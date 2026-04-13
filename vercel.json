@@ -1,11 +1,8 @@
 {
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api" }
-  ],
-  "functions": {
-    "api/index.js": {
-      "maxDuration": 60,
-      "memory": 1024
+    {
+      "source": "/api/(.*)",
+      "destination": "http://104.198.22.23:8787/api/$1"
     }
-  }
+  ]
 }
