@@ -1,0 +1,38 @@
+# Save as .github/workflows/deploy-gce-api.yml and set repository Secrets:
+#   GCE_HOST     — VM IP or DNS (e.g. api.yourdomain.com)
+#   GCE_USER     — SSH user with deploy rights (e.g. ubuntu or thedirection)
+#   GCE_SSH_KEY  — private key (full PEM, including BEGIN/END lines)
+#   DEPLOY_PATH  — e.g. /opt/the_direction
+#
+# The VM must have this repo cloned at DEPLOY_PATH and systemd unit installed.
+# Adjust branch name if not "main".
+
+name: Deploy API to GCE
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'deploy/gce/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.GCE_HOST }}
+          username: ${{ secrets.GCE_USER }}
+          key: ${{ secrets.GCE_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            cd ${{ secrets.DEPLOY_PATH }}
+            sudo -u thedirection -H bash -c 'git pull && npm ci --omit=dev'
+            sudo systemctl restart the-direction-api

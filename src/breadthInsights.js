@@ -4,6 +4,41 @@
 
 const RECENT_BARS = 5
 
+/** EMA smoothing length; matches RECENT_BARS so the chart aligns with “momentum” in Trading readout. */
+export const BREADTH_MOMENTUM_EMA_PERIOD = 5
+
+function emaSeries(values, period) {
+  if (!values.length) return []
+  const alpha = 2 / (period + 1)
+  const out = []
+  let e = values[0]
+  out.push(e)
+  for (let i = 1; i < values.length; i++) {
+    e = alpha * values[i] + (1 - alpha) * e
+    out.push(e)
+  }
+  return out
+}
+
+/**
+ * Per-bar breadth momentum inputs (oldest → newest).
+ * netBreadth = green% − red% (−100…+100). emaNet = EMA of netBreadth.
+ */
+export function computeBreadthMomentumSeries(
+  candles,
+  emaPeriod = BREADTH_MOMENTUM_EMA_PERIOD,
+) {
+  if (!candles?.length) return []
+  const net = candles.map((c) => c.greenPct - c.redPct)
+  const emaNet = emaSeries(net, emaPeriod)
+  return candles.map((c, i) => ({
+    index: c.index,
+    openTime: c.openTime,
+    netBreadth: net[i],
+    emaNet: emaNet[i],
+  }))
+}
+
 export function computeBreadthInsights(candles) {
   if (!candles?.length) return null
 

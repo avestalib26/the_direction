@@ -24,3 +24,12 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+.vercel
+
+# Python ML outputs (keep ml/data/*/ .gitkeep)
+ml/.venv/
+ml/data/ml_prepared/*
+!ml/data/ml_prepared/.gitkeep
+ml/data/raw_ohlcv/*
+!ml/data/raw_ohlcv/.gitkeep

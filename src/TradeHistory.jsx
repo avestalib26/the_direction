@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { TradeHistoryCharts } from './TradeHistoryCharts'
+import { computeTradeHistoryMetrics } from './tradeHistoryMetrics'
 
 const LIMIT = 1000
 
@@ -51,6 +52,11 @@ export function TradeHistory() {
     [closes],
   )
 
+  const metrics = useMemo(
+    () => computeTradeHistoryMetrics(closes),
+    [closes],
+  )
+
   return (
     <div className="trade-history">
       <div className="trade-history-header">
@@ -96,6 +102,173 @@ export function TradeHistory() {
               {meta?.tradesPerSymbolLimit ?? '—'} trades/symbol
             </p>
           )}
+
+          {!metrics.empty && (
+            <section
+              className="trade-history-metrics"
+              aria-label="Performance metrics"
+            >
+              <h2 className="breadth-detail-title trade-history-metrics-title">
+                Metrics
+              </h2>
+              <p className="trade-history-metrics-scope">
+                Based on the <strong>{metrics.sampleSize}</strong> closes loaded
+                (max {LIMIT} from the API), not necessarily your full account
+                history. <strong>Today</strong> uses your device&apos;s{' '}
+                <strong>local calendar date</strong>.
+              </p>
+
+              <div className="trade-history-metrics-grid">
+                <div className="trade-history-metric-card trade-history-metric-card--today">
+                  <h3 className="trade-history-metric-heading">Today (local)</h3>
+                  <dl className="trade-history-metric-dl">
+                    <div>
+                      <dt>Closes</dt>
+                      <dd>{metrics.todayCount}</dd>
+                    </div>
+                    <div>
+                      <dt>Win rate</dt>
+                      <dd>{fmtPctOrDash(metrics.todayWinRatePct)}</dd>
+                    </div>
+                    <div>
+                      <dt>Net PnL</dt>
+                      <dd className={pnlClass(metrics.todayNetPnl)}>
+                        {fmtPnl4OrDash(metrics.todayNetPnl)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Avg / trade</dt>
+                      <dd className={pnlClass(metrics.todayAvgPnl)}>
+                        {fmtPnl4OrDash(metrics.todayAvgPnl)}
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+
+                <div className="trade-history-metric-card">
+                  <h3 className="trade-history-metric-heading">Last 7 days</h3>
+                  <dl className="trade-history-metric-dl">
+                    <div>
+                      <dt>Closes</dt>
+                      <dd>{metrics.count7d}</dd>
+                    </div>
+                    <div>
+                      <dt>Win rate</dt>
+                      <dd>{fmtPctOrDash(metrics.winRate7dPct)}</dd>
+                    </div>
+                    <div>
+                      <dt>Net PnL</dt>
+                      <dd className={pnlClass(metrics.net7d)}>
+                        {fmtPnl4OrDash(metrics.net7d)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Avg win / avg loss</dt>
+                      <dd>
+                        <span className="pnl-pos">
+                          {fmtPnl4OrDash(metrics.avgWin7d)}
+                        </span>
+                        {' · '}
+                        <span className="pnl-neg">
+                          {fmtPnl4OrDash(metrics.avgLoss7d)}
+                        </span>
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+
+                <div className="trade-history-metric-card">
+                  <h3 className="trade-history-metric-heading">Last 30 days</h3>
+                  <dl className="trade-history-metric-dl">
+                    <div>
+                      <dt>Closes</dt>
+                      <dd>{metrics.count30d}</dd>
+                    </div>
+                    <div>
+                      <dt>Win rate</dt>
+                      <dd>{fmtPctOrDash(metrics.winRate30dPct)}</dd>
+                    </div>
+                    <div>
+                      <dt>Net PnL</dt>
+                      <dd className={pnlClass(metrics.net30d)}>
+                        {fmtPnl4OrDash(metrics.net30d)}
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+
+                <div className="trade-history-metric-card trade-history-metric-card--wide">
+                  <h3 className="trade-history-metric-heading">
+                    All loaded closes
+                  </h3>
+                  <dl className="trade-history-metric-dl trade-history-metric-dl--wide">
+                    <div>
+                      <dt>Wins / losses / flat</dt>
+                      <dd>
+                        {metrics.winCount} / {metrics.lossCount} /{' '}
+                        {metrics.flatCount}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Win rate (all rows)</dt>
+                      <dd>{fmtPctOrDash(metrics.winRateTotalPct)}</dd>
+                    </div>
+                    <div>
+                      <dt>Win rate (excl. flat)</dt>
+                      <dd>{fmtPctOrDash(metrics.winRateDecisivePct)}</dd>
+                    </div>
+                    <div>
+                      <dt>Avg win</dt>
+                      <dd className="pnl-pos">
+                        {fmtPnl4OrDash(metrics.avgWin)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Avg loss</dt>
+                      <dd className="pnl-neg">
+                        {fmtPnl4OrDash(metrics.avgLoss)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Profit factor</dt>
+                      <dd>{fmtProfitFactor(metrics.profitFactor)}</dd>
+                    </div>
+                    <div>
+                      <dt>Expectancy / trade</dt>
+                      <dd className={pnlClass(metrics.expectancy)}>
+                        {fmtPnl4OrDash(metrics.expectancy)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Net PnL</dt>
+                      <dd className={pnlClass(metrics.netPnl)}>
+                        {fmtPnl4OrDash(metrics.netPnl)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Avg PnL / trade</dt>
+                      <dd className={pnlClass(metrics.avgTradePnl)}>
+                        {fmtPnl4OrDash(metrics.avgTradePnl)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Best / worst</dt>
+                      <dd>
+                        <span className="pnl-pos">
+                          {fmtPnl4OrDash(metrics.largestWin)}
+                        </span>
+                        {' · '}
+                        <span className="pnl-neg">
+                          {fmtPnl4OrDash(metrics.largestLoss)}
+                        </span>
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+              </div>
+            </section>
+          )}
+
           <section className="trade-history-chart-section">
             <h2 className="breadth-detail-title">Charts</h2>
             <TradeHistoryCharts
@@ -169,4 +342,27 @@ function fmtSigned(n) {
 function chgClass(n) {
   if (!Number.isFinite(n) || n === 0) return ''
   return n > 0 ? 'pnl-pos' : 'pnl-neg'
+}
+
+function pnlClass(n) {
+  if (n == null || !Number.isFinite(n) || n === 0) return ''
+  return n > 0 ? 'pnl-pos' : 'pnl-neg'
+}
+
+function fmtPctOrDash(p) {
+  if (p == null || !Number.isFinite(p)) return '—'
+  return `${p.toFixed(1)}%`
+}
+
+function fmtPnl4OrDash(n) {
+  if (n == null || !Number.isFinite(n)) return '—'
+  return fmtSigned(n)
+}
+
+function fmtProfitFactor(pf) {
+  if (pf == null) return '—'
+  if (pf === Infinity) return '∞'
+  if (!Number.isFinite(pf)) return '—'
+  if (pf > 1e6) return '>1,000,000'
+  return pf.toFixed(2)
 }

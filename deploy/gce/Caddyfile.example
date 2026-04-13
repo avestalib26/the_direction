@@ -1,0 +1,23 @@
+# Install Caddy on the VM, then:
+#   sudo cp Caddyfile.example /etc/caddy/Caddyfile
+#   sudo nano /etc/caddy/Caddyfile   # replace hostnames
+#   sudo systemctl reload caddy
+#
+# Requires DNS A record: app.example.com → your VM static IP.
+# Caddy obtains Let's Encrypt certificates automatically on :443.
+
+app.example.com {
+	encode gzip
+
+	# API first (paths unchanged — Express serves /api/...)
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	# Vite production build (SPA fallback)
+	handle {
+		root * /opt/the_direction/dist
+		try_files {path} /index.html
+		file_server
+	}
+}

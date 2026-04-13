@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState } from 'react'
 import { BreadthBarCharts } from './BreadthCharts'
+import { RegimeBreadthPanel } from './RegimeBreadthPanel'
 import {
   buildCandleBreadthCsv,
   buildSymbolMatrixCsv,
@@ -102,12 +103,20 @@ export function MarketBreadth() {
       <div className="breadth-header">
         <h1 className="title">Market breadth</h1>
         <p className="subtitle">
-          USDT-M perpetuals, single-candle open→close per bar. After you run,
-          the <strong>four charts</strong> summarize counts, % breadth, sum of
-          coin % per candle, and its cumulative line; open{' '}
-          <strong>Tables &amp; export</strong> for
-          raw grids and CSV.
+          <strong>Daily regime framework</strong> below uses median return,
+          participation, and % above MA20 with z-scored regime score and
+          momentum sleeves. <strong>Intraday breadth</strong> further down uses
+          USDT-M perpetuals, single-candle open→close per bar; the six charts
+          summarize counts, % breadth, net breadth, smoothed momentum (EMA), sum
+          of coin % per candle, and its cumulative line; open{' '}
+          <strong>Tables &amp; export</strong> for raw grids and CSV.
         </p>
+
+        <RegimeBreadthPanel />
+
+        <h2 className="breadth-detail-title breadth-intraday-title">
+          Intraday candle breadth
+        </h2>
 
         <div className="breadth-controls">
           <label className="field">
@@ -162,6 +171,12 @@ export function MarketBreadth() {
           <p className="positions-error-title">Breadth failed</p>
           <p className="positions-error-msg">{error}</p>
         </div>
+      )}
+
+      {data?.breadthNote && (
+        <p className="breadth-serverless-note" role="status">
+          {data.breadthNote}
+        </p>
       )}
 
       {candles.length > 0 && (

@@ -4,9 +4,20 @@
  * Symbols to scan come from paginated REALIZED_PNL income (not all 500+ perpetuals).
  */
 
-const INCOME_PAGES_MAX = 10
+const IS_VERCEL = process.env.VERCEL === '1'
+/** Tighter on Vercel so /closed-positions finishes before the ~10s Hobby timeout. */
+const INCOME_PAGES_MAX = IS_VERCEL ? 4 : 10
 const USER_TRADES_LIMIT = 1000
-const TRADES_CONCURRENCY = 14
+const TRADES_CONCURRENCY = IS_VERCEL ? 3 : 7
+
+function closedSymbolsCap() {
+  if (!IS_VERCEL) return 0
+  const raw = process.env.CLOSED_MAX_SYMBOLS
+  if (raw === '0' || raw === '') return 0
+  const n = Number.parseInt(String(raw ?? ''), 10)
+  if (Number.isFinite(n) && n > 0) return n
+  return 45
+}
 
 async function mapPool(items, concurrency, fn) {
   const out = new Array(items.length)
@@ -48,7 +59,14 @@ async function collectSymbolsFromRealizedIncome(signedJson) {
  * @param {(path: string, params: Record<string, string | number>) => Promise<unknown>} signedJson
  */
 export async function computeClosedPositionPnl(signedJson, { limit = 1000 } = {}) {
-  const symbols = await collectSymbolsFromRealizedIncome(signedJson)
+  let symbols = await collectSymbolsFromRealizedIncome(signedJson)
+  const incomeSymbolCount = symbols.length
+  const symCap = closedSymbolsCap()
+  let closedTruncated = false
+  if (symCap > 0 && symbols.length > symCap) {
+    symbols = symbols.slice(0, symCap)
+    closedTruncated = true
+  }
 
   if (symbols.length === 0) {
     return {
@@ -113,13 +131,20 @@ export async function computeClosedPositionPnl(signedJson, { limit = 1000 } = {}
   closes.sort((a, b) => b.closedAt - a.closedAt)
   const top = closes.slice(0, limit)
 
+  const baseNote =
+    'Each row is total realized PnL for one reduce/close order (all fills with that orderId). ' +
+    'Only symbols that appear in recent REALIZED_PNL income are scanned; each symbol uses at most ' +
+    `${USER_TRADES_LIMIT} latest trades.`
+
   return {
     closes: top,
     symbolsScanned: symbols.length,
+    incomeSymbolCount,
+    closedTruncated,
     tradesPerSymbolLimit: USER_TRADES_LIMIT,
     note:
-      'Each row is total realized PnL for one reduce/close order (all fills with that orderId). ' +
-      'Only symbols that appear in recent REALIZED_PNL income are scanned; each symbol uses at most ' +
-      `${USER_TRADES_LIMIT} latest trades.`,
+      closedTruncated && IS_VERCEL
+        ? `${baseNote} On Vercel, only the first ${symbols.length} of ${incomeSymbolCount} income symbols are scanned (time limit). Set CLOSED_MAX_SYMBOLS or use Pro / self-host for full scans.`
+        : baseNote,
   }
 }

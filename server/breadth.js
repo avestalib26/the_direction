@@ -1,5 +1,10 @@
 /** Binance USDT-M futures market breadth (public klines). */
 
+import {
+  acquireFuturesRestWeight,
+  futuresKlinesRequestWeight,
+} from './binanceFuturesRestThrottle.js'
+
 export const ALLOWED_INTERVALS = new Set([
   '1m',
   '3m',
@@ -18,10 +23,28 @@ export const ALLOWED_INTERVALS = new Set([
   '1M',
 ])
 
-const KLINES_CONCURRENCY = 24
+/** Lower on Vercel (Hobby ≈10s function cap) so breadth finishes in time. */
+const IS_VERCEL = process.env.VERCEL === '1'
+const KLINES_CONCURRENCY = IS_VERCEL
+  ? Math.min(
+      12,
+      Math.max(4, Number.parseInt(process.env.BREADTH_KLINES_CONCURRENCY ?? '5', 10) || 5),
+    )
+  : 12
 
-async function fetchJson(url) {
-  const res = await fetch(url)
+/** On Vercel, only fetch klines for this many symbols unless BREADTH_MAX_SYMBOLS is set (0 = no cap). */
+function breadthSymbolCap() {
+  if (!IS_VERCEL) return 0
+  const raw = process.env.BREADTH_MAX_SYMBOLS
+  if (raw === '0' || raw === '') return 0
+  const n = Number.parseInt(String(raw ?? ''), 10)
+  if (Number.isFinite(n) && n > 0) return n
+  return 200
+}
+
+async function fetchJson(url, init = {}, weight = 1) {
+  await acquireFuturesRestWeight(weight)
+  const res = await fetch(url, init)
   const text = await res.text()
   let data
   try {
@@ -36,8 +59,8 @@ async function fetchJson(url) {
   return data
 }
 
-export async function fetchUsdmPerpetualSymbols(futuresBase) {
-  const data = await fetchJson(`${futuresBase}/fapi/v1/exchangeInfo`)
+export async function fetchUsdmPerpetualSymbols(futuresBase, init = {}) {
+  const data = await fetchJson(`${futuresBase}/fapi/v1/exchangeInfo`, init)
   const symbols = data.symbols ?? []
   return symbols
     .filter(
@@ -65,7 +88,8 @@ async function fetchKlines(futuresBase, symbol, interval, limit) {
     limit: String(limit),
   })
   const url = `${futuresBase}/fapi/v1/klines?${q}`
-  const klines = await fetchJson(url)
+  const w = futuresKlinesRequestWeight(limit)
+  const klines = await fetchJson(url, {}, w)
   return Array.isArray(klines) ? klines : []
 }
 
@@ -85,7 +109,14 @@ async function mapPool(items, concurrency, mapper) {
 }
 
 export async function computeMarketBreadth(futuresBase, interval, candleLimit) {
-  const symbols = await fetchUsdmPerpetualSymbols(futuresBase)
+  let symbols = await fetchUsdmPerpetualSymbols(futuresBase)
+  const fullSymbolCount = symbols.length
+  const cap = breadthSymbolCap()
+  let breadthTruncated = false
+  if (cap > 0 && symbols.length > cap) {
+    symbols = symbols.slice(0, cap)
+    breadthTruncated = true
+  }
   const raw = await mapPool(symbols, KLINES_CONCURRENCY, async (symbol) => {
     try {
       const klines = await fetchKlines(futuresBase, symbol, interval, candleLimit)
@@ -159,11 +190,17 @@ export async function computeMarketBreadth(futuresBase, interval, candleLimit) {
   return {
     interval,
     candleLimit,
-    symbolCount: symbols.length,
+    symbolCount: fullSymbolCount,
+    symbolsInRequest: symbols.length,
     nCoins,
     candleBreadth,
     symbolRows,
     skipped,
     fetchedAt: new Date().toISOString(),
+    breadthTruncated,
+    breadthNote:
+      breadthTruncated && IS_VERCEL
+        ? `Using first ${symbols.length} of ${fullSymbolCount} USDT perpetuals so the request fits Vercel’s short function limit. Upgrade to Vercel Pro (longer timeouts), self-host the API, or set BREADTH_MAX_SYMBOLS.`
+        : undefined,
   }
 }

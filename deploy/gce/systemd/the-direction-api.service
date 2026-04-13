@@ -1,0 +1,20 @@
+[Unit]
+Description=The Direction API (Express / Binance proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=thedirection
+Group=thedirection
+WorkingDirectory=/opt/the_direction
+EnvironmentFile=-/opt/the_direction/.env
+ExecStart=/usr/bin/node server/index.js
+Restart=on-failure
+RestartSec=5
+
+# Reasonable defaults; tighten further if you want.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

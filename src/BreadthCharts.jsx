@@ -1,11 +1,21 @@
-import { useMemo } from 'react'
+import {
+  AreaSeries,
+  ColorType,
+  CrosshairMode,
+  HistogramSeries,
+  LineSeries,
+  createChart,
+} from 'lightweight-charts'
+import { useEffect, useRef, useState } from 'react'
+import {
+  BREADTH_MOMENTUM_EMA_PERIOD,
+  computeBreadthMomentumSeries,
+} from './breadthInsights'
 
-const VW = 880
-const VH = 200
-const PAD_L = 44
-const PAD_R = 12
-const PAD_T = 8
-const PAD_B = 36
+const UP = '#0ecb81'
+const DOWN = '#f6465d'
+const LINE_DIM = '#c99400'
+const EMA_LINE = '#2962ff'
 
 /** Sum of each coin's open→close % for that candle (equal-weight coins, raw sum). */
 function sumCoinPctPerCandle(symbolRows, nCandles) {
@@ -34,295 +44,334 @@ function cumulativeSum(values) {
   return out
 }
 
-function DivergingPairChart({
-  candles,
-  upKey,
-  downKey,
-  upLabel,
-  downLabel,
-  title,
-  subtitle,
-  maxScale,
-}) {
-  const n = candles.length
-  const plotW = VW - PAD_L - PAD_R
-  const plotH = VH - PAD_T - PAD_B
-  const midY = PAD_T + plotH / 2
-  const halfH = plotH / 2 - 4
+function assignUniqueChartTimes(candlesAsc) {
+  const used = new Set()
+  return candlesAsc.map((c) => {
+    let t = Math.floor(c.openTime / 1000)
+    while (used.has(t)) t += 1
+    used.add(t)
+    return { ...c, chartTime: t }
+  })
+}
 
-  const { maxMag, slotW, barW } = useMemo(() => {
-    let maxUp = 1
-    let maxDown = 1
-    for (const c of candles) {
-      maxUp = Math.max(maxUp, c[upKey])
-      maxDown = Math.max(maxDown, c[downKey])
+function chartLayout(isDark) {
+  const bg = isDark ? '#1e2329' : '#ffffff'
+  const text = isDark ? '#b7bdc6' : '#474d57'
+  const grid = isDark ? '#2b3139' : '#eaecef'
+  const border = isDark ? '#2b3139' : '#eaecef'
+  return {
+    layout: {
+      background: { type: ColorType.Solid, color: bg },
+      textColor: text,
+      fontSize: 12,
+      fontFamily: "system-ui, 'Segoe UI', Roboto, sans-serif",
+    },
+    grid: {
+      vertLines: { color: grid },
+      horzLines: { color: grid },
+    },
+    crosshair: {
+      mode: CrosshairMode.Normal,
+      vertLine: {
+        color: isDark ? '#6a6d78' : '#9598a1',
+        labelBackgroundColor: isDark ? '#474d57' : '#848e9c',
+      },
+      horzLine: {
+        color: isDark ? '#6a6d78' : '#9598a1',
+        labelBackgroundColor: isDark ? '#474d57' : '#848e9c',
+      },
+    },
+    rightPriceScale: {
+      borderColor: border,
+      scaleMargins: { top: 0.08, bottom: 0.08 },
+    },
+    timeScale: {
+      borderColor: border,
+      timeVisible: true,
+      secondsVisible: false,
+      rightOffset: 2,
+    },
+    handleScroll: {
+      mouseWheel: true,
+      pressedMouseMove: true,
+      horzTouchDrag: true,
+      vertTouchDrag: false,
+    },
+    handleScale: {
+      axisPressedMouseMove: true,
+      mouseWheel: true,
+      pinch: true,
+    },
+  }
+}
+
+function syncVisibleRanges(charts) {
+  const unsub = []
+  let lock = false
+  for (const source of charts) {
+    const fn = (range) => {
+      if (lock || range == null) return
+      lock = true
+      for (const c of charts) {
+        if (c !== source) {
+          c.timeScale().setVisibleRange(range)
+        }
+      }
+      lock = false
     }
-    let maxMag = Math.max(maxUp, maxDown, 1e-9)
-    if (typeof maxScale === 'number') maxMag = maxScale
-    const slotW = n > 0 ? plotW / n : plotW
-    const barW = Math.max(3, Math.min(16, slotW * 0.55))
-    return { maxMag, slotW, barW }
-  }, [candles, upKey, downKey, maxScale, n, plotW])
-
-  return (
-    <figure className="breadth-chart-figure">
-      <figcaption className="breadth-chart-title">{title}</figcaption>
-      {subtitle && <p className="breadth-chart-sub">{subtitle}</p>}
-      <div className="breadth-chart-svg-wrap">
-        <svg
-          className="breadth-chart-svg"
-          viewBox={`0 0 ${VW} ${VH}`}
-          preserveAspectRatio="xMidYMid meet"
-          role="img"
-          aria-label={title}
-        >
-          <line
-            x1={PAD_L}
-            y1={midY}
-            x2={VW - PAD_R}
-            y2={midY}
-            className="breadth-chart-axis"
-          />
-          {candles.map((c, i) => {
-            const x =
-              PAD_L + (i + 0.5) * slotW - barW / 2
-            const g = Number(c[upKey]) || 0
-            const r = Number(c[downKey]) || 0
-            const hG = (g / maxMag) * halfH
-            const hR = (r / maxMag) * halfH
-            return (
-              <g key={c.index ?? i}>
-                <rect
-                  x={x}
-                  y={midY - hG}
-                  width={barW}
-                  height={Math.max(hG, 0.5)}
-                  className="breadth-bar breadth-bar--up"
-                  rx={1}
-                />
-                <rect
-                  x={x}
-                  y={midY}
-                  width={barW}
-                  height={Math.max(hR, 0.5)}
-                  className="breadth-bar breadth-bar--down"
-                  rx={1}
-                />
-              </g>
-            )
-          })}
-          <text
-            x={PAD_L}
-            y={VH - 10}
-            className="breadth-chart-caption"
-          >
-            {upLabel} ↑ and {downLabel} ↓ on the same column · oldest → newest
-          </text>
-        </svg>
-      </div>
-    </figure>
-  )
-}
-
-function SumCoinPctChart({ candles, symbolRows }) {
-  const n = candles.length
-  const plotW = VW - PAD_L - PAD_R
-  const plotH = VH - PAD_T - PAD_B
-  const midY = PAD_T + plotH / 2
-  const halfH = plotH / 2 - 4
-
-  const { sums, maxMag, slotW, barW } = useMemo(() => {
-    const sums = sumCoinPctPerCandle(symbolRows, n)
-    const maxAbs = Math.max(...sums.map((v) => Math.abs(v)), 0.01)
-    const maxMag = maxAbs * 1.08
-    const slotW = n > 0 ? plotW / n : plotW
-    const barW = Math.max(3, Math.min(14, slotW * 0.55))
-    return { sums, maxMag, slotW, barW }
-  }, [symbolRows, n, plotW])
-
-  const title = '3 · Sum of coin % change (per candle)'
-  const subtitle =
-    'Each bar is the sum of every coin’s open→close % for that candle (scales with how many symbols are included).'
-
-  return (
-    <figure className="breadth-chart-figure">
-      <figcaption className="breadth-chart-title">{title}</figcaption>
-      <p className="breadth-chart-sub">{subtitle}</p>
-      <div className="breadth-chart-svg-wrap">
-        <svg
-          className="breadth-chart-svg"
-          viewBox={`0 0 ${VW} ${VH}`}
-          preserveAspectRatio="xMidYMid meet"
-          role="img"
-          aria-label={title}
-        >
-          <line
-            x1={PAD_L}
-            y1={midY}
-            x2={VW - PAD_R}
-            y2={midY}
-            className="breadth-chart-axis"
-          />
-          {candles.map((c, i) => {
-            const v = sums[i]
-            const x = PAD_L + i * slotW + (slotW - barW) / 2
-            const h = (Math.abs(v) / maxMag) * halfH
-            if (v >= 0) {
-              return (
-                <rect
-                  key={c.index ?? i}
-                  x={x}
-                  y={midY - h}
-                  width={barW}
-                  height={Math.max(h, 0.5)}
-                  className="breadth-bar breadth-bar--up"
-                  rx={1}
-                />
-              )
-            }
-            return (
-              <rect
-                key={c.index ?? i}
-                x={x}
-                y={midY}
-                width={barW}
-                height={Math.max(h, 0.5)}
-                className="breadth-bar breadth-bar--down"
-                rx={1}
-              />
-            )
-          })}
-          <text x={PAD_L} y={16} className="breadth-chart-y-label">
-            {`max ≈ ${maxMag.toFixed(2)}%`}
-          </text>
-          <text
-            x={PAD_L}
-            y={VH - 10}
-            className="breadth-chart-caption"
-          >
-            One bar per candle: height = sum of all coin % · center = 0
-          </text>
-        </svg>
-      </div>
-    </figure>
-  )
-}
-
-function CumulativeSumLineChart({ candles, symbolRows }) {
-  const n = candles.length
-  const plotW = VW - PAD_L - PAD_R
-  const plotTop = PAD_T
-  const plotBottom = VH - PAD_B
-  const plotH = plotBottom - plotTop
-
-  const { pathD, areaD, zeroY, lastV, yMin, yMax } = useMemo(() => {
-    const sums = sumCoinPctPerCandle(symbolRows, n)
-    const cum = cumulativeSum(sums)
-    let yMin = Math.min(...cum, 0)
-    let yMax = Math.max(...cum, 0)
-    const pad = (yMax - yMin) * 0.08 || 1
-    yMin -= pad
-    yMax += pad
-    const span = Math.max(yMax - yMin, 1e-9)
-
-    const xAt = (i) =>
-      PAD_L + (n <= 1 ? plotW / 2 : (i / (n - 1)) * plotW)
-    const yAt = (v) => plotBottom - ((v - yMin) / span) * plotH
-
-    const pts = cum.map((v, i) => ({ x: xAt(i), y: yAt(v) }))
-    const pathD =
-      pts.length > 0
-        ? `M ${pts.map((p) => `${p.x},${p.y}`).join(' L ')}`
-        : ''
-    const areaD =
-      pts.length > 0
-        ? `M ${pts[0].x},${plotBottom} ${pts.map((p) => `L ${p.x},${p.y}`).join(' ')} L ${pts[pts.length - 1].x},${plotBottom} Z`
-        : ''
-    const zeroY = yMin <= 0 && yMax >= 0 ? yAt(0) : null
-    const lastV = cum.length ? cum[cum.length - 1] : 0
-    return { pathD, areaD, zeroY, lastV, yMin, yMax }
-  }, [symbolRows, n, plotW, plotH, plotBottom])
-
-  const title = '4 · Cumulative sum of coin % (line)'
-  const subtitle =
-    'Running total of chart 3’s per-candle sums — same units, shows drift over the window.'
-
-  return (
-    <figure className="breadth-chart-figure">
-      <figcaption className="breadth-chart-title">{title}</figcaption>
-      <p className="breadth-chart-sub">{subtitle}</p>
-      <div className="breadth-chart-svg-wrap">
-        <svg
-          className="breadth-chart-svg"
-          viewBox={`0 0 ${VW} ${VH}`}
-          preserveAspectRatio="xMidYMid meet"
-          role="img"
-          aria-label={title}
-        >
-          {zeroY != null && (
-            <line
-              x1={PAD_L}
-              y1={zeroY}
-              x2={VW - PAD_R}
-              y2={zeroY}
-              className="breadth-line-chart-zero"
-            />
-          )}
-          {areaD ? (
-            <path d={areaD} className="breadth-line-chart-area" />
-          ) : null}
-          {pathD ? (
-            <path d={pathD} className="breadth-line-chart-line" />
-          ) : null}
-          <text x={PAD_L} y={16} className="breadth-chart-y-label">
-            {`range ≈ ${yMin.toFixed(0)} … ${yMax.toFixed(0)} · end ${lastV.toFixed(1)}`}
-          </text>
-          <text
-            x={PAD_L}
-            y={VH - 10}
-            className="breadth-chart-caption"
-          >
-            Oldest → newest · y = cumulative Σ (per-candle sum of coin %)
-          </text>
-        </svg>
-      </div>
-    </figure>
-  )
+    source.timeScale().subscribeVisibleTimeRangeChange(fn)
+    unsub.push(() => source.timeScale().unsubscribeVisibleTimeRangeChange(fn))
+  }
+  return () => {
+    for (const u of unsub) u()
+  }
 }
 
 export function BreadthBarCharts({ candles, symbolRows }) {
+  const [dark, setDark] = useState(() =>
+    typeof window !== 'undefined' &&
+    window.matchMedia('(prefers-color-scheme: dark)').matches,
+  )
+
+  const ref1 = useRef(null)
+  const ref2 = useRef(null)
+  const ref3 = useRef(null)
+  const ref4 = useRef(null)
+  const ref5 = useRef(null)
+  const ref6 = useRef(null)
+
+  useEffect(() => {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)')
+    const fn = () => setDark(mq.matches)
+    mq.addEventListener('change', fn)
+    return () => mq.removeEventListener('change', fn)
+  }, [])
+
+  const hasSymbolRows = symbolRows.length > 0
+
+  useEffect(() => {
+    if (!candles.length) return
+
+    const sorted = [...candles].sort((a, b) => a.openTime - b.openTime)
+    const enriched = assignUniqueChartTimes(sorted)
+    const n = enriched.length
+
+    const layout = chartLayout(dark)
+    const charts = []
+    const cleanupFns = []
+
+    const mk = (container) => {
+      const c = createChart(container, { ...layout, autoSize: true })
+      charts.push(c)
+      return c
+    }
+
+    // —— Chart 1: counts ——
+    if (ref1.current) {
+      const ch = mk(ref1.current)
+      const g = ch.addSeries(HistogramSeries, {
+        color: UP,
+        priceFormat: { type: 'price', precision: 0, minMove: 1 },
+        base: 0,
+      })
+      const r = ch.addSeries(HistogramSeries, {
+        color: DOWN,
+        priceFormat: { type: 'price', precision: 0, minMove: 1 },
+        base: 0,
+      })
+      g.setData(enriched.map((c) => ({ time: c.chartTime, value: c.green })))
+      r.setData(
+        enriched.map((c) => ({ time: c.chartTime, value: -c.red })),
+      )
+      ch.timeScale().fitContent()
+    }
+
+    // —— Chart 2: % ——
+    if (ref2.current) {
+      const ch = mk(ref2.current)
+      const g = ch.addSeries(HistogramSeries, {
+        color: UP,
+        priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
+        base: 0,
+      })
+      const r = ch.addSeries(HistogramSeries, {
+        color: DOWN,
+        priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
+        base: 0,
+      })
+      g.setData(
+        enriched.map((c) => ({ time: c.chartTime, value: c.greenPct })),
+      )
+      r.setData(
+        enriched.map((c) => ({ time: c.chartTime, value: -c.redPct })),
+      )
+      ch.timeScale().fitContent()
+    }
+
+    // —— Chart 3: net breadth ——
+    if (ref3.current) {
+      const mom = computeBreadthMomentumSeries(
+        sorted,
+        BREADTH_MOMENTUM_EMA_PERIOD,
+      )
+      const ch = mk(ref3.current)
+      const line = ch.addSeries(LineSeries, {
+        color: LINE_DIM,
+        lineWidth: 2,
+        priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
+      })
+      line.setData(
+        mom.map((m, i) => ({
+          time: enriched[i].chartTime,
+          value: m.netBreadth,
+        })),
+      )
+      ch.timeScale().fitContent()
+    }
+
+    // —— Chart 4: EMA ——
+    if (ref4.current) {
+      const mom = computeBreadthMomentumSeries(
+        sorted,
+        BREADTH_MOMENTUM_EMA_PERIOD,
+      )
+      const ch = mk(ref4.current)
+      const line = ch.addSeries(LineSeries, {
+        color: EMA_LINE,
+        lineWidth: 2,
+        priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
+      })
+      line.setData(
+        mom.map((m, i) => ({
+          time: enriched[i].chartTime,
+          value: m.emaNet,
+        })),
+      )
+      ch.timeScale().fitContent()
+    }
+
+    if (hasSymbolRows && ref5.current && ref6.current) {
+      const sums = sumCoinPctPerCandle(symbolRows, n)
+      const cum = cumulativeSum(sums)
+
+      // —— Chart 5: sum of coin % ——
+      const ch5 = mk(ref5.current)
+      const h5 = ch5.addSeries(HistogramSeries, {
+        priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+        base: 0,
+      })
+      h5.setData(
+        enriched.map((c, i) => ({
+          time: c.chartTime,
+          value: sums[i],
+          color: sums[i] >= 0 ? UP : DOWN,
+        })),
+      )
+      ch5.timeScale().fitContent()
+
+      // —— Chart 6: cumulative ——
+      const ch6 = mk(ref6.current)
+      const acc = dark ? '#f0b90b' : '#c99400'
+      const area = ch6.addSeries(AreaSeries, {
+        lineColor: acc,
+        topColor: dark ? 'rgba(240, 185, 11, 0.35)' : 'rgba(201, 148, 0, 0.35)',
+        bottomColor: dark ? 'rgba(240, 185, 11, 0.02)' : 'rgba(201, 148, 0, 0.02)',
+        lineWidth: 2,
+        priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+      })
+      area.setData(
+        cum.map((v, i) => ({
+          time: enriched[i].chartTime,
+          value: v,
+        })),
+      )
+      ch6.timeScale().fitContent()
+    }
+
+    const unsubSync = syncVisibleRanges(charts)
+    cleanupFns.push(unsubSync)
+
+    return () => {
+      for (const u of cleanupFns) u()
+      for (const c of charts) c.remove()
+    }
+  }, [candles, symbolRows, dark, hasSymbolRows])
+
   if (!candles.length) return null
 
   return (
     <section className="breadth-charts" aria-label="Breadth bar charts">
-      <h2 className="breadth-detail-title">Breadth charts (1–4)</h2>
-      <DivergingPairChart
-        candles={candles}
-        upKey="green"
-        downKey="red"
-        upLabel="Green (count)"
-        downLabel="Red (count)"
-        title="1 · Coin counts per candle"
-        subtitle="Each vertical slot is one candle: green count grows up from the line, red count grows down — same center line."
-      />
-      <DivergingPairChart
-        candles={candles}
-        upKey="greenPct"
-        downKey="redPct"
-        upLabel="Green %"
-        downLabel="Red %"
-        title="2 · Green % and red % per candle"
-        subtitle="Same layout as chart 1: one column per candle, green % up / red % down from the midline (0–100% scale)."
-        maxScale={100}
-      />
-      {symbolRows.length > 0 ? (
+      <h2 className="breadth-detail-title">Breadth charts (1–6)</h2>
+      <p className="breadth-lwc-hint">
+        <strong>TradingView-style:</strong> drag to pan · mouse wheel or pinch to
+        zoom · all charts below share the same time range (zoom one, the rest
+        follow).
+      </p>
+
+      <figure className="breadth-chart-figure">
+        <figcaption className="breadth-chart-title">1 · Coin counts per candle</figcaption>
+        <p className="breadth-chart-sub">
+          Green histogram up, red down from zero — same candle time on the axis.
+        </p>
+        <div ref={ref1} className="breadth-lwc-pane" />
+      </figure>
+
+      <figure className="breadth-chart-figure">
+        <figcaption className="breadth-chart-title">
+          2 · Green % and red % per candle
+        </figcaption>
+        <p className="breadth-chart-sub">
+          Same layout as chart 1: green % above zero, red % as negative bars below.
+        </p>
+        <div ref={ref2} className="breadth-lwc-pane" />
+      </figure>
+
+      <figure className="breadth-chart-figure">
+        <figcaption className="breadth-chart-title">
+          3 · Net breadth (green% − red%)
+        </figcaption>
+        <p className="breadth-chart-sub">
+          Line = participation skew per bar. Crosshair shows exact values.
+        </p>
+        <div ref={ref3} className="breadth-lwc-pane" />
+      </figure>
+
+      <figure className="breadth-chart-figure">
+        <figcaption className="breadth-chart-title">
+          4 · Breadth momentum EMA ({BREADTH_MOMENTUM_EMA_PERIOD})
+        </figcaption>
+        <p className="breadth-chart-sub">
+          EMA of chart 3’s net breadth — smoother trend (same % units).
+        </p>
+        <div ref={ref4} className="breadth-lwc-pane" />
+      </figure>
+
+      {hasSymbolRows ? (
         <>
-          <SumCoinPctChart candles={candles} symbolRows={symbolRows} />
-          <CumulativeSumLineChart candles={candles} symbolRows={symbolRows} />
+          <figure className="breadth-chart-figure">
+            <figcaption className="breadth-chart-title">
+              5 · Sum of coin % change (per candle)
+            </figcaption>
+            <p className="breadth-chart-sub">
+              Sum of every coin’s open→close % for that candle (scales with symbol
+              count).
+            </p>
+            <div ref={ref5} className="breadth-lwc-pane" />
+          </figure>
+
+          <figure className="breadth-chart-figure">
+            <figcaption className="breadth-chart-title">
+              6 · Cumulative sum of coin % (area)
+            </figcaption>
+            <p className="breadth-chart-sub">
+              Running total of chart 5’s per-candle sums — drift over the window.
+            </p>
+            <div ref={ref6} className="breadth-lwc-pane" />
+          </figure>
         </>
       ) : (
         <p className="breadth-chart-missing">
-          Charts 3–4 need symbol rows (re-run breadth).
+          Charts 5–6 need symbol rows (re-run breadth).
         </p>
       )}
     </section>
