@@ -29,6 +29,7 @@ import {
 } from './spikeTpSlBacktestV3.js'
 import {
   acquireFuturesRestWeight,
+  FUTURES_EXCHANGE_INFO_WEIGHT,
   futuresKlinesRequestWeight,
   futuresSignedPathWeight,
   FUTURES_TIME_WEIGHT,
@@ -255,6 +256,132 @@ async function signedFuturesJson(apiKey, apiSecret, path, params) {
   return data
 }
 
+async function signedFuturesJsonPost(apiKey, apiSecret, path, params) {
+  const url = await signedFuturesUrl(path, apiSecret, params)
+  await acquireFuturesRestWeight(futuresSignedPathWeight(path))
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'X-MBX-APIKEY': apiKey },
+  })
+  const text = await res.text()
+  let data
+  try {
+    data = text ? JSON.parse(text) : {}
+  } catch {
+    throw new BinanceApiError(
+      `Invalid JSON from Binance (${res.status}): ${text.slice(0, 240)}`,
+      res.status,
+    )
+  }
+  if (!res.ok) {
+    const msg = data.msg || data.message || text
+    if (res.status === 400 && /timestamp|recvWindow/i.test(String(msg))) {
+      const retryUrl = await signedFuturesUrl(path, apiSecret, params, true)
+      await acquireFuturesRestWeight(futuresSignedPathWeight(path))
+      const retryRes = await fetch(retryUrl, {
+        method: 'POST',
+        headers: { 'X-MBX-APIKEY': apiKey },
+      })
+      const retryText = await retryRes.text()
+      let retryData
+      try {
+        retryData = retryText ? JSON.parse(retryText) : {}
+      } catch {
+        throw new BinanceApiError(
+          `Invalid JSON from Binance (${retryRes.status}): ${retryText.slice(0, 240)}`,
+          retryRes.status,
+        )
+      }
+      if (retryRes.ok) return retryData
+      const retryMsg = retryData.msg || retryData.message || retryText
+      throw new BinanceApiError(`Binance ${retryRes.status}: ${retryMsg}`, retryRes.status)
+    }
+    throw new BinanceApiError(`Binance ${res.status}: ${msg}`, res.status)
+  }
+  return data
+}
+
+let exchangeInfoCache = null
+let exchangeInfoCacheAt = 0
+const EXCHANGE_INFO_TTL_MS = 5 * 60_000
+
+function toNum(x) {
+  const n = Number.parseFloat(String(x ?? ''))
+  return Number.isFinite(n) ? n : null
+}
+
+function decimalPlaces(step) {
+  const s = String(step ?? '').trim()
+  if (!s || !s.includes('.')) return 0
+  return s.replace(/0+$/, '').split('.')[1]?.length ?? 0
+}
+
+function quantizeToStep(value, step, mode = 'floor') {
+  if (!Number.isFinite(value) || !Number.isFinite(step) || step <= 0) return value
+  const u = value / step
+  let units
+  if (mode === 'ceil') {
+    units = Math.ceil(u - Number.EPSILON)
+  } else if (mode === 'round') {
+    units = Math.round(u)
+  } else {
+    units = Math.floor(u + Number.EPSILON)
+  }
+  return units * step
+}
+
+function fmtByStep(value, step, precisionCap = null) {
+  const d = decimalPlaces(step)
+  let use = Math.max(0, d)
+  if (Number.isFinite(precisionCap) && precisionCap >= 0) {
+    use = Math.min(use, Math.floor(precisionCap))
+  }
+  return value.toFixed(Math.min(12, use))
+}
+
+async function getFuturesExchangeInfo() {
+  const now = Date.now()
+  if (exchangeInfoCache && now - exchangeInfoCacheAt < EXCHANGE_INFO_TTL_MS) {
+    return exchangeInfoCache
+  }
+  await acquireFuturesRestWeight(FUTURES_EXCHANGE_INFO_WEIGHT)
+  const r = await fetch(`${FUTURES_BASE}/fapi/v1/exchangeInfo`)
+  const text = await r.text()
+  let data
+  try {
+    data = text ? JSON.parse(text) : {}
+  } catch {
+    throw new Error(`Invalid exchangeInfo JSON (${r.status})`)
+  }
+  if (!r.ok || !Array.isArray(data?.symbols)) {
+    const msg = data?.msg || data?.message || text
+    throw new Error(`Binance ${r.status}: ${msg}`)
+  }
+  exchangeInfoCache = data
+  exchangeInfoCacheAt = now
+  return data
+}
+
+async function getSymbolSpec(symbol) {
+  const info = await getFuturesExchangeInfo()
+  const row = info.symbols.find((s) => s?.symbol === symbol)
+  if (!row) {
+    throw new Error(`Symbol not found on Binance Futures: ${symbol}`)
+  }
+  const lot = row.filters?.find((f) => f?.filterType === 'LOT_SIZE')
+  const priceFilter = row.filters?.find((f) => f?.filterType === 'PRICE_FILTER')
+  const stepSize = toNum(lot?.stepSize) ?? 0.001
+  const minQty = toNum(lot?.minQty) ?? stepSize
+  const tickSize = toNum(priceFilter?.tickSize) ?? 0.01
+  return {
+    stepSize,
+    minQty,
+    tickSize,
+    quantityPrecision: row.quantityPrecision,
+    pricePrecision: row.pricePrecision,
+  }
+}
+
 /** Signed Binance routes: map 451 geo-block and other Binance statuses to HTTP response. */
 function sendBinanceRouteError(res, e) {
   console.error(e)
@@ -429,6 +556,168 @@ app.get('/api/binance/open-positions', async (_req, res) => {
       ? all.filter((p) => Math.abs(parseFloat(p.positionAmt || 0)) > 0)
       : []
     res.json({ positions, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    return sendBinanceRouteError(res, e)
+  }
+})
+
+app.post('/api/binance/test-order', async (req, res) => {
+  const apiKey = process.env.BINANCE_API_KEY
+  const apiSecret = process.env.BINANCE_API_SECRET
+  if (!apiKey || !apiSecret) {
+    return res.status(503).json({
+      error:
+        'Set BINANCE_API_KEY and BINANCE_API_SECRET in a .env file in the project root.',
+    })
+  }
+
+  let symbol = String(req.body?.symbol ?? '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+  if (!symbol.length || symbol.length > 32) {
+    return res.status(400).json({ error: 'symbol required (e.g. BTC or BTCUSDT)' })
+  }
+  if (!symbol.endsWith('USDT')) symbol = `${symbol}USDT`
+
+  const side = String(req.body?.side ?? 'BUY').trim().toUpperCase()
+  if (side !== 'BUY' && side !== 'SELL') {
+    return res.status(400).json({ error: 'side must be BUY or SELL' })
+  }
+
+  const tradeSizeUsd = Number.parseFloat(String(req.body?.tradeSizeUsd ?? '0'))
+  if (!Number.isFinite(tradeSizeUsd) || tradeSizeUsd <= 0) {
+    return res.status(400).json({ error: 'tradeSizeUsd must be a positive number' })
+  }
+  const leverage = Number.parseInt(String(req.body?.leverage ?? '5'), 10)
+  if (!Number.isFinite(leverage) || leverage < 1 || leverage > 125) {
+    return res.status(400).json({ error: 'leverage must be an integer between 1 and 125' })
+  }
+  const tpPct = Number.parseFloat(String(req.body?.tpPct ?? '0'))
+  const slPct = Number.parseFloat(String(req.body?.slPct ?? '0'))
+  if (!Number.isFinite(tpPct) || tpPct <= 0) {
+    return res.status(400).json({ error: 'tpPct must be a positive number' })
+  }
+  if (!Number.isFinite(slPct) || slPct <= 0) {
+    return res.status(400).json({ error: 'slPct must be a positive number' })
+  }
+
+  try {
+    const spec = await getSymbolSpec(symbol)
+
+    await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/leverage', {
+      symbol,
+      leverage,
+    })
+
+    const tickerQ = new URLSearchParams({ symbol })
+    const tickerRes = await fetch(`${FUTURES_BASE}/fapi/v1/ticker/price?${tickerQ}`)
+    const tickerText = await tickerRes.text()
+    let ticker
+    try {
+      ticker = tickerText ? JSON.parse(tickerText) : {}
+    } catch {
+      return res.status(502).json({ error: 'Invalid Binance ticker response' })
+    }
+    const markPrice = Number.parseFloat(String(ticker?.price ?? ''))
+    if (!Number.isFinite(markPrice) || markPrice <= 0) {
+      return res.status(502).json({ error: 'Could not resolve current symbol price' })
+    }
+
+    const effectiveNotionalUsd = tradeSizeUsd * leverage
+    const rawQty = effectiveNotionalUsd / markPrice
+    const qty = quantizeToStep(rawQty, spec.stepSize, 'floor')
+    if (!Number.isFinite(qty) || qty <= 0 || qty < spec.minQty) {
+      return res.status(400).json({
+        error: `tradeSizeUsd × leverage is too small for ${symbol}. Minimum quantity is ${spec.minQty}.`,
+      })
+    }
+    const quantity = fmtByStep(qty, spec.stepSize, spec.quantityPrecision)
+
+    const entryOrder = await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/order', {
+      symbol,
+      side,
+      type: 'MARKET',
+      quantity,
+      newOrderRespType: 'RESULT',
+    })
+
+    let entryPrice = Number.parseFloat(String(entryOrder?.avgPrice ?? ''))
+    if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
+      const risk = await fetchPositionRisk(apiKey, apiSecret)
+      const row = Array.isArray(risk)
+        ? risk.find((p) => String(p?.symbol ?? '') === symbol && Math.abs(parseFloat(p?.positionAmt ?? '0')) > 0)
+        : null
+      const rp = Number.parseFloat(String(row?.entryPrice ?? ''))
+      entryPrice = Number.isFinite(rp) && rp > 0 ? rp : markPrice
+    }
+
+    const exitSide = side === 'BUY' ? 'SELL' : 'BUY'
+    const tpPriceRaw = side === 'BUY'
+      ? entryPrice * (1 + tpPct / 100)
+      : entryPrice * (1 - tpPct / 100)
+    const slPriceRaw = side === 'BUY'
+      ? entryPrice * (1 - slPct / 100)
+      : entryPrice * (1 + slPct / 100)
+    const tpMode = side === 'BUY' ? 'ceil' : 'floor'
+    const slMode = side === 'BUY' ? 'floor' : 'ceil'
+    const tpPriceNum = quantizeToStep(tpPriceRaw, spec.tickSize, tpMode)
+    const slPriceNum = quantizeToStep(slPriceRaw, spec.tickSize, slMode)
+    if (!Number.isFinite(tpPriceNum) || tpPriceNum <= 0 || !Number.isFinite(slPriceNum) || slPriceNum <= 0) {
+      return res.status(400).json({ error: 'Computed TP/SL prices are invalid for this symbol tick size.' })
+    }
+    const tpPrice = fmtByStep(tpPriceNum, spec.tickSize, spec.pricePrecision)
+    const slPrice = fmtByStep(slPriceNum, spec.tickSize, spec.pricePrecision)
+
+    let tpOrder = null
+    let slOrder = null
+    const warnings = []
+
+    try {
+      tpOrder = await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/order', {
+        symbol,
+        side: exitSide,
+        type: 'TAKE_PROFIT_MARKET',
+        stopPrice: tpPrice,
+        closePosition: 'true',
+        workingType: 'MARK_PRICE',
+        priceProtect: 'true',
+      })
+    } catch (e) {
+      warnings.push(`TP order failed: ${e instanceof Error ? e.message : 'Unknown error'}`)
+    }
+
+    try {
+      slOrder = await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/order', {
+        symbol,
+        side: exitSide,
+        type: 'STOP_MARKET',
+        stopPrice: slPrice,
+        closePosition: 'true',
+        workingType: 'MARK_PRICE',
+        priceProtect: 'true',
+      })
+    } catch (e) {
+      warnings.push(`SL order failed: ${e instanceof Error ? e.message : 'Unknown error'}`)
+    }
+
+    return res.json({
+      ok: true,
+      symbol,
+      side,
+      leverage,
+      tradeSizeUsd,
+      effectiveNotionalUsd,
+      quantity,
+      entryPrice,
+      tpPrice,
+      slPrice,
+      entryOrder,
+      tpOrder,
+      slOrder,
+      warnings,
+      fetchedAt: new Date().toISOString(),
+    })
   } catch (e) {
     return sendBinanceRouteError(res, e)
   }

@@ -2,7 +2,6 @@ import { useCallback, useEffect, useId, useMemo, useState } from 'react'
 import { MarketBreadth } from './MarketBreadth'
 import { Backtest1 } from './Backtest1'
 import { Backtest2 } from './Backtest2'
-import { VolumeScreener } from './VolumeScreener'
 import { Backtest3 } from './Backtest3'
 import { Backtest4 } from './Backtest4'
 import { ZoneHedgeBacktest } from './ZoneHedgeBacktest'
@@ -12,13 +11,14 @@ import { SpikeFilter } from './SpikeFilter'
 import { SpikeTpSlBacktest } from './SpikeTpSlBacktest'
 import { SpikeTpSlBacktestV2 } from './SpikeTpSlBacktestV2'
 import { SpikeTpSlBacktestV3 } from './SpikeTpSlBacktestV3'
-import { FiveMinScreener } from './FiveMinScreener'
 import { The100k } from './The100k'
 import { TradeHistory } from './TradeHistory'
 import { Emotions } from './Emotions'
 import { EmotionsErrorBoundary } from './EmotionsErrorBoundary'
 import { HFT } from './HFT'
 import { MlDatasetPrep } from './MlDatasetPrep'
+import { Agent1 } from './Agent1'
+import { TestPage } from './TestPage'
 import './App.css'
 
 async function fetchOpenPositions() {
@@ -113,6 +113,14 @@ function App() {
     if (isBacktestView) setBacktestMenuOpen(true)
   }, [view, isBacktestView])
 
+  const AGENTS_VIEWS = ['agent1']
+  const isAgentsView = AGENTS_VIEWS.includes(view)
+  const [agentsMenuOpen, setAgentsMenuOpen] = useState(isAgentsView)
+
+  useEffect(() => {
+    if (isAgentsView) setAgentsMenuOpen(true)
+  }, [view, isAgentsView])
+
   const totalOpenPnl = useMemo(() => {
     if (!positions?.length) return null
     let s = 0
@@ -200,6 +208,9 @@ function App() {
           <span className="hamburger-line" aria-hidden />
           <span className="hamburger-line" aria-hidden />
         </button>
+        {view === 'agent1' && (
+          <h1 className="top-bar-title">Agent 1</h1>
+        )}
       </header>
 
       {menuOpen && (
@@ -228,6 +239,45 @@ function App() {
               }}
             >
               Home
+            </a>
+          </li>
+          <li className="menu-item--submenu">
+            <details
+              className="menu-details"
+              open={agentsMenuOpen}
+              onToggle={(e) => setAgentsMenuOpen(e.currentTarget.open)}
+            >
+              <summary
+                className={`menu-details-summary ${isAgentsView ? 'menu-details-summary--active' : ''}`}
+              >
+                Agents
+              </summary>
+              <ul className="menu-sublist">
+                <li>
+                  <a
+                    href="#"
+                    className={`menu-link menu-sublink ${view === 'agent1' ? 'menu-link--active' : ''}`}
+                    onClick={(e) => {
+                      e.preventDefault()
+                      go('agent1')
+                    }}
+                  >
+                    Agent 1
+                  </a>
+                </li>
+              </ul>
+            </details>
+          </li>
+          <li>
+            <a
+              href="#"
+              className={`menu-link ${view === 'testpage' ? 'menu-link--active' : ''}`}
+              onClick={(e) => {
+                e.preventDefault()
+                go('testpage')
+              }}
+            >
+              Test Page
             </a>
           </li>
           <li>
@@ -288,18 +338,6 @@ function App() {
               }}
             >
               ML dataset
-            </a>
-          </li>
-          <li>
-            <a
-              href="#"
-              className={`menu-link ${view === 'volume' ? 'menu-link--active' : ''}`}
-              onClick={(e) => {
-                e.preventDefault()
-                go('volume')
-              }}
-            >
-              24h volume
             </a>
           </li>
           <li className="menu-item--submenu">
@@ -461,35 +499,11 @@ function App() {
               HFT
             </a>
           </li>
-          <li>
-            <a
-              href="#"
-              className={`menu-link ${view === '5minscreener' ? 'menu-link--active' : ''}`}
-              onClick={(e) => {
-                e.preventDefault()
-                go('5minscreener')
-              }}
-            >
-              5min screener
-            </a>
-          </li>
-          <li>
-            <a
-              href="#"
-              className={`menu-link ${view === '5minscreener-bi' ? 'menu-link--active' : ''}`}
-              onClick={(e) => {
-                e.preventDefault()
-                go('5minscreener-bi')
-              }}
-            >
-              5m screener (± wicks)
-            </a>
-          </li>
         </ul>
       </nav>
 
       <main
-        className={`app ${view === 'breadth' || view === 'history' || view === 'emotions' || view === 'mldataset' || view === 'the100k' || view === 'backtest1' || view === 'backtest2' || view === 'backtest3' || view === 'backtest4' || view === 'zonehedge' || view === 'hourlyspikes' || view === 'gptbacktest' || view === 'spikefilter' || view === 'spiketpsl' || view === 'spiketpslv2' || view === 'spiketpslv3' || view === '5minscreener' || view === '5minscreener-bi' || view === 'volume' || view === 'hft' ? 'app--breadth' : ''}`}
+        className={`app ${view === 'breadth' || view === 'history' || view === 'emotions' || view === 'mldataset' || view === 'the100k' || view === 'backtest1' || view === 'backtest2' || view === 'backtest3' || view === 'backtest4' || view === 'zonehedge' || view === 'hourlyspikes' || view === 'gptbacktest' || view === 'spikefilter' || view === 'spiketpsl' || view === 'spiketpslv2' || view === 'spiketpslv3' || view === 'hft' || view === 'agent1' || view === 'testpage' ? 'app--breadth' : ''}`}
         id="main"
       >
         {view === 'home' && (
@@ -673,7 +687,6 @@ function App() {
         {view === 'mldataset' && <MlDatasetPrep />}
         {view === 'backtest1' && <Backtest1 />}
         {view === 'backtest2' && <Backtest2 />}
-        {view === 'volume' && <VolumeScreener />}
         {view === 'backtest3' && <Backtest3 />}
         {view === 'backtest4' && <Backtest4 />}
         {view === 'zonehedge' && <ZoneHedgeBacktest />}
@@ -683,9 +696,9 @@ function App() {
         {view === 'spiketpsl' && <SpikeTpSlBacktest />}
         {view === 'spiketpslv2' && <SpikeTpSlBacktestV2 />}
         {view === 'spiketpslv3' && <SpikeTpSlBacktestV3 />}
-        {view === '5minscreener' && <FiveMinScreener spikeDirections="up" />}
-        {view === '5minscreener-bi' && <FiveMinScreener spikeDirections="both" />}
         {view === 'hft' && <HFT />}
+        {view === 'agent1' && <Agent1 />}
+        {view === 'testpage' && <TestPage />}
       </main>
     </div>
   )
