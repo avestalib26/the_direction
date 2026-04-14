@@ -15,6 +15,10 @@ import {
   acquireFuturesRestWeight,
   futuresKlinesRequestWeight,
 } from './binanceFuturesRestThrottle.js'
+import {
+  attachBtcCloseToEquityPoints,
+  candlesToBtcCloseMap,
+} from './spikeTpSlEquityBtc.js'
 
 /** Max UTC calendar-day span (inclusive) for fromDate → toDate. */
 export const SPIKE_TPSL_MAX_RANGE_DAYS = 3
@@ -636,6 +640,17 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const requestedSymbols = volFiltered.length
   const selected = volFiltered.slice(0, maxSymbols)
 
+  const btcCandlesPromise = utcRange
+    ? fetchKlinesOHLCInRange(
+        futuresBase,
+        'BTCUSDT',
+        interval,
+        utcRange.startTime,
+        utcRange.endTime,
+        publicHeaders,
+      )
+    : fetchKlinesOHLC(futuresBase, 'BTCUSDT', interval, n, publicHeaders)
+
   const raw = await mapPool(selected, CONCURRENCY, async (row) => {
     try {
       const candles = utcRange
@@ -734,7 +749,15 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     if (a.entryOpenTime !== b.entryOpenTime) return a.entryOpenTime - b.entryOpenTime
     return String(a.symbol ?? '').localeCompare(String(b.symbol ?? ''))
   })
+  let btcByOpenTime = new Map()
+  try {
+    const btcCandles = await btcCandlesPromise
+    btcByOpenTime = candlesToBtcCloseMap(btcCandles)
+  } catch (e) {
+    console.error('BTCUSDT klines for equity overlay failed:', e)
+  }
   const { points: equityCurveFull } = buildEquityCurveSummedPricePct(chron)
+  attachBtcCloseToEquityPoints(equityCurveFull, btcByOpenTime)
   const lastPt = equityCurveFull[equityCurveFull.length - 1]
   const perTradePricePctChronFull = chron.map((t) => tradePriceReturnPct(t))
 

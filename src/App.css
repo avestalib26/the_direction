@@ -20,6 +20,11 @@
   border-bottom: 1px solid var(--menu-border);
 }
 
+.top-bar--agent1 .top-bar-title {
+  flex: 1;
+  min-width: 0;
+}
+
 .top-bar-title {
   margin: 0;
   flex: 1;
@@ -29,6 +34,224 @@
   color: var(--text-heading);
   letter-spacing: -0.02em;
   line-height: 1.2;
+}
+
+.top-bar-agent1-actions {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.agent1-master-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2.25rem;
+  padding: 0.2rem 0.55rem 0.2rem 2.15rem;
+  border: 1px solid var(--menu-border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg) 70%, var(--menu-border));
+  color: var(--text-heading);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+
+.agent1-master-toggle:hover:not(:disabled) {
+  background: var(--menu-hover);
+}
+
+.agent1-master-toggle:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.agent1-master-toggle__track {
+  position: absolute;
+  left: 0.35rem;
+  width: 1.45rem;
+  height: 0.85rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-muted) 35%, transparent);
+}
+
+.agent1-master-toggle__thumb {
+  position: absolute;
+  left: 0.4rem;
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 50%;
+  background: var(--text-heading);
+  transition: transform 0.18s ease, background 0.18s ease;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+
+.agent1-master-toggle--on .agent1-master-toggle__track {
+  background: color-mix(in srgb, #0ecb81 45%, transparent);
+}
+
+.agent1-master-toggle--on .agent1-master-toggle__thumb {
+  transform: translateX(0.65rem);
+  background: #0ecb81;
+}
+
+.agent1-master-toggle--off .agent1-master-toggle__text {
+  color: var(--text-muted);
+}
+
+.agent1-master-toggle__text {
+  min-width: 1.5rem;
+  text-align: left;
+}
+
+@media (max-width: 400px) {
+  .top-bar--agent1 .top-bar-title {
+    font-size: 0.92rem;
+  }
+
+  .agent1-master-toggle {
+    padding: 0.15rem 0.45rem 0.15rem 1.95rem;
+    font-size: 0.72rem;
+    min-height: 2rem;
+  }
+
+  .agent1-master-toggle__track {
+    left: 0.3rem;
+    width: 1.25rem;
+    height: 0.75rem;
+  }
+
+  .agent1-master-toggle__thumb {
+    left: 0.35rem;
+    width: 0.65rem;
+    height: 0.65rem;
+  }
+
+  .agent1-master-toggle--on .agent1-master-toggle__thumb {
+    transform: translateX(0.55rem);
+  }
+}
+
+.backtest1-btn {
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  padding: 0.5rem 0.9rem;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--text-heading) 28%, var(--menu-border));
+  background: color-mix(in srgb, var(--text-heading) 88%, transparent);
+  color: var(--bg);
+  cursor: pointer;
+  transition: opacity 0.15s ease, background 0.15s ease;
+  min-height: 44px;
+  box-sizing: border-box;
+}
+
+.backtest1-btn:hover:not(:disabled) {
+  opacity: 0.92;
+}
+
+.backtest1-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.backtest1-btn--secondary {
+  background: var(--menu-surface);
+  color: var(--text-heading);
+  border-color: var(--menu-border);
+}
+
+.backtest1-btn--secondary:hover:not(:disabled) {
+  background: var(--menu-hover);
+  opacity: 1;
+}
+
+.agent1-page {
+  width: 100%;
+  max-width: 56rem;
+  margin-inline: auto;
+  padding-inline: max(0.65rem, env(safe-area-inset-left, 0px));
+  padding-right: max(0.65rem, env(safe-area-inset-right, 0px));
+  box-sizing: border-box;
+}
+
+.agent1-page .vol-screener-title {
+  text-align: left;
+}
+
+.agent1-section-title {
+  font-size: clamp(1rem, 4vw, 1.1rem) !important;
+  margin: 0 0 0.5rem !important;
+}
+
+.agent1-section-title--table {
+  margin-top: 1.25rem !important;
+}
+
+.agent1-risk-summary {
+  margin-bottom: 1rem;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.agent1-risk-summary .risk-chip {
+  max-width: 100%;
+}
+
+@media (min-width: 520px) {
+  .agent1-risk-summary {
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .agent1-risk-summary .risk-chip {
+    max-width: none;
+  }
+}
+
+.agent1-form {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 12rem), 1fr)) !important;
+  padding: 0.75rem !important;
+  gap: 0.85rem !important;
+}
+
+.agent1-form-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  padding-top: 0.15rem;
+}
+
+.agent1-form-actions .backtest1-btn {
+  flex: 1 1 auto;
+  min-width: min(100%, 10rem);
+}
+
+.agent1-spikes-wrap {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+
+.agent1-spikes-table {
+  min-width: 36rem;
+  font-size: clamp(0.72rem, 2.8vw, 0.8125rem);
+}
+
+.agent1-spikes-table th,
+.agent1-spikes-table td {
+  padding: 0.5rem 0.45rem;
+}
+
+@media (min-width: 640px) {
+  .agent1-spikes-table th,
+  .agent1-spikes-table td {
+    padding: 0.6rem 0.75rem;
+  }
 }
 
 .hamburger {

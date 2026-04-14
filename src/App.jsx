@@ -51,6 +51,10 @@ function App() {
   const [maxNegPnlPct, setMaxNegPnlPct] = useState('500')
   const [maxOpenPositions, setMaxOpenPositions] = useState('10')
   const [maxTotalPositionSize, setMaxTotalPositionSize] = useState('0')
+  /** null = loading; master on/off persisted in Supabase (header toggle). */
+  const [agent1MasterEnabled, setAgent1MasterEnabled] = useState(null)
+  const [agent1MasterSaving, setAgent1MasterSaving] = useState(false)
+
   const loadPositions = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -120,6 +124,53 @@ function App() {
   useEffect(() => {
     if (isAgentsView) setAgentsMenuOpen(true)
   }, [view, isAgentsView])
+
+  useEffect(() => {
+    if (view !== 'agent1') return
+    let cancelled = false
+    setAgent1MasterEnabled(null)
+    ;(async () => {
+      try {
+        const res = await fetch('/api/agents/agent1/settings', { cache: 'no-store' })
+        const data = await res.json().catch(() => ({}))
+        if (cancelled) return
+        if (!res.ok) throw new Error(data.error || String(res.status))
+        setAgent1MasterEnabled(data.settings?.agentEnabled !== false)
+      } catch {
+        if (!cancelled) setAgent1MasterEnabled(true)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [view])
+
+  const requestAgent1MasterToggle = useCallback(async () => {
+    if (agent1MasterEnabled == null || agent1MasterSaving) return
+    const next = !agent1MasterEnabled
+    const ok = window.confirm(
+      next
+        ? 'Turn Agent 1 ON? The server will run scheduled 5m spike scans when the API scheduler is enabled.'
+        : 'Turn Agent 1 OFF? Scheduled spike scans will stop until you turn the agent on again.',
+    )
+    if (!ok) return
+    setAgent1MasterSaving(true)
+    try {
+      const res = await fetch('/api/agents/agent1/enabled', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+      setAgent1MasterEnabled(data.settings?.agentEnabled !== false)
+      window.dispatchEvent(new Event('agent1-enabled-changed'))
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'Failed to update Agent1')
+    } finally {
+      setAgent1MasterSaving(false)
+    }
+  }, [agent1MasterEnabled, agent1MasterSaving])
 
   const totalOpenPnl = useMemo(() => {
     if (!positions?.length) return null
@@ -195,7 +246,7 @@ function App() {
 
   return (
     <div className="layout">
-      <header className="top-bar">
+      <header className={`top-bar ${view === 'agent1' ? 'top-bar--agent1' : ''}`}>
         <button
           type="button"
           className="hamburger"
@@ -209,7 +260,29 @@ function App() {
           <span className="hamburger-line" aria-hidden />
         </button>
         {view === 'agent1' && (
-          <h1 className="top-bar-title">Agent 1</h1>
+          <>
+            <h1 className="top-bar-title">Agent 1</h1>
+            <div className="top-bar-agent1-actions">
+              <button
+                type="button"
+                className={`agent1-master-toggle ${agent1MasterEnabled ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
+                onClick={() => requestAgent1MasterToggle()}
+                disabled={agent1MasterEnabled == null || agent1MasterSaving}
+                aria-pressed={agent1MasterEnabled === true}
+                title={
+                  agent1MasterEnabled
+                    ? 'Agent is ON — click to turn OFF (confirmation)'
+                    : 'Agent is OFF — click to turn ON (confirmation)'
+                }
+              >
+                <span className="agent1-master-toggle__track" aria-hidden />
+                <span className="agent1-master-toggle__thumb" aria-hidden />
+                <span className="agent1-master-toggle__text">
+                  {agent1MasterSaving ? '…' : agent1MasterEnabled ? 'On' : 'Off'}
+                </span>
+              </button>
+            </div>
+          </>
         )}
       </header>
 

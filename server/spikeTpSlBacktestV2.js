@@ -18,6 +18,10 @@ import {
   acquireFuturesRestWeight,
   futuresKlinesRequestWeight,
 } from './binanceFuturesRestThrottle.js'
+import {
+  attachBtcCloseToEquityPoints,
+  candlesToBtcCloseMap,
+} from './spikeTpSlEquityBtc.js'
 
 /** Single-day mode only (one trade date per request). */
 export const SPIKE_TPSL_V2_MAX_RANGE_DAYS = 1
@@ -585,7 +589,7 @@ function buildEquityCurveSummedPricePct(tradesChronAsc) {
  * Summary, equity curve, and trade tables from a full trade list (post-process / filtered views).
  * @param {object[]} perSymbolRows — pre-sorted rows for the per-symbol table
  */
-function computeAggregatesBundle(allTrades, perSymbolRows) {
+function computeAggregatesBundle(allTrades, perSymbolRows, btcByOpenTime) {
   const totalTrades = allTrades.length
   const tpHits = allTrades.filter((t) => t.outcome === 'tp').length
   const slHits = allTrades.filter((t) => t.outcome === 'sl').length
@@ -609,6 +613,7 @@ function computeAggregatesBundle(allTrades, perSymbolRows) {
     return String(a.symbol ?? '').localeCompare(String(b.symbol ?? ''))
   })
   const { points: equityCurveFull } = buildEquityCurveSummedPricePct(chron)
+  attachBtcCloseToEquityPoints(equityCurveFull, btcByOpenTime)
   const lastPt = equityCurveFull[equityCurveFull.length - 1]
   const perTradePricePctChronFull = chron.map((t) => tradePriceReturnPct(t))
 
@@ -838,7 +843,22 @@ export async function computeSpikeTpSlBacktestV2(futuresBase, opts) {
   const maxSymbolBarCount =
     perSymbol.length > 0 ? Math.max(...perSymbol.map((p) => p.candleCount ?? 0)) : 0
 
-  const mainBundle = computeAggregatesBundle(allTrades, perSymbol)
+  let btcByOpenTime = new Map()
+  try {
+    const btcCandles = await fetchKlinesOHLCInRange(
+      futuresBase,
+      'BTCUSDT',
+      interval,
+      dayCtx.tradeDayStart,
+      dayCtx.tradeDayEnd,
+      publicHeaders,
+    )
+    btcByOpenTime = candlesToBtcCloseMap(btcCandles)
+  } catch (e) {
+    console.error('BTCUSDT klines for equity overlay failed:', e)
+  }
+
+  const mainBundle = computeAggregatesBundle(allTrades, perSymbol, btcByOpenTime)
 
   const allTradesPriorDayUp = allTrades.filter(
     (t) =>
@@ -856,7 +876,11 @@ export async function computeSpikeTpSlBacktestV2(futuresBase, opts) {
     if (b.sumR !== a.sumR) return b.sumR - a.sumR
     return b.tradeCount - a.tradeCount
   })
-  const filteredBundle = computeAggregatesBundle(allTradesPriorDayUp, perSymbolPriorDayUp)
+  const filteredBundle = computeAggregatesBundle(
+    allTradesPriorDayUp,
+    perSymbolPriorDayUp,
+    btcByOpenTime,
+  )
 
   const meta =
     strat === 'shortSpikeLow'

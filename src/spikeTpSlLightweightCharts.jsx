@@ -72,6 +72,19 @@ function equityToLineData(points) {
   return data.length >= 2 ? data : null
 }
 
+function btcOverlayLineData(points) {
+  if (!Array.isArray(points) || points.length < 2) return null
+  const data = []
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i]
+    const k = Number.isFinite(p.tradeIndex) ? p.tradeIndex : i
+    const v = Number(p.btcCloseUsd)
+    if (!Number.isFinite(v)) continue
+    data.push({ time: synthTradeTime(k), value: v })
+  }
+  return data.length >= 2 ? data : null
+}
+
 function fmtInt(n) {
   return Number.isFinite(n) ? n.toLocaleString() : '—'
 }
@@ -81,14 +94,18 @@ const COL_TEXT = '#B7BDC6'
 const COL_GRID = 'rgba(255, 255, 255, 0.06)'
 const COL_POS = '#0ecb81'
 const COL_NEG = '#f6465d'
+const COL_BTC = '#f0b90b'
 
 export function SpikeTpSlEquityLightChart({ points }) {
   const containerRef = useRef(null)
   const lineData = useMemo(() => equityToLineData(points), [points])
+  const btcData = useMemo(() => btcOverlayLineData(points), [points])
 
   useLayoutEffect(() => {
     const el = containerRef.current
     if (!el || !lineData) return undefined
+
+    const showBtc = btcData && btcData.length >= 2
 
     const chart = createChart(el, {
       layout: {
@@ -107,7 +124,16 @@ export function SpikeTpSlEquityLightChart({ points }) {
         timeVisible: true,
         secondsVisible: false,
       },
-      rightPriceScale: { borderColor: COL_GRID },
+      leftPriceScale: {
+        visible: showBtc,
+        borderColor: COL_GRID,
+        scaleMargins: { top: 0.08, bottom: 0.08 },
+      },
+      rightPriceScale: {
+        visible: true,
+        borderColor: COL_GRID,
+        scaleMargins: { top: 0.08, bottom: 0.08 },
+      },
       localization: {
         priceFormatter: (p) => `${Number(p).toFixed(2)}%`,
       },
@@ -117,8 +143,20 @@ export function SpikeTpSlEquityLightChart({ points }) {
     const series = chart.addSeries(LineSeries, {
       color: last >= 0 ? COL_POS : COL_NEG,
       lineWidth: 2,
+      priceScaleId: 'right',
     })
     series.setData(lineData)
+
+    if (showBtc) {
+      const btcSeries = chart.addSeries(LineSeries, {
+        color: COL_BTC,
+        lineWidth: 1,
+        priceScaleId: 'left',
+        priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+      })
+      btcSeries.setData(btcData)
+    }
+
     chart.timeScale().fitContent()
 
     const ro = new ResizeObserver(() => {
@@ -129,7 +167,7 @@ export function SpikeTpSlEquityLightChart({ points }) {
       ro.disconnect()
       chart.remove()
     }
-  }, [lineData])
+  }, [lineData, btcData])
 
   if (!lineData) {
     return (
@@ -141,8 +179,14 @@ export function SpikeTpSlEquityLightChart({ points }) {
     <div className="spike-tpsl-lw-host">
       <div ref={containerRef} className="spike-tpsl-lw-chart" />
       <p className="hourly-spikes-hint spike-tpsl-lw-axis-hint">
-        <strong>TradingView Lightweight Charts</strong> — time axis is synthetic (one step per trade #);
-        values are cumulative Σ price %.
+        <strong>TradingView Lightweight Charts</strong> — time axis is synthetic (one step per trade #).
+        <strong> Right axis</strong>: cumulative Σ price %.
+        {btcData && btcData.length >= 2 ? (
+          <>
+            {' '}
+            <strong>Left axis</strong>: BTCUSDT close at each trade&apos;s entry bar (same interval as backtest).
+          </>
+        ) : null}
       </p>
     </div>
   )

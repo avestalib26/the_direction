@@ -57,27 +57,45 @@ async function fetchKlines(futuresBase, symbol, interval, limit) {
   return parseKlines(data)
 }
 
-function countSpikeEvents(candles, thresholdPct, spikeDirections) {
+function countSpikeEvents(candles, thresholdPct, spikeDirections, spikeMetric) {
   let count = 0
   const wantUp = spikeDirections !== 'down'
   const wantDown = spikeDirections !== 'up'
+  const upFn = spikeMetric === 'wick' ? isWickSpikeUp : isBodySpikeUp
+  const downFn = spikeMetric === 'wick' ? isWickSpikeDown : isBodySpikeDown
   for (const c of candles) {
-    if (wantUp && isSpikeUp(c, thresholdPct)) count += 1
-    if (wantDown && isSpikeDown(c, thresholdPct)) count += 1
+    if (wantUp && upFn(c, thresholdPct)) count += 1
+    if (wantDown && downFn(c, thresholdPct)) count += 1
   }
   return count
 }
 
-function isSpikeUp(c, thresholdPct) {
+function isWickSpikeUp(c, thresholdPct) {
   if (!Number.isFinite(c.open) || c.open === 0 || !Number.isFinite(c.high)) return false
   const upPct = ((c.high - c.open) / c.open) * 100
   return upPct >= thresholdPct
 }
 
-function isSpikeDown(c, thresholdPct) {
+function isWickSpikeDown(c, thresholdPct) {
   if (!Number.isFinite(c.open) || c.open === 0 || !Number.isFinite(c.low)) return false
   const downPct = ((c.open - c.low) / c.open) * 100
   return downPct >= thresholdPct
+}
+
+/** Signed body %: (close−open)/open×100. Up spike = green body ≥ threshold; down = red body ≥ threshold. */
+function bodyPctSigned(c) {
+  if (!Number.isFinite(c.open) || c.open === 0 || !Number.isFinite(c.close)) return null
+  return ((c.close - c.open) / c.open) * 100
+}
+
+function isBodySpikeUp(c, thresholdPct) {
+  const p = bodyPctSigned(c)
+  return p != null && p >= thresholdPct
+}
+
+function isBodySpikeDown(c, thresholdPct) {
+  const p = bodyPctSigned(c)
+  return p != null && p <= -thresholdPct
 }
 
 /** Up wick %: (high − open) / open (positive). */
@@ -100,6 +118,7 @@ function nextCandleOtoCPct(c1) {
 }
 
 const SPIKE_DIRECTIONS = new Set(['up', 'down', 'both'])
+const SPIKE_METRICS = new Set(['body', 'wick'])
 
 export async function computeFiveMinScreener(futuresBase, {
   candleCount,
@@ -107,24 +126,40 @@ export async function computeFiveMinScreener(futuresBase, {
   thresholdPct,
   interval = '5m',
   spikeDirections = 'up',
+  spikeMetric = 'body',
+  maxSymbols: maxSymbolsOpt,
 }) {
   const dir =
     typeof spikeDirections === 'string' && SPIKE_DIRECTIONS.has(spikeDirections)
       ? spikeDirections
       : 'up'
+  const metric =
+    typeof spikeMetric === 'string' && SPIKE_METRICS.has(spikeMetric.toLowerCase())
+      ? spikeMetric.toLowerCase()
+      : 'body'
   const wantUp = dir !== 'down'
   const wantDown = dir !== 'up'
   const volumeRows = await computeFutures24hVolumes(futuresBase)
   const filtered = volumeRows.filter((r) => r.quoteVolume24h >= minQuoteVolume)
   const requestedSymbols = filtered.length
 
-  const maxSymRaw = Number.parseInt(process.env.FIVEMIN_SCREENER_MAX_SYMBOLS ?? '300', 10)
-  const maxSymbols = Number.isFinite(maxSymRaw) && maxSymRaw > 0 ? maxSymRaw : 300
+  const maxSymEnv = Number.parseInt(process.env.FIVEMIN_SCREENER_MAX_SYMBOLS ?? '600', 10)
+  const envCap = Number.isFinite(maxSymEnv) && maxSymEnv > 0 ? maxSymEnv : 600
+  const maxSymQuery = Number.parseInt(String(maxSymbolsOpt ?? ''), 10)
+  const hardCap = 800
+  const maxSymbols =
+    Number.isFinite(maxSymQuery) && maxSymQuery > 0
+      ? Math.min(hardCap, maxSymQuery)
+      : Math.min(hardCap, envCap)
   const selected = filtered.slice(0, maxSymbols)
 
   const intervalMinutes = intervalToMinutes(interval)
   const candlesPerSymbol = Math.max(1, Math.min(1500, Math.floor(candleCount)))
-  const CONCURRENCY = 9
+  const concRaw = Number.parseInt(process.env.FIVEMIN_SCREENER_CONCURRENCY ?? '18', 10)
+  const CONCURRENCY = Math.min(
+    24,
+    Math.max(4, Number.isFinite(concRaw) && concRaw > 0 ? concRaw : 18),
+  )
   const timelineMap = new Map()
   const raw = await mapPool(selected, CONCURRENCY, async (row) => {
     try {
@@ -132,7 +167,7 @@ export async function computeFiveMinScreener(futuresBase, {
       if (!candles.length) {
         return { symbol: row.symbol, quoteVolume24h: row.quoteVolume24h, error: 'no candles' }
       }
-      const count = countSpikeEvents(candles, thresholdPct, dir)
+      const count = countSpikeEvents(candles, thresholdPct, dir, metric)
       const spikeEvents = []
       for (let i = 0; i < candles.length; i++) {
         const c = candles[i]
@@ -156,13 +191,19 @@ export async function computeFiveMinScreener(futuresBase, {
         const slot = timelineMap.get(key)
         slot.coinCount += 1
 
+        const upFn = metric === 'wick' ? isWickSpikeUp : isBodySpikeUp
+        const downFn = metric === 'wick' ? isWickSpikeDown : isBodySpikeDown
         const dirs = []
-        if (wantUp && isSpikeUp(c, thresholdPct)) dirs.push('up')
-        if (wantDown && isSpikeDown(c, thresholdPct)) dirs.push('down')
+        if (wantUp && upFn(c, thresholdPct)) dirs.push('up')
+        if (wantDown && downFn(c, thresholdPct)) dirs.push('down')
 
         for (const direction of dirs) {
           const wickPct =
-            direction === 'up' ? spikeUpWickPct(c) : spikeDownWickPctSigned(c)
+            metric === 'wick'
+              ? direction === 'up'
+                ? spikeUpWickPct(c)
+                : spikeDownWickPctSigned(c)
+              : bodyPctSigned(c)
           const c1 = candles[i + 1]
           const nextPct = nextCandleOtoCPct(c1)
           if (wickPct != null) {
@@ -295,6 +336,7 @@ export async function computeFiveMinScreener(futuresBase, {
     spikeSlotsTimeWiseV2,
     timeline,
     spikeDirections: dir,
+    spikeMetric: metric,
     thresholdPct,
     minQuoteVolume,
     candleCount: candlesPerSymbol,
@@ -370,6 +412,7 @@ function intervalToMinutes(interval) {
     '2h': 120,
     '4h': 240,
     '6h': 360,
+    '8h': 480,
     '12h': 720,
     '1d': 1440,
   }

@@ -439,9 +439,10 @@ export function SpikeTpSlBacktestV2() {
                 Trades in <strong>entry-time</strong> order. Each trade adds its entry→exit{' '}
                 <strong>price</strong> return % (long:{' '}
                 <code className="inline-code">(exit−entry)/entry</code>, short:{' '}
-                <code className="inline-code">(entry−exit)/entry</code>). Y-axis is the{' '}
-                <strong>running sum</strong> of those % (starts at 0). Reference scale100 + Σ is not a
-                compounded balance.
+                <code className="inline-code">(entry−exit)/entry</code>). The <strong>right</strong> scale is
+                the <strong>running sum</strong> of those % (starts at 0). The <strong>left</strong> scale
+                (gold line) is <strong>BTCUSDT</strong> close on the entry bar (same kline interval as the
+                backtest), aligned in trade order for context.
                 {resultView.src.equityCurveDownsampled ? (
                   <>
                     {' '}

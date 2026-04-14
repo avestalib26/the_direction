@@ -34,6 +34,15 @@ import {
   futuresSignedPathWeight,
   FUTURES_TIME_WEIGHT,
 } from './binanceFuturesRestThrottle.js'
+import {
+  agent1SchedulerState,
+  startAgent1ScanScheduler,
+} from './agent1ScanScheduler.js'
+import {
+  AGENT1_INTERVAL_MS,
+  AGENT1_SCAN_INTERVALS,
+  clampScanSecondsBeforeClose,
+} from './agent1ScanIntervals.js'
 
 const USE_TESTNET = process.env.BINANCE_USE_TESTNET === 'true'
 const FUTURES_BASE =
@@ -48,6 +57,25 @@ const SPOT_BASE =
 const FUTURES_WS_BASE =
   process.env.BINANCE_FUTURES_WS ||
   (USE_TESTNET ? 'wss://stream.binancefuture.com' : 'wss://fstream.binance.com')
+const SUPABASE_URL = String(process.env.SUPABASE_URL ?? '').replace(/\/+$/, '')
+const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? '').trim()
+
+const AGENT1_DEFAULT_SETTINGS = Object.freeze({
+  agentName: 'agent1',
+  tradeSizeUsd: 1,
+  leverage: 10,
+  marginMode: 'cross',
+  maxTpPct: 1.5,
+  maxSlPct: 1.0,
+  scanSecondsBeforeClose: 20,
+  scanThresholdPct: 3,
+  scanMinQuoteVolume: 0,
+  scanMaxSymbols: 800,
+  scanSpikeMetric: 'body',
+  scanDirection: 'both',
+  scanInterval: '5m',
+  agentEnabled: true,
+})
 
 class BinanceApiError extends Error {
   constructor(message, statusCode) {
@@ -56,6 +84,8 @@ class BinanceApiError extends Error {
     this.statusCode = statusCode
   }
 }
+
+class SupabaseConfigError extends Error {}
 
 function signQuery(secret, queryString) {
   return crypto.createHmac('sha256', secret).update(queryString).digest('hex')
@@ -370,13 +400,22 @@ async function getSymbolSpec(symbol) {
   }
   const lot = row.filters?.find((f) => f?.filterType === 'LOT_SIZE')
   const priceFilter = row.filters?.find((f) => f?.filterType === 'PRICE_FILTER')
+  const minNotionalFilter = row.filters?.find((f) => f?.filterType === 'MIN_NOTIONAL')
+  const notionalFilter = row.filters?.find((f) => f?.filterType === 'NOTIONAL')
   const stepSize = toNum(lot?.stepSize) ?? 0.001
   const minQty = toNum(lot?.minQty) ?? stepSize
   const tickSize = toNum(priceFilter?.tickSize) ?? 0.01
+  const minNotional =
+    toNum(notionalFilter?.minNotional) ??
+    toNum(minNotionalFilter?.notional) ??
+    toNum(minNotionalFilter?.minNotional) ??
+    0
   return {
     stepSize,
     minQty,
     tickSize,
+    minNotional,
+    orderTypes: Array.isArray(row.orderTypes) ? row.orderTypes : [],
     quantityPrecision: row.quantityPrecision,
     pricePrecision: row.pricePrecision,
   }
@@ -396,6 +435,28 @@ function sendBinanceRouteError(res, e) {
         `Details: ${e.message}`,
     })
   }
+  if (
+    e instanceof BinanceApiError &&
+    e.statusCode === 400 &&
+    /position side does not match user's setting/i.test(String(e.message))
+  ) {
+    return res.status(400).json({
+      code: 'BINANCE_POSITION_SIDE_MISMATCH',
+      error:
+        'Position mode mismatch on Binance Futures. Your account is likely in Hedge Mode, but the order was sent without the expected position side (LONG/SHORT), or your current mode expects ONE-WAY. Align your Binance position mode and order side settings, then try again.',
+    })
+  }
+  if (
+    e instanceof BinanceApiError &&
+    e.statusCode === 400 &&
+    /notional must be no smaller than/i.test(String(e.message))
+  ) {
+    return res.status(400).json({
+      code: 'BINANCE_MIN_NOTIONAL',
+      error:
+        'Order rejected: minimum notional not met. Increase trade size or leverage so trade size × leverage satisfies Binance minimum notional for this symbol.',
+    })
+  }
   if (e instanceof BinanceApiError && e.statusCode >= 400 && e.statusCode < 500) {
     return res.status(e.statusCode).json({ error: e.message })
   }
@@ -406,6 +467,242 @@ function sendBinanceRouteError(res, e) {
 
 async function fetchPositionRisk(apiKey, apiSecret) {
   return signedFuturesJson(apiKey, apiSecret, '/fapi/v2/positionRisk', {})
+}
+
+function ensureSupabaseConfigured() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new SupabaseConfigError(
+      'Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in server .env to use Agent 1 settings storage.',
+    )
+  }
+}
+
+async function supabaseRest(path, init = {}) {
+  ensureSupabaseConfigured()
+  const headers = {
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    ...init.headers,
+  }
+  const res = await fetch(`${SUPABASE_URL}${path}`, {
+    ...init,
+    headers,
+  })
+  const text = await res.text()
+  let data = null
+  if (text) {
+    try {
+      data = JSON.parse(text)
+    } catch {
+      throw new Error(`Supabase invalid JSON (${res.status}): ${text.slice(0, 240)}`)
+    }
+  }
+  if (!res.ok) {
+    const msg = data?.message || data?.error || text || `Supabase ${res.status}`
+    throw new Error(`Supabase ${res.status}: ${msg}`)
+  }
+  return data
+}
+
+function parseAgent1Bool(v, defaultVal) {
+  if (v == null) return defaultVal
+  if (typeof v === 'boolean') return v
+  const s = String(v).trim().toLowerCase()
+  if (s === 'true' || s === '1') return true
+  if (s === 'false' || s === '0') return false
+  return defaultVal
+}
+
+function normalizeAgent1Settings(raw = {}) {
+  const tradeSizeUsd = Number.parseFloat(String(raw.tradeSizeUsd ?? raw.trade_size_usd ?? AGENT1_DEFAULT_SETTINGS.tradeSizeUsd))
+  const leverage = Number.parseInt(String(raw.leverage ?? AGENT1_DEFAULT_SETTINGS.leverage), 10)
+  const marginMode = String(raw.marginMode ?? raw.margin_mode ?? AGENT1_DEFAULT_SETTINGS.marginMode)
+    .trim()
+    .toLowerCase()
+  const maxTpPct = Number.parseFloat(String(raw.maxTpPct ?? raw.max_tp_pct ?? AGENT1_DEFAULT_SETTINGS.maxTpPct))
+  const maxSlPct = Number.parseFloat(String(raw.maxSlPct ?? raw.max_sl_pct ?? AGENT1_DEFAULT_SETTINGS.maxSlPct))
+
+  const scanIntervalRaw = String(
+    raw.scanInterval ?? raw.scan_interval ?? AGENT1_DEFAULT_SETTINGS.scanInterval,
+  ).trim()
+  if (!AGENT1_SCAN_INTERVALS.has(scanIntervalRaw)) {
+    throw new Error(
+      `scanInterval must be one of: ${[...AGENT1_SCAN_INTERVALS].sort().join(', ')}`,
+    )
+  }
+  const scanInterval = scanIntervalRaw
+  const intervalMs = AGENT1_INTERVAL_MS[scanInterval] ?? AGENT1_INTERVAL_MS['5m']
+  const scanSecondsBeforeClose = clampScanSecondsBeforeClose(
+    raw.scanSecondsBeforeClose ?? raw.scan_seconds_before_close ?? AGENT1_DEFAULT_SETTINGS.scanSecondsBeforeClose,
+    intervalMs,
+  )
+  const scanThresholdPct = Number.parseFloat(
+    String(raw.scanThresholdPct ?? raw.scan_threshold_pct ?? AGENT1_DEFAULT_SETTINGS.scanThresholdPct),
+  )
+  const scanMinQuoteVolume = Number.parseFloat(
+    String(raw.scanMinQuoteVolume ?? raw.scan_min_quote_volume ?? AGENT1_DEFAULT_SETTINGS.scanMinQuoteVolume),
+  )
+  const scanMaxSymbols = Number.parseInt(
+    String(raw.scanMaxSymbols ?? raw.scan_max_symbols ?? AGENT1_DEFAULT_SETTINGS.scanMaxSymbols),
+    10,
+  )
+  const scanSpikeMetric = String(raw.scanSpikeMetric ?? raw.scan_spike_metric ?? AGENT1_DEFAULT_SETTINGS.scanSpikeMetric)
+    .trim()
+    .toLowerCase()
+  const scanDirection = String(raw.scanDirection ?? raw.scan_direction ?? AGENT1_DEFAULT_SETTINGS.scanDirection)
+    .trim()
+    .toLowerCase()
+  const agentEnabledRaw = raw.agentEnabled ?? raw.agent_enabled
+  const agentEnabled = parseAgent1Bool(
+    agentEnabledRaw,
+    AGENT1_DEFAULT_SETTINGS.agentEnabled,
+  )
+
+  if (!Number.isFinite(tradeSizeUsd) || tradeSizeUsd <= 0) {
+    throw new Error('tradeSizeUsd must be a positive number')
+  }
+  if (!Number.isFinite(leverage) || leverage < 1 || leverage > 125) {
+    throw new Error('leverage must be between 1 and 125')
+  }
+  if (marginMode !== 'cross' && marginMode !== 'isolated') {
+    throw new Error("marginMode must be 'cross' or 'isolated'")
+  }
+  if (!Number.isFinite(maxTpPct) || maxTpPct <= 0) {
+    throw new Error('maxTpPct must be a positive number')
+  }
+  if (!Number.isFinite(maxSlPct) || maxSlPct <= 0) {
+    throw new Error('maxSlPct must be a positive number')
+  }
+  if (!Number.isFinite(scanThresholdPct) || scanThresholdPct <= 0) {
+    throw new Error('scanThresholdPct must be a positive number')
+  }
+  if (!Number.isFinite(scanMinQuoteVolume) || scanMinQuoteVolume < 0) {
+    throw new Error('scanMinQuoteVolume must be a non-negative number')
+  }
+  if (!Number.isFinite(scanMaxSymbols) || scanMaxSymbols < 1 || scanMaxSymbols > 800) {
+    throw new Error('scanMaxSymbols must be between 1 and 800')
+  }
+  if (scanSpikeMetric !== 'body' && scanSpikeMetric !== 'wick') {
+    throw new Error("scanSpikeMetric must be 'body' or 'wick'")
+  }
+  if (!['up', 'down', 'both'].includes(scanDirection)) {
+    throw new Error("scanDirection must be 'up', 'down', or 'both'")
+  }
+
+  return {
+    agentName: AGENT1_DEFAULT_SETTINGS.agentName,
+    tradeSizeUsd,
+    leverage,
+    marginMode,
+    maxTpPct,
+    maxSlPct,
+    scanSecondsBeforeClose,
+    scanThresholdPct,
+    scanMinQuoteVolume,
+    scanMaxSymbols,
+    scanSpikeMetric,
+    scanDirection,
+    scanInterval,
+    agentEnabled,
+  }
+}
+
+const AGENT1_SETTINGS_SELECT =
+  'agent_name,trade_size_usd,leverage,margin_mode,max_tp_pct,max_sl_pct,updated_at,' +
+  'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled'
+
+async function readAgent1Settings() {
+  const p =
+    `/rest/v1/agent_settings?select=${AGENT1_SETTINGS_SELECT}` +
+    '&agent_name=eq.agent1' +
+    '&limit=1'
+  const rows = await supabaseRest(p)
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return {
+      ...AGENT1_DEFAULT_SETTINGS,
+      updatedAt: null,
+    }
+  }
+  const row = rows[0]
+  const s = normalizeAgent1Settings(row)
+  return {
+    ...s,
+    updatedAt: row.updated_at ?? null,
+  }
+}
+
+async function upsertAgent1Settings(input) {
+  const s = normalizeAgent1Settings(input)
+  const body = {
+    agent_name: s.agentName,
+    trade_size_usd: s.tradeSizeUsd,
+    leverage: s.leverage,
+    margin_mode: s.marginMode,
+    max_tp_pct: s.maxTpPct,
+    max_sl_pct: s.maxSlPct,
+    scan_seconds_before_close: s.scanSecondsBeforeClose,
+    scan_threshold_pct: s.scanThresholdPct,
+    scan_min_quote_volume: s.scanMinQuoteVolume,
+    scan_max_symbols: s.scanMaxSymbols,
+    scan_spike_metric: s.scanSpikeMetric,
+    scan_direction: s.scanDirection,
+    scan_interval: s.scanInterval,
+    agent_enabled: s.agentEnabled,
+  }
+  const rows = await supabaseRest('/rest/v1/agent_settings?on_conflict=agent_name&select=*', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=merge-duplicates,return=representation',
+    },
+    body: JSON.stringify(body),
+  })
+  const row = Array.isArray(rows) && rows[0] ? rows[0] : body
+  const out = normalizeAgent1Settings(row)
+  return {
+    ...out,
+    updatedAt: row.updated_at ?? null,
+  }
+}
+
+const SPIKE_ROW_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+async function persistAgent1ScanResult(scanResult) {
+  const events = scanResult.spikeEventsChronological ?? []
+  if (events.length === 0) {
+    return { spikeCount: 0 }
+  }
+  const scanRunAt = new Date().toISOString()
+  const volMap = new Map()
+  for (const r of scanResult.rows ?? []) {
+    if (r?.symbol != null && r.quoteVolume24h != null) {
+      volMap.set(r.symbol, r.quoteVolume24h)
+    }
+  }
+  const rows = events.map((ev) => ({
+    candle_open_time_ms: ev.openTime,
+    symbol: ev.symbol,
+    direction: ev.direction,
+    spike_pct: ev.spikePct,
+    quote_volume_24h: volMap.get(ev.symbol) ?? null,
+    scan_run_at: scanRunAt,
+    trade_taken: false,
+  }))
+  await supabaseRest('/rest/v1/agent1_spikes?on_conflict=candle_open_time_ms,symbol,direction', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=ignore-duplicates,return=minimal',
+    },
+    body: JSON.stringify(rows),
+  })
+  return { spikeCount: events.length }
+}
+
+async function fetchPositionMode(apiKey, apiSecret) {
+  const data = await signedFuturesJson(apiKey, apiSecret, '/fapi/v1/positionSide/dual', {})
+  return Boolean(data?.dualSidePosition)
 }
 
 /**
@@ -484,6 +781,165 @@ mountHftRaveSse(app, { futuresWsBase: FUTURES_WS_BASE })
 /** No Binance call — use to verify `/api` routing on Vercel (should return JSON quickly). */
 app.get('/api/ping', (_req, res) => {
   res.json({ ok: true, t: Date.now() })
+})
+
+app.get('/api/agents/agent1/settings', async (_req, res) => {
+  try {
+    const settings = await readAgent1Settings()
+    return res.json({ settings, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to load Agent 1 settings',
+    })
+  }
+})
+
+app.put('/api/agents/agent1/settings', async (req, res) => {
+  try {
+    const body = req.body ?? {}
+    const current = await readAgent1Settings()
+    const merged = { ...current, ...body }
+    if (typeof body.agentEnabled !== 'boolean') {
+      merged.agentEnabled = current.agentEnabled
+    }
+    if (typeof body.scanInterval !== 'string' && typeof body.scan_interval !== 'string') {
+      merged.scanInterval = current.scanInterval
+    }
+    const { updatedAt: _u, ...forUpsert } = merged
+    const settings = await upsertAgent1Settings(forUpsert)
+    return res.json({ ok: true, settings, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    if (e instanceof Error && /must be/i.test(e.message)) {
+      return res.status(400).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to save Agent 1 settings',
+    })
+  }
+})
+
+app.patch('/api/agents/agent1/enabled', async (req, res) => {
+  try {
+    if (typeof req.body?.enabled !== 'boolean') {
+      return res.status(400).json({ error: 'JSON body must include enabled: boolean' })
+    }
+    const current = await readAgent1Settings()
+    const { updatedAt: _upd, ...rest } = current
+    const settings = await upsertAgent1Settings({
+      ...rest,
+      agentEnabled: req.body.enabled,
+    })
+    return res.json({ ok: true, settings, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    if (e instanceof Error && /must be/i.test(e.message)) {
+      return res.status(400).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to update Agent 1 enabled flag',
+    })
+  }
+})
+
+app.get('/api/agents/agent1/scan-status', async (_req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const st = agent1SchedulerState
+    const settings = await readAgent1Settings()
+    const enabled =
+      Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) &&
+      process.env.AGENT1_SCAN_SCHEDULER !== 'false'
+    return res.json({
+      schedulerEnabled: enabled,
+      agentEnabled: settings.agentEnabled,
+      scanInterval: settings.scanInterval,
+      nextFireAt: st.nextFireAt,
+      nextFireAtIso: st.nextFireAt != null ? new Date(st.nextFireAt).toISOString() : null,
+      lastRunAt: st.lastRunAt,
+      lastRunAtIso: st.lastRunAt != null ? new Date(st.lastRunAt).toISOString() : null,
+      lastSpikeCount: st.lastSpikeCount,
+      lastError: st.lastError,
+      running: st.running,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    console.error(e)
+    return res.status(500).json({ error: 'scan-status failed' })
+  }
+})
+
+app.get('/api/agents/agent1/spikes', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const limitRaw = Number.parseInt(String(req.query.limit ?? '200'), 10)
+    const limit = Math.min(200, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 200))
+    const rows = await supabaseRest(
+      `/rest/v1/agent1_spikes?select=*&order=created_at.desc&limit=${limit}`,
+    )
+    return res.json({
+      spikes: Array.isArray(rows) ? rows : [],
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to load spikes',
+    })
+  }
+})
+
+app.patch('/api/agents/agent1/spikes/:id', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const id = String(req.params.id ?? '').trim()
+    if (!SPIKE_ROW_UUID_RE.test(id)) {
+      return res.status(400).json({ error: 'Invalid spike id' })
+    }
+    if (typeof req.body?.tradeTaken !== 'boolean') {
+      return res.status(400).json({ error: 'Body must include tradeTaken: boolean' })
+    }
+    const rows = await supabaseRest(`/rest/v1/agent1_spikes?id=eq.${id}&select=*`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify({ trade_taken: req.body.tradeTaken }),
+    })
+    const row = Array.isArray(rows) && rows[0] ? rows[0] : null
+    if (!row) {
+      return res.status(404).json({ error: 'Spike not found' })
+    }
+    return res.json({ ok: true, spike: row })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to update spike',
+    })
+  }
 })
 
 app.get('/api/binance/futures-wallet', async (_req, res) => {
@@ -595,6 +1051,25 @@ app.post('/api/binance/test-order', async (req, res) => {
   }
   const tpPct = Number.parseFloat(String(req.body?.tpPct ?? '0'))
   const slPct = Number.parseFloat(String(req.body?.slPct ?? '0'))
+  const verboseDebug = req.body?.debug !== false
+  const debug = {
+    inputs: { symbol, side, tradeSizeUsd, leverage, tpPct, slPct },
+    timeline: [],
+  }
+  const addDebug = (step, data = {}) => {
+    if (!verboseDebug) return
+    debug.timeline.push({
+      at: new Date().toISOString(),
+      step,
+      ...data,
+    })
+  }
+  const errInfo = (e) => ({
+    name: e instanceof Error ? e.name : 'Error',
+    message: e instanceof Error ? e.message : String(e ?? 'Unknown error'),
+    statusCode: e instanceof BinanceApiError ? e.statusCode : null,
+  })
+
   if (!Number.isFinite(tpPct) || tpPct <= 0) {
     return res.status(400).json({ error: 'tpPct must be a positive number' })
   }
@@ -603,12 +1078,29 @@ app.post('/api/binance/test-order', async (req, res) => {
   }
 
   try {
+    addDebug('start')
     const spec = await getSymbolSpec(symbol)
+    addDebug('symbol_spec_loaded', {
+      stepSize: spec.stepSize,
+      minQty: spec.minQty,
+      tickSize: spec.tickSize,
+      minNotional: spec.minNotional,
+      supportedOrderTypes: spec.orderTypes,
+      quantityPrecision: spec.quantityPrecision,
+      pricePrecision: spec.pricePrecision,
+    })
+    const isHedgeMode = await fetchPositionMode(apiKey, apiSecret)
+    const entryPositionSide = side === 'BUY' ? 'LONG' : 'SHORT'
+    addDebug('position_mode', {
+      positionMode: isHedgeMode ? 'HEDGE' : 'ONE_WAY',
+      positionSide: isHedgeMode ? entryPositionSide : 'BOTH',
+    })
 
     await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/leverage', {
       symbol,
       leverage,
     })
+    addDebug('leverage_set', { leverage })
 
     const tickerQ = new URLSearchParams({ symbol })
     const tickerRes = await fetch(`${FUTURES_BASE}/fapi/v1/ticker/price?${tickerQ}`)
@@ -623,23 +1115,51 @@ app.post('/api/binance/test-order', async (req, res) => {
     if (!Number.isFinite(markPrice) || markPrice <= 0) {
       return res.status(502).json({ error: 'Could not resolve current symbol price' })
     }
+    addDebug('mark_price_loaded', { markPrice })
 
     const effectiveNotionalUsd = tradeSizeUsd * leverage
+    addDebug('notional_computed', { effectiveNotionalUsd })
+    if (spec.minNotional > 0 && effectiveNotionalUsd < spec.minNotional) {
+      return res.status(400).json({
+        code: 'BINANCE_MIN_NOTIONAL',
+        error:
+          `Order notional too small for ${symbol}. Required min notional is ${spec.minNotional} USDT. ` +
+          `Current trade size × leverage = ${effectiveNotionalUsd.toFixed(4)} USDT.`,
+        debug: verboseDebug
+          ? { ...debug, failure: { step: 'min_notional_check', required: spec.minNotional, current: effectiveNotionalUsd } }
+          : undefined,
+      })
+    }
     const rawQty = effectiveNotionalUsd / markPrice
     const qty = quantizeToStep(rawQty, spec.stepSize, 'floor')
+    addDebug('quantity_computed', { rawQty, roundedQty: qty })
     if (!Number.isFinite(qty) || qty <= 0 || qty < spec.minQty) {
       return res.status(400).json({
         error: `tradeSizeUsd × leverage is too small for ${symbol}. Minimum quantity is ${spec.minQty}.`,
+        debug: verboseDebug
+          ? { ...debug, failure: { step: 'quantity_check', minQty: spec.minQty, roundedQty: qty } }
+          : undefined,
       })
     }
     const quantity = fmtByStep(qty, spec.stepSize, spec.quantityPrecision)
 
-    const entryOrder = await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/order', {
+    const entryOrderParams = {
       symbol,
       side,
       type: 'MARKET',
       quantity,
       newOrderRespType: 'RESULT',
+    }
+    if (isHedgeMode) {
+      entryOrderParams.positionSide = entryPositionSide
+    }
+    addDebug('entry_order_request', { params: entryOrderParams })
+    const entryOrder = await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/order', entryOrderParams)
+    addDebug('entry_order_response', {
+      orderId: entryOrder?.orderId ?? null,
+      status: entryOrder?.status ?? null,
+      avgPrice: entryOrder?.avgPrice ?? null,
+      executedQty: entryOrder?.executedQty ?? null,
     })
 
     let entryPrice = Number.parseFloat(String(entryOrder?.avgPrice ?? ''))
@@ -668,43 +1188,66 @@ app.post('/api/binance/test-order', async (req, res) => {
     }
     const tpPrice = fmtByStep(tpPriceNum, spec.tickSize, spec.pricePrecision)
     const slPrice = fmtByStep(slPriceNum, spec.tickSize, spec.pricePrecision)
+    addDebug('tp_sl_computed', { tpPrice, slPrice, tpPriceRaw, slPriceRaw })
 
     let tpOrder = null
     let slOrder = null
     const warnings = []
-
+    const tpParams = {
+      algoType: 'CONDITIONAL',
+      symbol,
+      side: exitSide,
+      type: 'TAKE_PROFIT_MARKET',
+      triggerPrice: tpPrice,
+      workingType: 'MARK_PRICE',
+      priceProtect: 'true',
+      closePosition: 'true',
+      newOrderRespType: 'RESULT',
+    }
+    const slParams = {
+      algoType: 'CONDITIONAL',
+      symbol,
+      side: exitSide,
+      type: 'STOP_MARKET',
+      triggerPrice: slPrice,
+      workingType: 'MARK_PRICE',
+      priceProtect: 'true',
+      closePosition: 'true',
+      newOrderRespType: 'RESULT',
+    }
+    if (isHedgeMode) {
+      tpParams.positionSide = entryPositionSide
+      slParams.positionSide = entryPositionSide
+    }
+    addDebug('protective_order_requests', { tpParams, slParams })
     try {
-      tpOrder = await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/order', {
-        symbol,
-        side: exitSide,
-        type: 'TAKE_PROFIT_MARKET',
-        stopPrice: tpPrice,
-        closePosition: 'true',
-        workingType: 'MARK_PRICE',
-        priceProtect: 'true',
+      tpOrder = await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/algoOrder', tpParams)
+      addDebug('tp_order_response', {
+        algoId: tpOrder?.algoId ?? null,
+        algoStatus: tpOrder?.algoStatus ?? null,
       })
     } catch (e) {
       warnings.push(`TP order failed: ${e instanceof Error ? e.message : 'Unknown error'}`)
+      addDebug('tp_order_error', errInfo(e))
     }
-
     try {
-      slOrder = await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/order', {
-        symbol,
-        side: exitSide,
-        type: 'STOP_MARKET',
-        stopPrice: slPrice,
-        closePosition: 'true',
-        workingType: 'MARK_PRICE',
-        priceProtect: 'true',
+      slOrder = await signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/algoOrder', slParams)
+      addDebug('sl_order_response', {
+        algoId: slOrder?.algoId ?? null,
+        algoStatus: slOrder?.algoStatus ?? null,
       })
     } catch (e) {
       warnings.push(`SL order failed: ${e instanceof Error ? e.message : 'Unknown error'}`)
+      addDebug('sl_order_error', errInfo(e))
     }
+    addDebug('finish', { protectionPlaced: Boolean(tpOrder && slOrder), warningsCount: warnings.length })
 
     return res.json({
       ok: true,
       symbol,
       side,
+      positionMode: isHedgeMode ? 'HEDGE' : 'ONE_WAY',
+      positionSide: isHedgeMode ? entryPositionSide : 'BOTH',
       leverage,
       tradeSizeUsd,
       effectiveNotionalUsd,
@@ -715,10 +1258,31 @@ app.post('/api/binance/test-order', async (req, res) => {
       entryOrder,
       tpOrder,
       slOrder,
+      protectionPlaced: Boolean(tpOrder && slOrder),
+      supportedOrderTypes: spec.orderTypes,
       warnings,
+      debug: verboseDebug ? debug : undefined,
       fetchedAt: new Date().toISOString(),
     })
   } catch (e) {
+    addDebug('fatal_error', errInfo(e))
+    if (verboseDebug) {
+      if (e instanceof BinanceApiError && e.statusCode >= 400 && e.statusCode < 500) {
+        return res.status(e.statusCode).json({
+          error: e.message,
+          debug,
+        })
+      }
+      if (e instanceof BinanceApiError && e.statusCode === 451) {
+        return res.status(451).json({
+          code: 'BINANCE_GEO_BLOCKED',
+          error:
+            'Binance Futures API rejected this request because of server location (HTTP 451). ' +
+            `Details: ${e.message}`,
+          debug,
+        })
+      }
+    }
     return sendBinanceRouteError(res, e)
   }
 })
@@ -1407,15 +1971,37 @@ app.get('/api/binance/5m-screener', async (req, res) => {
       error: 'spikeDirections must be up, down, or both',
     })
   }
+  const spikeMetric = String(req.query.spikeMetric ?? 'body').toLowerCase()
+  if (!['body', 'wick'].includes(spikeMetric)) {
+    return res.status(400).json({
+      error: 'spikeMetric must be body or wick',
+    })
+  }
+  const maxSymbolsRaw = req.query.maxSymbols
+  const maxSymbols =
+    maxSymbolsRaw === undefined || maxSymbolsRaw === ''
+      ? undefined
+      : Number.parseInt(String(maxSymbolsRaw), 10)
+  if (maxSymbols !== undefined && (!Number.isFinite(maxSymbols) || maxSymbols < 1)) {
+    return res.status(400).json({
+      error: 'maxSymbols must be a positive integer (optional, cap 800)',
+    })
+  }
   try {
+    const t0 = Date.now()
     const result = await computeFiveMinScreener(FUTURES_BASE, {
       candleCount,
       minQuoteVolume,
       thresholdPct,
       interval,
       spikeDirections,
+      spikeMetric,
+      maxSymbols,
     })
-    res.json(result)
+    res.json({
+      ...result,
+      elapsedMs: Date.now() - t0,
+    })
   } catch (e) {
     console.error(e)
     res.status(502).json({
@@ -1509,3 +2095,13 @@ app.get('/api/binance/closed-positions', async (req, res) => {
     return sendBinanceRouteError(res, e)
   }
 })
+
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && process.env.AGENT1_SCAN_SCHEDULER !== 'false') {
+  startAgent1ScanScheduler({
+    futuresBase: FUTURES_BASE,
+    isEnabled: () => true,
+    readSettings: readAgent1Settings,
+    persistScan: persistAgent1ScanResult,
+    logger: console,
+  })
+}
