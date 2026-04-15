@@ -21,6 +21,7 @@ create table if not exists public.agent_settings (
   scan_direction text not null default 'both',
   scan_interval text not null default '5m',
   agent_enabled boolean not null default true,
+  ema_gate_enabled boolean not null default true,
   constraint agent_settings_scan_spike_metric_chk check (scan_spike_metric in ('body', 'wick')),
   constraint agent_settings_scan_direction_chk check (scan_direction in ('up', 'down', 'both')),
   constraint agent_settings_scan_interval_chk check (

@@ -120,6 +120,29 @@ function nextCandleOtoCPct(c1) {
 const SPIKE_DIRECTIONS = new Set(['up', 'down', 'both'])
 const SPIKE_METRICS = new Set(['body', 'wick'])
 
+/**
+ * Agent 1 long shadow / spike-long: up spike per scan metric (green body or upper wick).
+ * When scanDirection is `down` only, there is no long candidate.
+ */
+export function isAgent1LongSpikeBar(c, thresholdPct, spikeMetric, scanDirection) {
+  const dir = String(scanDirection ?? 'both').toLowerCase()
+  const wantUp = dir !== 'down'
+  if (!wantUp) return false
+  const metric = String(spikeMetric ?? 'body').toLowerCase() === 'wick' ? 'wick' : 'body'
+  const upFn = metric === 'wick' ? isWickSpikeUp : isBodySpikeUp
+  return upFn(c, thresholdPct)
+}
+
+/** Bar indices i with a long spike on candle i (needs bar i+1 for entry). */
+export function longSpikeIndicesForAgent1Scan(candles, thresholdPct, spikeMetric, scanDirection) {
+  const out = []
+  const n = candles?.length ?? 0
+  for (let i = 0; i < n - 1; i++) {
+    if (isAgent1LongSpikeBar(candles[i], thresholdPct, spikeMetric, scanDirection)) out.push(i)
+  }
+  return out
+}
+
 export async function computeFiveMinScreener(futuresBase, {
   candleCount,
   minQuoteVolume,
@@ -212,6 +235,7 @@ export async function computeFiveMinScreener(futuresBase, {
               symbol: row.symbol,
               direction,
               spikePct: wickPct,
+              spikeLow: Number.isFinite(c.low) ? c.low : null,
               nextCandlePct: nextPct,
             })
           }

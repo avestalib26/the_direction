@@ -23,6 +23,9 @@ alter table public.agent_settings
   add column if not exists agent_enabled boolean not null default true;
 
 alter table public.agent_settings
+  add column if not exists ema_gate_enabled boolean not null default true;
+
+alter table public.agent_settings
   add column if not exists scan_interval text not null default '5m';
 
 do $$

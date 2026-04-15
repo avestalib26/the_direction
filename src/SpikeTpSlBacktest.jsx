@@ -1,8 +1,15 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
+import {
+  computeEquityEmaFilterStats,
+  computePerTradeSubsampleStats,
+  normalizeEquityEmaPair,
+} from './equityEmaInteractiveFilter.js'
 import {
   SpikeTpSlEquityLightChart,
+  SpikeTpSlPerTradeCandleLightChart,
   SpikeTpSlPerTradeLightChart,
 } from './spikeTpSlLightweightCharts.jsx'
+import { SpikeTpSlSymbolCandleCharts } from './spikeTpSlSymbolCandleCharts.jsx'
 
 const DEFAULT_MIN_VOL = 1_000_000
 const DEFAULT_CANDLES = 500
@@ -59,6 +66,57 @@ const INTERVAL_OPTIONS = [
   { value: '4h', label: '4h' },
 ]
 
+function computeEmaSeries(closes, period) {
+  const out = closes.map(() => null)
+  if (!Array.isArray(closes) || closes.length < period || period < 2) return out
+  let sum = 0
+  for (let i = 0; i < period; i++) sum += closes[i]
+  let ema = sum / period
+  out[period - 1] = ema
+  const alpha = 2 / (period + 1)
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * alpha + ema * (1 - alpha)
+    out[i] = ema
+  }
+  return out
+}
+
+function buildInteractiveEmaCurvePoints(pcts, filterOn, emaFastPeriod, emaSlowPeriod) {
+  if (!Array.isArray(pcts) || pcts.length === 0) return null
+  const numeric = pcts.map((x) => (Number.isFinite(Number(x)) ? Number(x) : 0))
+  const closes = []
+  let level = 100
+  for (let i = 0; i < numeric.length; i++) {
+    level += numeric[i]
+    closes.push(level)
+  }
+  const emaFast = computeEmaSeries(closes, emaFastPeriod)
+  const emaSlow = computeEmaSeries(closes, emaSlowPeriod)
+
+  let keptCum = 0
+  const points = [{ tradeIndex: 0, pnlPctFromStart: 0, entryOpenTime: null }]
+  for (let i = 0; i < numeric.length; i++) {
+    let keep = true
+    if (filterOn && i > 0) {
+      const ef = emaFast[i - 1]
+      const es = emaSlow[i - 1]
+      keep =
+        ef == null ||
+        es == null ||
+        !Number.isFinite(ef) ||
+        !Number.isFinite(es) ||
+        ef > es
+    }
+    if (keep) keptCum += numeric[i]
+    points.push({
+      tradeIndex: i + 1,
+      pnlPctFromStart: keptCum,
+      entryOpenTime: null,
+    })
+  }
+  return points.length > 1 ? points : null
+}
+
 async function fetchBacktest(params) {
   const q = new URLSearchParams()
   for (const [k, v] of Object.entries(params)) {
@@ -109,9 +167,24 @@ export function SpikeTpSlBacktest() {
   const [fromDate, setFromDate] = useState('')
   const [toDate, setToDate] = useState('')
   const [strategy, setStrategy] = useState('long')
+  /** Empty = no cap. Otherwise cap adverse stop distance as % of entry (tighter stop only). */
+  const [maxSlPct, setMaxSlPct] = useState('')
+  /** R and +2R / TP levels unchanged; stop price anchored to spike candle open (when valid vs entry). */
+  const [slAtSpikeOpen, setSlAtSpikeOpen] = useState(false)
+  /** Adds OHLC candlesticks (per symbol with trades) — larger API payload. */
+  const [includeOhlcCharts, setIncludeOhlcCharts] = useState(true)
+  /** Long only: require next open > EMA(96) on 5m at spike bar (server aligns 5m to main window). */
+  const [emaLongFilter96_5m, setEmaLongFilter96_5m] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [data, setData] = useState(null)
+  /** Fast / slow EMA periods on stacked equity (chart + filter); defaults 10 / 50. */
+  const [equityEmaFastPeriod, setEquityEmaFastPeriod] = useState('10')
+  const [equityEmaSlowPeriod, setEquityEmaSlowPeriod] = useState('50')
+  /** When true, stats count only trades where fast EMA &gt; slow EMA before entry; when false, all subsample trades. */
+  const [equityEmaStatsFilterOn, setEquityEmaStatsFilterOn] = useState(true)
+  /** Take-profit multiple vs 1R stop (long / red short); green short uses this for stop width (TP still spike low). */
+  const [tpR, setTpR] = useState('2')
 
   const run = useCallback(async () => {
     setLoading(true)
@@ -127,6 +200,8 @@ export function SpikeTpSlBacktest() {
       const th = Number.parseFloat(String(thresholdPct))
       const fd = String(fromDate).trim()
       const td = String(toDate).trim()
+      const maxSl = Number.parseFloat(String(maxSlPct).trim())
+      const tpRVal = Number.parseFloat(String(tpR).replace(/,/g, '').trim())
       const out = await fetchBacktest({
         minQuoteVolume24h: Number.isFinite(mv) && mv >= 0 ? mv : DEFAULT_MIN_VOL,
         interval,
@@ -134,6 +209,11 @@ export function SpikeTpSlBacktest() {
         thresholdPct: th,
         strategy,
         ...(fd && td ? { fromDate: fd, toDate: td } : {}),
+        ...(Number.isFinite(maxSl) && maxSl > 0 ? { maxSlPct: maxSl } : {}),
+        ...(slAtSpikeOpen ? { slAtSpikeOpen: true } : {}),
+        includeChartCandles: includeOhlcCharts,
+        ...(emaLongFilter96_5m && strategy === 'long' ? { emaLongFilter96_5m: true } : {}),
+        ...(Number.isFinite(tpRVal) && tpRVal > 0 && tpRVal <= 100 ? { tpR: tpRVal } : {}),
       })
       setData(out)
     } catch (e) {
@@ -141,9 +221,56 @@ export function SpikeTpSlBacktest() {
     } finally {
       setLoading(false)
     }
-  }, [minQuoteVolume24h, interval, candleCount, thresholdPct, strategy, fromDate, toDate])
+  }, [
+    minQuoteVolume24h,
+    interval,
+    candleCount,
+    thresholdPct,
+    strategy,
+    fromDate,
+    toDate,
+    maxSlPct,
+    slAtSpikeOpen,
+    includeOhlcCharts,
+    emaLongFilter96_5m,
+    tpR,
+  ])
+
+  const tpRDisplay = useMemo(() => {
+    const v = Number.parseFloat(String(tpR).replace(/,/g, '').trim())
+    return Number.isFinite(v) && v > 0 ? v : 2
+  }, [tpR])
 
   const s = data?.summary
+  const emaFilterCol = Boolean(data?.emaLongFilterApplied)
+
+  const { fast: equityEmaFastNum, slow: equityEmaSlowNum } = useMemo(
+    () => normalizeEquityEmaPair(equityEmaFastPeriod, equityEmaSlowPeriod),
+    [equityEmaFastPeriod, equityEmaSlowPeriod],
+  )
+
+  const equityEmaStats = useMemo(() => {
+    const pcts = data?.perTradePricePctChron
+    const r = data?.perTradeRChron
+    if (!Array.isArray(pcts) || !Array.isArray(r) || pcts.length === 0 || r.length !== pcts.length) {
+      return null
+    }
+    const oc = data?.perTradeOutcomeChron
+    const outcomes = Array.isArray(oc) && oc.length === pcts.length ? oc : null
+    if (equityEmaStatsFilterOn) {
+      return computeEquityEmaFilterStats(pcts, r, outcomes, equityEmaFastNum, equityEmaSlowNum)
+    }
+    return computePerTradeSubsampleStats(pcts, r, outcomes)
+  }, [data, equityEmaFastNum, equityEmaSlowNum, equityEmaStatsFilterOn])
+  const equityEmaInteractiveCurvePoints = useMemo(() => {
+    const pcts = data?.perTradePricePctChron
+    return buildInteractiveEmaCurvePoints(
+      pcts,
+      equityEmaStatsFilterOn,
+      equityEmaFastNum,
+      equityEmaSlowNum,
+    )
+  }, [data, equityEmaStatsFilterOn, equityEmaFastNum, equityEmaSlowNum])
   const tpLbl = data?.tpStatLabel ?? 'TP (2R)'
   const slLbl = data?.slStatLabel ?? 'SL (-1R)'
 
@@ -160,17 +287,27 @@ export function SpikeTpSlBacktest() {
             <strong>next open</strong>: stop <code className="inline-code">entry + R</code>, target{' '}
             <code className="inline-code">entry − 2R</code> (same 2:1 R-multiple idea as long, mirrored).{' '}
           </>
+        ) : strategy === 'regimeFlipEma50' ? (
+          <>
+            <strong>Regime flip mode</strong>: uses green spikes only and checks cumulative equity vs{' '}
+            <strong>EMA 50</strong>. If cumulative is <strong>above</strong> EMA (or EMA not seeded yet), it
+            takes the normal <strong>long</strong> setup (<code className="inline-code">TP +{tpRDisplay}R</code>,{' '}
+            <code className="inline-code">SL −1R</code>). If cumulative is <strong>below</strong> EMA, it flips to
+            <strong> short</strong> with <strong>TP at spike low</strong> and a fixed <strong>SL +2R</strong>
+            (roughly 0.5R profile).{' '}
+          </>
         ) : strategy === 'shortSpikeLow' ? (
           <>
             <strong>R = spike close − spike low</strong>. <strong>Short</strong> at the{' '}
-            <strong>next open</strong>: stop <code className="inline-code">entry + 2R</code>, take-profit when
-            price trades at the <strong>spike candle low</strong> (skipped if next open is already ≤ that low).{' '}
+            <strong>next open</strong>: stop <code className="inline-code">entry + {tpRDisplay}R</code>,
+            take-profit when price trades at the <strong>spike candle low</strong> (skipped if next open is already ≤
+            that low).{' '}
           </>
         ) : (
           <>
             <strong>R = spike close − spike low</strong>. <strong>Long</strong> at the{' '}
             <strong>next open</strong>: stop <code className="inline-code">entry − R</code>, target{' '}
-            <code className="inline-code">entry + 2R</code>.{' '}
+            <code className="inline-code">entry + {tpRDisplay}R</code>.{' '}
           </>
         )}
         If both stop and target touch in the same bar, <strong>stop is assumed first</strong>{' '}
@@ -199,11 +336,11 @@ export function SpikeTpSlBacktest() {
           <strong>Short on green spike (plain):</strong> A big green candle (the spike) just closed. You are
           betting it will <strong>give back some of the move</strong> before going much higher. You{' '}
           <strong>sell (short) at the next candle&apos;s open</strong>. Your <strong>stop</strong> sits{' '}
-          <strong>above</strong> that entry: distance = <strong>2×R</strong>, with{' '}
+          <strong>above</strong> that entry: distance = <strong>{tpRDisplay}×R</strong>, with{' '}
           <strong>R = spike close − spike low</strong>. Your <strong>profit target</strong> is the{' '}
           <strong>low of that same spike candle</strong>—if price trades down there, you cover the short.
           If price hits the stop first, you lose <strong>1R</strong> (here, 1R means one full stop width =
-          2×R in price). Trades where the next open is already at or below the spike low are skipped.
+          {tpRDisplay}×R in price). Trades where the next open is already at or below the spike low are skipped.
         </p>
       )}
 
@@ -212,8 +349,9 @@ export function SpikeTpSlBacktest() {
           <strong>Short on red spike (plain):</strong> A big <strong>red</strong> candle (the spike) just
           closed—the opposite of the long setup. You <strong>sell (short) at the next candle&apos;s open</strong>.
           Risk unit <strong>R = spike high − spike close</strong> (the body &quot;stretch&quot; upward). Stop is{' '}
-          <strong>entry + R</strong>; target is <strong>entry − 2R</strong> (2R profit vs 1R risk, mirrored from
-          the long rule). Same bar priority: if both levels touch one bar, <strong>stop first</strong> (conservative).
+          <strong>entry + R</strong>; target is <strong>entry − {tpRDisplay}R</strong> ({tpRDisplay}R profit vs 1R
+          risk, mirrored from the long rule). Same bar priority: if both levels touch one bar,{' '}
+          <strong>stop first</strong> (conservative).
         </p>
       )}
 
@@ -288,10 +426,87 @@ export function SpikeTpSlBacktest() {
             value={strategy}
             onChange={(e) => setStrategy(e.target.value)}
           >
-            <option value="long">Long — TP +2R / SL −1R (green spike, R below)</option>
-            <option value="shortSpikeLow">Short — TP spike low / SL +2R (green spike)</option>
-            <option value="shortRedSpike">Short — TP −2R / SL +1R (red spike, mirrored)</option>
+            <option value="long">
+              Long — TP +{tpRDisplay}R / SL −1R (green spike, R below)
+            </option>
+            <option value="shortSpikeLow">
+              Short — TP spike low / SL +{tpRDisplay}R (green spike)
+            </option>
+            <option value="shortRedSpike">
+              Short — TP −{tpRDisplay}R / SL +1R (red spike, mirrored)
+            </option>
+            <option value="regimeFlipEma50">
+              Regime flip — above EMA50: long, below EMA50: short (TP spike low / fixed SL +2R)
+            </option>
           </select>
+        </label>
+        <label className="vol-screener-field">
+          <span className="vol-screener-label">Take-profit (R multiples)</span>
+          <input
+            className="vol-screener-input vol-screener-input--narrow"
+            type="text"
+            inputMode="decimal"
+            placeholder="default 2"
+            value={tpR}
+            onChange={(e) => setTpR(e.target.value)}
+          />
+        </label>
+        {strategy === 'regimeFlipEma50' && (
+          <p className="hourly-spikes-hint spike-tpsl-range-hint">
+            In regime flip mode, <strong>TP R</strong> above applies only to the <strong>long</strong> branch. The{' '}
+            <strong>short</strong> branch is fixed to <strong>TP at spike low</strong> and{' '}
+            <strong>SL = entry + 2R</strong>.
+          </p>
+        )}
+        <label className="vol-screener-field">
+          <span className="vol-screener-label">Max SL (% of entry, optional)</span>
+          <input
+            className="vol-screener-input vol-screener-input--narrow"
+            type="text"
+            inputMode="decimal"
+            placeholder="e.g. 10 — no cap if empty"
+            value={maxSlPct}
+            onChange={(e) => setMaxSlPct(e.target.value)}
+          />
+        </label>
+        <label className="vol-screener-field spike-tpsl-sl-open-toggle">
+          <input
+            type="checkbox"
+            checked={slAtSpikeOpen}
+            onChange={(e) => setSlAtSpikeOpen(e.target.checked)}
+          />
+          <span>
+            <strong>Stop at spike open</strong> — <strong>R</strong> still from the spike body (close−low or red
+            mirror); <strong>TP</strong> still uses <strong>{tpRDisplay}× that R</strong> (or spike low for the plain
+            short). Only the <strong>stop price</strong> uses the spike candle <strong>open</strong> instead of{' '}
+            <code className="inline-code">entry ± R</code> / <code className="inline-code">entry + {tpRDisplay}R</code>{' '}
+            (skipped when open is on the wrong side of entry).
+          </span>
+        </label>
+        <label className="vol-screener-field spike-tpsl-sl-open-toggle">
+          <input
+            type="checkbox"
+            checked={emaLongFilter96_5m}
+            disabled={strategy !== 'long'}
+            onChange={(e) => setEmaLongFilter96_5m(e.target.checked)}
+          />
+          <span>
+            <strong>EMA 96 (5m) long filter</strong> — only take a <strong>long</strong> when the{' '}
+            <strong>entry open</strong> is above <strong>EMA(96)</strong> on <strong>5m</strong> at the spike bar
+            (5m series is loaded for the same time window as your main interval). Ignored for short strategies.
+          </span>
+        </label>
+        <label className="vol-screener-field spike-tpsl-sl-open-toggle">
+          <input
+            type="checkbox"
+            checked={includeOhlcCharts}
+            onChange={(e) => setIncludeOhlcCharts(e.target.checked)}
+          />
+          <span>
+            <strong>OHLC charts</strong> at the bottom (TradingView Lightweight candlesticks) for{' '}
+            <strong>symbols with at least one trade or EMA-filter skip</strong> — same bar window as this run;
+            slightly heavier response. Turn off for a faster run or very large universes.
+          </span>
         </label>
         <div className="vol-screener-actions">
           <button type="button" className="btn-refresh" onClick={run} disabled={loading}>
@@ -327,6 +542,32 @@ export function SpikeTpSlBacktest() {
             )}
             body ≥ <strong>{data.thresholdPct}%</strong> · min 24h vol {fmtInt(data.minQuoteVolume24h)} USDT ·{' '}
             {fmtInt(data.symbolCount)} symbols
+            {data.maxSlPct != null && Number.isFinite(data.maxSlPct) ? (
+              <>
+                {' '}
+                · max SL <strong>{data.maxSlPct}%</strong> of entry
+              </>
+            ) : null}
+            {data.slAtSpikeOpen ? (
+              <>
+                {' '}
+                · <strong>SL at spike open</strong>
+              </>
+            ) : null}
+            {data.emaLongFilter96_5m ? (
+              <>
+                {' '}
+                ·{' '}
+                <strong>EMA 96 5m filter</strong>
+                {data.emaLongFilterApplied ? ' (on)' : ' (off for non-long)'}
+              </>
+            ) : null}
+            {data.tpR != null && Number.isFinite(data.tpR) ? (
+              <>
+                {' '}
+                · TP <strong>{data.tpR}R</strong>
+              </>
+            ) : null}
             {data.symbolsCapped ? ` (capped ${data.cappedAt})` : ''}
             {data.skipped > 0 ? ` · ${data.skipped} fetch errors` : ''}
             {data.binancePublicApiKeySent ? ' · API key header on' : ''}
@@ -361,6 +602,12 @@ export function SpikeTpSlBacktest() {
                 <span className="backtest1-stat-label">EOD (last close)</span>
                 <span className="backtest1-stat-value">{fmtInt(s.eodHits)}</span>
               </div>
+              {data.emaLongFilterApplied ? (
+                <div className="backtest1-stat">
+                  <span className="backtest1-stat-label">Skipped (EMA 96 5m)</span>
+                  <span className="backtest1-stat-value">{fmtInt(s.emaFilterSkips ?? 0)}</span>
+                </div>
+              ) : null}
               <div className="backtest1-stat">
                 <span className="backtest1-stat-label">Sum R</span>
                 <span
@@ -425,6 +672,160 @@ export function SpikeTpSlBacktest() {
                 totalTradeRows={data.totalTradeRows}
                 serverSubsampled={Boolean(data.perTradePricePctSubsampled)}
               />
+              <div className="spike-tpsl-pertrade-candle-toolbar">
+                <h3 className="hourly-spikes-h3 spike-tpsl-pertrade-candle-h3">Stacked equity candles + EMA</h3>
+                <label className="spike-tpsl-pertrade-ema-inline">
+                  <span className="spike-tpsl-pertrade-ema-inline-label">Fast EMA</span>
+                  <input
+                    className="vol-screener-input vol-screener-input--narrow"
+                    type="text"
+                    inputMode="numeric"
+                    aria-label="Stacked equity fast EMA period"
+                    placeholder="10"
+                    value={equityEmaFastPeriod}
+                    onChange={(e) => setEquityEmaFastPeriod(e.target.value)}
+                  />
+                </label>
+                <label className="spike-tpsl-pertrade-ema-inline">
+                  <span className="spike-tpsl-pertrade-ema-inline-label">Slow EMA</span>
+                  <input
+                    className="vol-screener-input vol-screener-input--narrow"
+                    type="text"
+                    inputMode="numeric"
+                    aria-label="Stacked equity slow EMA period"
+                    placeholder="50"
+                    value={equityEmaSlowPeriod}
+                    onChange={(e) => setEquityEmaSlowPeriod(e.target.value)}
+                  />
+                </label>
+              </div>
+              <p className="hourly-spikes-hint">
+                Same order as the histogram: <strong>100 + cumulative Σ price %</strong> after each trade — bodies
+                only (no wicks). Two EMAs on the closes; if fast &gt; slow is wrong way round in the fields, periods
+                are auto-swapped. Chart updates live.
+              </p>
+              <SpikeTpSlPerTradeCandleLightChart
+                perTradePricePctChron={data.perTradePricePctChron}
+                tradesFallback={data.trades}
+                totalTradeRows={data.totalTradeRows}
+                serverSubsampled={Boolean(data.perTradePricePctSubsampled)}
+                emaFastPeriod={equityEmaFastNum}
+                emaSlowPeriod={equityEmaSlowNum}
+              />
+              <div className="spike-tpsl-equity-ema-panel">
+                <h4 className="spike-tpsl-equity-ema-title">Equity EMA filter (interactive)</h4>
+                <p className="hourly-spikes-hint spike-tpsl-equity-ema-lead">
+                  When the filter is <strong>on</strong>, only trades where <strong>fast EMA &gt; slow EMA</strong> on
+                  the prior stacked-equity close are counted (same periods as the chart). When <strong>off</strong>,
+                  stats use every trade in the subsample. No re-fetch — subsampled runs are approximate.
+                </p>
+                <label className="vol-screener-field spike-tpsl-sl-open-toggle spike-tpsl-equity-ema-toggle">
+                  <input
+                    type="checkbox"
+                    checked={equityEmaStatsFilterOn}
+                    onChange={(e) => setEquityEmaStatsFilterOn(e.target.checked)}
+                  />
+                  <span>
+                    <strong>Equity EMA crossover filter</strong> — off = all trades; on = only when fast EMA is above
+                    slow EMA before entry.
+                  </span>
+                </label>
+                {!data.perTradeRChron?.length ? (
+                  <p className="hourly-spikes-hint spike-tpsl-equity-ema-warn">
+                    Re-run the backtest to load <code className="inline-code">perTradeRChron</code> for this panel.
+                  </p>
+                ) : equityEmaStats ? (
+                  <>
+                    <div className="backtest1-summary-grid spike-tpsl-equity-ema-stats">
+                      <div className="backtest1-stat">
+                        <span className="backtest1-stat-label">Stats mode</span>
+                        <span className="backtest1-stat-value">
+                          {equityEmaStats.mode === 'filtered' ? 'Fast EMA > slow' : 'All (subsample)'}
+                        </span>
+                      </div>
+                      <div className="backtest1-stat">
+                        <span className="backtest1-stat-label">Fast / slow EMA</span>
+                        <span className="backtest1-stat-value">
+                          {equityEmaStats.emaFastPeriod != null && equityEmaStats.emaSlowPeriod != null
+                            ? `${fmtInt(equityEmaStats.emaFastPeriod)} / ${fmtInt(equityEmaStats.emaSlowPeriod)}`
+                            : '—'}
+                        </span>
+                      </div>
+                      <div className="backtest1-stat">
+                        <span className="backtest1-stat-label">Kept / skipped</span>
+                        <span className="backtest1-stat-value">
+                          {fmtInt(equityEmaStats.kept)} / {fmtInt(equityEmaStats.skipped)}
+                        </span>
+                      </div>
+                      <div className="backtest1-stat">
+                        <span className="backtest1-stat-label">Sum R</span>
+                        <span
+                          className={`backtest1-stat-value ${(equityEmaStats.sumR ?? 0) >= 0 ? 'pnl-pos' : 'pnl-neg'}`}
+                        >
+                          {equityEmaStats.sumR != null && Number.isFinite(equityEmaStats.sumR)
+                            ? `${equityEmaStats.sumR.toFixed(2)}R`
+                            : '—'}
+                        </span>
+                      </div>
+                      <div className="backtest1-stat">
+                        <span className="backtest1-stat-label">Avg R</span>
+                        <span
+                          className={`backtest1-stat-value ${(equityEmaStats.avgR ?? 0) >= 0 ? 'pnl-pos' : 'pnl-neg'}`}
+                        >
+                          {equityEmaStats.avgR != null && Number.isFinite(equityEmaStats.avgR)
+                            ? `${equityEmaStats.avgR.toFixed(3)}R`
+                            : '—'}
+                        </span>
+                      </div>
+                      <div className="backtest1-stat">
+                        <span className="backtest1-stat-label">Σ price %</span>
+                        <span
+                          className={`backtest1-stat-value ${(equityEmaStats.sumPnlPct ?? 0) >= 0 ? 'pnl-pos' : 'pnl-neg'}`}
+                        >
+                          {equityEmaStats.sumPnlPct != null && Number.isFinite(equityEmaStats.sumPnlPct)
+                            ? `${equityEmaStats.sumPnlPct >= 0 ? '+' : ''}${equityEmaStats.sumPnlPct.toFixed(2)}%`
+                            : '—'}
+                        </span>
+                      </div>
+                      <div className="backtest1-stat">
+                        <span className="backtest1-stat-label">End stack</span>
+                        <span className="backtest1-stat-value">
+                          {equityEmaStats.finalStackLevel != null && Number.isFinite(equityEmaStats.finalStackLevel)
+                            ? equityEmaStats.finalStackLevel.toFixed(4)
+                            : '—'}
+                        </span>
+                      </div>
+                      <div className="backtest1-stat">
+                        <span className="backtest1-stat-label">TP / SL / EOD</span>
+                        <span className="backtest1-stat-value">
+                          {fmtInt(equityEmaStats.tpHits)} / {fmtInt(equityEmaStats.slHits)} /{' '}
+                          {fmtInt(equityEmaStats.eodHits)}
+                        </span>
+                      </div>
+                      <div className="backtest1-stat">
+                        <span className="backtest1-stat-label">TP / (TP+SL)</span>
+                        <span className="backtest1-stat-value">
+                          {equityEmaStats.winRateTpVsSlPct != null &&
+                          Number.isFinite(equityEmaStats.winRateTpVsSlPct)
+                            ? `${equityEmaStats.winRateTpVsSlPct.toFixed(1)}%`
+                            : '—'}
+                        </span>
+                      </div>
+                    </div>
+                    {equityEmaInteractiveCurvePoints && equityEmaInteractiveCurvePoints.length > 1 ? (
+                      <>
+                        <h5 className="hourly-spikes-h3">Interactive EMA mode curve</h5>
+                        <p className="hourly-spikes-hint">
+                          Running Σ price % using current panel mode (
+                          <strong>{equityEmaStats.mode === 'filtered' ? 'fast EMA > slow' : 'all trades'}</strong>
+                          ).
+                        </p>
+                        <SpikeTpSlEquityLightChart points={equityEmaInteractiveCurvePoints} />
+                      </>
+                    ) : null}
+                  </>
+                ) : null}
+              </div>
             </section>
           )}
 
@@ -463,6 +864,7 @@ export function SpikeTpSlBacktest() {
                     <th className="cell-right">24h vol</th>
                     <th className="cell-right">Bars</th>
                     <th className="cell-right">Trades</th>
+                    {emaFilterCol ? <th className="cell-right">EMA skip</th> : null}
                     <th className="cell-right">TP</th>
                     <th className="cell-right">SL</th>
                     <th className="cell-right">EOD</th>
@@ -472,7 +874,7 @@ export function SpikeTpSlBacktest() {
                 <tbody>
                   {(data.perSymbol ?? []).length === 0 ? (
                     <tr>
-                      <td colSpan={8} className="hourly-spikes-empty">
+                      <td colSpan={emaFilterCol ? 9 : 8} className="hourly-spikes-empty">
                         No symbols or no trades.
                       </td>
                     </tr>
@@ -483,6 +885,9 @@ export function SpikeTpSlBacktest() {
                         <td className="cell-mono cell-right">{fmtInt(r.quoteVolume24h)}</td>
                         <td className="cell-mono cell-right">{fmtInt(r.candleCount)}</td>
                         <td className="cell-mono cell-right">{fmtInt(r.tradeCount)}</td>
+                        {emaFilterCol ? (
+                          <td className="cell-mono cell-right">{fmtInt(r.emaSkipCount ?? 0)}</td>
+                        ) : null}
                         <td className="cell-mono cell-right pnl-pos">{fmtInt(r.tpCount)}</td>
                         <td className="cell-mono cell-right pnl-neg">{fmtInt(r.slCount)}</td>
                         <td className="cell-mono cell-right">{fmtInt(r.eodCount)}</td>
@@ -585,6 +990,22 @@ export function SpikeTpSlBacktest() {
               </table>
             </div>
           </section>
+
+          {includeOhlcCharts &&
+            data.chartCandlesBySymbol &&
+            Object.keys(data.chartCandlesBySymbol).length > 0 && (
+              <SpikeTpSlSymbolCandleCharts
+                chartCandlesBySymbol={data.chartCandlesBySymbol}
+                chartEmaBySymbol={data.chartEmaBySymbol}
+                chartTradeMarkers={data.chartTradeMarkers}
+                chartSkippedMarkers={data.chartSkippedMarkers}
+                interval={data.interval ?? interval}
+                chartMaxCandlesPerSymbol={data.chartMaxCandlesPerSymbol}
+                chartMaxSymbols={data.chartMaxSymbols}
+                chartSymbolsReturned={data.chartSymbolsReturned}
+                chartSymbolsWithTradesTotal={data.chartSymbolsWithTradesTotal}
+              />
+            )}
         </>
       )}
     </div>

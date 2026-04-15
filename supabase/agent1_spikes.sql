@@ -9,11 +9,21 @@ create table if not exists public.agent1_spikes (
   symbol text not null,
   direction text not null check (direction in ('up', 'down')),
   spike_pct numeric not null,
+  spike_low numeric,
   quote_volume_24h numeric,
   scan_run_at timestamptz not null,
   trade_taken boolean not null default false,
   unique (candle_open_time_ms, symbol, direction)
 );
+
+alter table public.agent1_spikes
+  add column if not exists spike_low numeric;
+
+alter table public.agent1_spikes
+  add column if not exists execution_skipped boolean not null default false;
+
+alter table public.agent1_spikes
+  add column if not exists skip_reason text;
 
 create index if not exists idx_agent1_spikes_created_at_desc on public.agent1_spikes (created_at desc);
 

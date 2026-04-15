@@ -5,6 +5,9 @@
  * Short (shortRedSpike): next open short after red-body spike, R = spike high − spike close, SL = entry + R, TP = entry − 2R.
  * Short (shortSpikeLow): next open short, same R as long on green spike, SL = entry + 2R, TP = spike low (cover when low tags).
  *
+ * Optional: maxSlPct caps adverse stop distance as % of entry (tighter stop if model SL is wider).
+ * Optional: slAtSpikeOpen — R and TP still from spike body/low rules; stop price is spike open (when valid vs entry).
+ *
  * Risk unit for R-multiples: long uses R; short uses 2R (stop width). Pessimistic intrabar: SL before TP.
  * Unclosed trades exit at last close (EOD).
  */
@@ -30,6 +33,119 @@ const RANGE_FETCH_MAX_PAGES = 48
 const API_EQUITY_CURVE_MAX_POINTS = 2500
 const API_PER_TRADE_PCT_MAX = 3500
 
+/** Optional OHLC payloads for per-symbol candlestick charts (only symbols with ≥1 trade). */
+const CHART_CANDLES_PER_SYMBOL_DEFAULT = 600
+const CHART_SYMBOLS_MAX_DEFAULT = 48
+
+/** Binance-style bar duration (ms) for aligning 5m EMA to the main backtest interval. */
+const INTERVAL_MS = Object.freeze({
+  '1m': 60_000,
+  '3m': 180_000,
+  '5m': 300_000,
+  '15m': 900_000,
+  '30m': 1_800_000,
+  '1h': 3_600_000,
+  '2h': 7_200_000,
+  '4h': 14_400_000,
+})
+
+const EMA_LONG_FILTER_PERIOD = 96
+const EMA_LONG_FILTER_INTERVAL = '5m'
+/** Extra 5m bars to load before the main window so EMA(96) is seeded for early spikes (not null). */
+const EMA_5M_WARMUP_EXTRA_BARS = 100
+
+function mainIntervalMs(interval) {
+  const k = String(interval ?? '5m').trim()
+  return INTERVAL_MS[k] ?? 300_000
+}
+
+/**
+ * EMA with SMA seed on first `period` closes (standard). Returns array parallel to `candles`; null until seeded.
+ */
+function computeEmaArray(candles, period) {
+  const out = candles.map(() => null)
+  if (!Array.isArray(candles) || candles.length < period || period < 2) return out
+  let sum = 0
+  for (let i = 0; i < period; i++) sum += candles[i].close
+  let ema = sum / period
+  out[period - 1] = ema
+  const alpha = 2 / (period + 1)
+  for (let i = period; i < candles.length; i++) {
+    ema = candles[i].close * alpha + ema * (1 - alpha)
+    out[i] = ema
+  }
+  return out
+}
+
+/** Largest j with candles5m[j].openTime <= mainOpenTime (5m bar that has started at or before this main open). */
+function find5mIndexForMainOpenTime(candles5m, mainOpenTime) {
+  if (!Array.isArray(candles5m) || candles5m.length === 0) return -1
+  let lo = 0
+  let hi = candles5m.length - 1
+  let ans = -1
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    if (candles5m[mid].openTime <= mainOpenTime) {
+      ans = mid
+      lo = mid + 1
+    } else hi = mid - 1
+  }
+  return ans
+}
+
+function ema5mWarmupBarCount(mainCandles) {
+  const n = mainCandles?.length ?? 0
+  return Math.max(EMA_LONG_FILTER_PERIOD + EMA_5M_WARMUP_EXTRA_BARS, n + EMA_5M_WARMUP_EXTRA_BARS)
+}
+
+/** 5m candles with openTime in [firstMainOpen − warmup, firstMainOpen − 1], for EMA history before the backtest window. */
+async function fetch5mPrefixBeforeMain(
+  futuresBase,
+  symbol,
+  firstMainOpen,
+  warmupBarCount,
+  publicHeaders,
+) {
+  const ms5 = INTERVAL_MS['5m']
+  const startTime = firstMainOpen - warmupBarCount * ms5
+  const endTime = firstMainOpen - 1
+  if (!Number.isFinite(firstMainOpen) || endTime < startTime) return []
+  return fetchKlinesOHLCInRange(
+    futuresBase,
+    symbol,
+    EMA_LONG_FILTER_INTERVAL,
+    Math.max(0, startTime),
+    endTime,
+    publicHeaders,
+  )
+}
+
+async function fetch5mOhlcAlignedToMain(
+  futuresBase,
+  symbol,
+  mainCandles,
+  interval,
+  utcRange,
+  publicHeaders,
+) {
+  if (!mainCandles?.length) return []
+  const ivMs = mainIntervalMs(interval)
+  const rangeStart = utcRange ? utcRange.startTime : mainCandles[0].openTime
+  const last = mainCandles[mainCandles.length - 1]
+  const endTime = utcRange ? utcRange.endTime : last.openTime + ivMs - 1
+  if (endTime < rangeStart) return []
+  const warmupBarCount = ema5mWarmupBarCount(mainCandles)
+  const fetchStart = rangeStart - warmupBarCount * INTERVAL_MS['5m']
+  return fetchKlinesOHLCInRange(
+    futuresBase,
+    symbol,
+    EMA_LONG_FILTER_INTERVAL,
+    Math.max(0, fetchStart),
+    endTime,
+    publicHeaders,
+  )
+}
+
 function downsampleEquityCurvePoints(pts, maxPts) {
   if (!Array.isArray(pts) || pts.length === 0) return { points: pts ?? [], downsampled: false }
   if (pts.length <= maxPts) return { points: pts, downsampled: false }
@@ -42,7 +158,8 @@ function downsampleEquityCurvePoints(pts, maxPts) {
   return { points: out, downsampled: true }
 }
 
-function subsampleFloatSeries(arr, maxLen) {
+/** Same index picks as subsampleFloatSeries — use to keep parallel series aligned (e.g. OHLC + %). */
+function subsampleArraySeries(arr, maxLen) {
   if (!Array.isArray(arr) || arr.length === 0) {
     return { values: arr ?? [], subsampled: false }
   }
@@ -56,6 +173,10 @@ function subsampleFloatSeries(arr, maxLen) {
     values.push(arr[idx])
   }
   return { values, subsampled: true }
+}
+
+function subsampleFloatSeries(arr, maxLen) {
+  return subsampleArraySeries(arr, maxLen)
 }
 
 function parseUtcDayStart(ymd) {
@@ -231,6 +352,28 @@ function longBarOutcome(low, high, slPrice, tpPrice) {
   return null
 }
 
+/** Long: cap how far below entry the stop may sit (max adverse % of entry). */
+function capStopLong(entry, slPrice, maxSlPct) {
+  if (maxSlPct == null || !Number.isFinite(maxSlPct) || maxSlPct <= 0) return slPrice
+  if (!Number.isFinite(entry) || entry <= 0 || !Number.isFinite(slPrice)) return slPrice
+  const maxDist = entry * (maxSlPct / 100)
+  const dist = entry - slPrice
+  if (!(dist > 0)) return slPrice
+  if (dist <= maxDist) return slPrice
+  return entry - maxDist
+}
+
+/** Short: cap how far above entry the stop may sit (max adverse % of entry). */
+function capStopShort(entry, slPrice, maxSlPct) {
+  if (maxSlPct == null || !Number.isFinite(maxSlPct) || maxSlPct <= 0) return slPrice
+  if (!Number.isFinite(entry) || entry <= 0 || !Number.isFinite(slPrice)) return slPrice
+  const maxDist = entry * (maxSlPct / 100)
+  const dist = slPrice - entry
+  if (!(dist > 0)) return slPrice
+  if (dist <= maxDist) return slPrice
+  return entry + maxDist
+}
+
 /** Short: SL above entry, TP below (spike low). If both touched same bar, SL first (conservative). */
 function shortBarOutcome(low, high, slPrice, tpPrice) {
   const hitSl = high >= slPrice
@@ -241,7 +384,29 @@ function shortBarOutcome(low, high, slPrice, tpPrice) {
   return null
 }
 
-function simulateLongTrade(candles, spikeIndex) {
+function normalizeTpR(tradeOpts) {
+  const raw = tradeOpts?.tpR
+  const v = raw != null && raw !== '' ? Number(raw) : 2
+  if (!Number.isFinite(v) || v <= 0) return 2
+  return Math.min(Math.max(v, 0.1), 100)
+}
+
+function emaLastOnNumberSeries(values, period) {
+  if (!Array.isArray(values) || values.length < period || period < 2) return null
+  let sum = 0
+  for (let i = 0; i < period; i++) sum += values[i]
+  let ema = sum / period
+  const alpha = 2 / (period + 1)
+  for (let i = period; i < values.length; i++) {
+    ema = values[i] * alpha + ema * (1 - alpha)
+  }
+  return ema
+}
+
+export function simulateLongTrade(candles, spikeIndex, tradeOpts = {}) {
+  const maxSlPct = tradeOpts.maxSlPct
+  const slAtSpikeOpen = Boolean(tradeOpts.slAtSpikeOpen)
+  const tpR = normalizeTpR(tradeOpts)
   const i = spikeIndex
   if (i + 1 >= candles.length) return null
   const sp = candles[i]
@@ -251,8 +416,11 @@ function simulateLongTrade(candles, spikeIndex) {
   const entry = candles[i + 1].open
   if (!Number.isFinite(entry)) return null
 
-  const slPrice = entry - R
-  const tpPrice = entry + 2 * R
+  let slPrice = slAtSpikeOpen ? sp.open : entry - R
+  if (!Number.isFinite(slPrice) || !(slPrice < entry)) return null
+  slPrice = capStopLong(entry, slPrice, maxSlPct)
+  if (!Number.isFinite(slPrice) || !(slPrice < entry)) return null
+  const tpPrice = entry + tpR * R
 
   for (let j = i + 1; j < candles.length; j++) {
     const { low, high, openTime } = candles[j]
@@ -289,7 +457,7 @@ function simulateLongTrade(candles, spikeIndex) {
         slPrice,
         tpPrice,
         outcome: 'tp',
-        rMultiple: 2,
+        rMultiple: tpR,
         exitOpenTime: openTime,
         exitBarIndex: j,
         ...tradeBarMeta(i, j),
@@ -325,7 +493,10 @@ function simulateLongTrade(candles, spikeIndex) {
  * Short at next open after red-body spike. R = spike high − spike close. SL = entry + R, TP = entry − 2R.
  * Mirror of long green-spike 2R/1R; pessimistic intrabar uses shortBarOutcome.
  */
-function simulateShortRedSpikeTrade(candles, spikeIndex) {
+function simulateShortRedSpikeTrade(candles, spikeIndex, tradeOpts = {}) {
+  const maxSlPct = tradeOpts.maxSlPct
+  const slAtSpikeOpen = Boolean(tradeOpts.slAtSpikeOpen)
+  const tpR = normalizeTpR(tradeOpts)
   const i = spikeIndex
   if (i + 1 >= candles.length) return null
   const sp = candles[i]
@@ -335,8 +506,11 @@ function simulateShortRedSpikeTrade(candles, spikeIndex) {
   const entry = candles[i + 1].open
   if (!Number.isFinite(entry)) return null
 
-  const slPrice = entry + R
-  const tpPrice = entry - 2 * R
+  let slPrice = slAtSpikeOpen ? sp.open : entry + R
+  if (!Number.isFinite(slPrice) || !(slPrice > entry)) return null
+  slPrice = capStopShort(entry, slPrice, maxSlPct)
+  if (!Number.isFinite(slPrice) || !(slPrice > entry)) return null
+  const tpPrice = entry - tpR * R
 
   for (let j = i + 1; j < candles.length; j++) {
     const { low, high, openTime } = candles[j]
@@ -373,7 +547,7 @@ function simulateShortRedSpikeTrade(candles, spikeIndex) {
         slPrice,
         tpPrice,
         outcome: 'tp',
-        rMultiple: 2,
+        rMultiple: tpR,
         exitOpenTime: openTime,
         exitBarIndex: j,
         ...tradeBarMeta(i, j),
@@ -406,24 +580,38 @@ function simulateShortRedSpikeTrade(candles, spikeIndex) {
 }
 
 /**
- * Short at next open after green spike. R = spike close − spike low. Stop entry + 2R. TP = spike low.
+ * Short at next open after green spike. R = spike close − spike low. Stop entry + tpR×R. TP = spike low.
  * Risk unit = 2R (full stop width): SL → −1R, TP → +(entry − spike low) / (2R). Skips if entry ≤ spike low.
  */
-function simulateShortSpikeLowTrade(candles, spikeIndex) {
+function simulateShortSpikeLowTrade(candles, spikeIndex, tradeOpts = {}) {
+  const maxSlPct = tradeOpts.maxSlPct
+  const slAtSpikeOpen = Boolean(tradeOpts.slAtSpikeOpen)
+  const tpR = normalizeTpR(tradeOpts)
   const i = spikeIndex
   if (i + 1 >= candles.length) return null
   const sp = candles[i]
   const R = sp.close - sp.low
   if (!(R > 0) || !Number.isFinite(R)) return null
 
-  const riskWidth = 2 * R
   const entry = candles[i + 1].open
   if (!Number.isFinite(entry)) return null
 
   const tpPrice = sp.low
   if (!(entry > tpPrice)) return null
 
-  const slPrice = entry + riskWidth
+  let riskWidth
+  let slPrice
+  if (slAtSpikeOpen) {
+    slPrice = sp.open
+    if (!Number.isFinite(slPrice) || !(slPrice > entry)) return null
+    riskWidth = slPrice - entry
+  } else {
+    riskWidth = tpR * R
+    slPrice = entry + riskWidth
+  }
+  slPrice = capStopShort(entry, slPrice, maxSlPct)
+  riskWidth = slPrice - entry
+  if (!(riskWidth > 0) || !Number.isFinite(slPrice) || !(slPrice > entry)) return null
 
   for (let j = i + 1; j < candles.length; j++) {
     const { low, high, openTime } = candles[j]
@@ -555,22 +743,111 @@ function buildEquityCurveSummedPricePct(tradesChronAsc) {
   return { points: pts }
 }
 
-function runSymbolTrades(candles, thresholdPct, strategy = 'long') {
+/**
+ * @param {object | null} emaCtx — when set and strategy is long: require entry open > EMA(96) on 5m at spike bar.
+ * @param {string} emaCtx.symbol
+ * @param {ReturnType<typeof mapKlineRow>[]} emaCtx.candles5m
+ * @param {(number | null)[]} emaCtx.emaArr
+ */
+function runSymbolTrades(candles, thresholdPct, strategy = 'long', tradeOpts = {}, emaCtx = null) {
   let sim = simulateLongTrade
   if (strategy === 'shortSpikeLow') sim = simulateShortSpikeLowTrade
   else if (strategy === 'shortRedSpike') sim = simulateShortRedSpikeTrade
   const spikes = spikeIndices(candles, thresholdPct, strategy)
   let lastExitBar = -1
   const trades = []
+  const emaSkipped = []
+
   for (const si of spikes) {
     // Entry is at open of bar si+1; allow spike si when that entry bar is after the prior exit bar.
     if (si + 1 <= lastExitBar) continue
-    const tr = sim(candles, si)
+
+    if (emaCtx && strategy === 'long') {
+      const entryOpen = candles[si + 1].open
+      const spikeOpenTime = candles[si].openTime
+      const entryOpenTime = candles[si + 1].openTime
+      const j = find5mIndexForMainOpenTime(emaCtx.candles5m, spikeOpenTime)
+      const emaVal = j >= 0 && j < emaCtx.emaArr.length ? emaCtx.emaArr[j] : null
+      if (emaVal == null || !Number.isFinite(emaVal) || !(entryOpen > emaVal)) {
+        emaSkipped.push({
+          symbol: emaCtx.symbol,
+          spikeOpenTime,
+          entryOpenTime,
+          reason: 'ema96_5m',
+        })
+        continue
+      }
+    }
+
+    const tr = sim(candles, si, tradeOpts)
     if (!tr) continue
     trades.push(tr)
     lastExitBar = tr.exitBarIndex
   }
-  return trades
+  return { trades, emaSkipped }
+}
+
+/**
+ * Regime flip mode (global):
+ * - If cumulative equity is above EMA(50): take long setup.
+ * - If cumulative equity is below EMA(50): take short setup (TP spike low, SL +2R style).
+ * Uses green spikes as the trigger set for both branches.
+ */
+function runRegimeFlipTradesGlobal(rawRows, thresholdPct, tradeOpts = {}) {
+  const events = []
+  for (const row of rawRows) {
+    if (row?.error || !Array.isArray(row?.candles)) continue
+    const spikes = spikeIndices(row.candles, thresholdPct, 'long')
+    for (const si of spikes) {
+      const entryBar = row.candles[si + 1]
+      if (!entryBar) continue
+      events.push({
+        symbol: row.symbol,
+        quoteVolume24h: row.quoteVolume24h,
+        candles: row.candles,
+        spikeIndex: si,
+        entryOpenTime: entryBar.openTime,
+      })
+    }
+  }
+  events.sort((a, b) => {
+    if (a.entryOpenTime !== b.entryOpenTime) return a.entryOpenTime - b.entryOpenTime
+    return String(a.symbol ?? '').localeCompare(String(b.symbol ?? ''))
+  })
+
+  const regimeEmaPeriod = 50
+  const shortTradeOpts = { ...tradeOpts, tpR: 2 }
+  const lastExitBySymbol = new Map()
+  const perSymbolTrades = new Map()
+  const cumulativeAfterTrade = []
+  let cumulativePnlPct = 0
+
+  for (const ev of events) {
+    const prevExit = lastExitBySymbol.get(ev.symbol) ?? -1
+    if (ev.spikeIndex + 1 <= prevExit) continue
+    const ema50 = emaLastOnNumberSeries(cumulativeAfterTrade, regimeEmaPeriod)
+    const useShort = Number.isFinite(ema50) && cumulativePnlPct < ema50
+    const tr = useShort
+      ? simulateShortSpikeLowTrade(ev.candles, ev.spikeIndex, shortTradeOpts)
+      : simulateLongTrade(ev.candles, ev.spikeIndex, tradeOpts)
+    if (!tr) continue
+    tr.regimeMode = useShort ? 'short_below_ema50' : 'long_above_or_no_ema50'
+    tr.regimeEma50AtEntry = Number.isFinite(ema50) ? ema50 : null
+    tr.regimeCumPnlPctBefore = cumulativePnlPct
+    tr.regimeEmaPeriod = regimeEmaPeriod
+    tr.regimeShortFixedTpR = 2
+    const withSymbol = {
+      symbol: ev.symbol,
+      ...tr,
+    }
+    if (!perSymbolTrades.has(ev.symbol)) perSymbolTrades.set(ev.symbol, [])
+    perSymbolTrades.get(ev.symbol).push(withSymbol)
+    lastExitBySymbol.set(ev.symbol, tr.exitBarIndex)
+    cumulativePnlPct += tradePriceReturnPct(withSymbol)
+    cumulativeAfterTrade.push(cumulativePnlPct)
+  }
+
+  return perSymbolTrades
 }
 
 async function mapPool(items, concurrency, mapper) {
@@ -595,7 +872,12 @@ async function mapPool(items, concurrency, mapper) {
  * @param {string} opts.interval
  * @param {number} opts.candleCount
  * @param {number} opts.thresholdPct
- * @param {'long'|'shortSpikeLow'|'shortRedSpike'} [opts.strategy]
+ * @param {'long'|'shortSpikeLow'|'shortRedSpike'|'regimeFlipEma50'} [opts.strategy]
+ * @param {number | null} [opts.maxSlPct] cap adverse SL distance as % of entry (omit or ≤0 = no cap)
+ * @param {boolean} [opts.slAtSpikeOpen] place stop at spike open; R and TP targets unchanged
+ * @param {boolean} [opts.includeChartCandles] attach OHLC for symbols with trades (for Lightweight Charts)
+ * @param {boolean} [opts.emaLongFilter96_5m] long only: require entry open > EMA(96) on 5m at spike bar
+ * @param {number} [opts.tpR] take-profit distance in R multiples vs 1R stop (default 2, clamped 0.1–100)
  * @param {string} [opts.fromDate] YYYY-MM-DD UTC (with toDate)
  * @param {string} [opts.toDate] YYYY-MM-DD UTC (with fromDate)
  */
@@ -608,7 +890,41 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     strategy = 'long',
     fromDate: fromDateOpt,
     toDate: toDateOpt,
+    maxSlPct: maxSlPctRaw,
+    slAtSpikeOpen: slAtSpikeOpenRaw,
+    includeChartCandles: includeChartCandlesRaw,
+    emaLongFilter96_5m: emaLongFilterRaw,
   } = opts
+
+  let maxSlPct = null
+  if (maxSlPctRaw != null && maxSlPctRaw !== '') {
+    const v = Number(maxSlPctRaw)
+    if (Number.isFinite(v) && v > 0) maxSlPct = Math.min(v, 100)
+  }
+  const slAtSpikeOpen = Boolean(slAtSpikeOpenRaw)
+  const includeChartCandles = Boolean(includeChartCandlesRaw)
+  const emaLongFilter96_5m = Boolean(emaLongFilterRaw)
+  const tpR = normalizeTpR({ tpR: opts?.tpR })
+  const tradeOpts = { maxSlPct, slAtSpikeOpen, tpR }
+
+  const maxChartCandles = Math.min(
+    1500,
+    Math.max(
+      50,
+      Number.parseInt(
+        process.env.SPIKE_TPSL_CHART_MAX_CANDLES_PER_SYMBOL ?? String(CHART_CANDLES_PER_SYMBOL_DEFAULT),
+        10,
+      ) || CHART_CANDLES_PER_SYMBOL_DEFAULT,
+    ),
+  )
+  const maxChartSyms = Math.min(
+    200,
+    Math.max(
+      1,
+      Number.parseInt(process.env.SPIKE_TPSL_CHART_MAX_SYMBOLS ?? String(CHART_SYMBOLS_MAX_DEFAULT), 10) ||
+        CHART_SYMBOLS_MAX_DEFAULT,
+    ),
+  )
   const sNorm = String(strategy ?? 'long')
     .trim()
     .replace(/-/g, '_')
@@ -622,7 +938,16 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     sNorm === 'negativespike'
   ) {
     strat = 'shortRedSpike'
+  } else if (
+    sNorm === 'regimeflipema50' ||
+    sNorm === 'regime_flip_ema50' ||
+    sNorm === 'regime_flip' ||
+    sNorm === 'regime'
+  ) {
+    strat = 'regimeFlipEma50'
   }
+
+  const emaFilterActive = emaLongFilter96_5m && strat === 'long'
 
   const utcRange = parseSpikeTpSlUtcRange(fromDateOpt, toDateOpt)
   const n = Math.max(50, Math.min(1500, Math.floor(candleCount)))
@@ -669,53 +994,126 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
           quoteVolume24h: row.quoteVolume24h,
           error: 'not enough candles',
           trades: [],
+          emaSkipped: [],
         }
       }
-      const trades = runSymbolTrades(candles, thresholdPct, strat)
-      return {
+
+      let candles5m = null
+      let ema5mArr = null
+      if (emaFilterActive) {
+        if (interval === '5m') {
+          const warmupN = ema5mWarmupBarCount(candles)
+          const prefix = await fetch5mPrefixBeforeMain(
+            futuresBase,
+            row.symbol,
+            candles[0].openTime,
+            warmupN,
+            publicHeaders,
+          )
+          candles5m = [...prefix, ...candles]
+        } else {
+          candles5m = await fetch5mOhlcAlignedToMain(
+            futuresBase,
+            row.symbol,
+            candles,
+            interval,
+            utcRange,
+            publicHeaders,
+          )
+        }
+        ema5mArr = computeEmaArray(candles5m, EMA_LONG_FILTER_PERIOD)
+      }
+
+      const emaCtx =
+        emaFilterActive && candles5m?.length && ema5mArr
+          ? { symbol: row.symbol, candles5m, emaArr: ema5mArr }
+          : null
+
+      const useLegacyPerSymbolSim = strat !== 'regimeFlipEma50'
+      const { trades, emaSkipped } = useLegacyPerSymbolSim
+        ? runSymbolTrades(candles, thresholdPct, strat, tradeOpts, emaCtx)
+        : { trades: [], emaSkipped: [] }
+
+      const rowOut = {
         symbol: row.symbol,
         quoteVolume24h: row.quoteVolume24h,
         candleCount: candles.length,
         error: null,
         trades,
+        emaSkipped,
+        ...(strat === 'regimeFlipEma50' ? { candles } : {}),
       }
+
+      const chartWorthy =
+        includeChartCandles &&
+        (strat === 'regimeFlipEma50' || trades.length > 0 || (emaSkipped?.length ?? 0) > 0)
+      if (chartWorthy) {
+        const slice =
+          candles.length > maxChartCandles ? candles.slice(-maxChartCandles) : candles
+        rowOut.chartCandles = slice.map((c) => ({
+          openTime: c.openTime,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+        }))
+        if (emaFilterActive && emaCtx) {
+          rowOut.chartEma = slice.map((c) => {
+            const j = find5mIndexForMainOpenTime(emaCtx.candles5m, c.openTime)
+            const ema = j >= 0 ? emaCtx.emaArr[j] : null
+            return {
+              openTime: c.openTime,
+              ema: ema != null && Number.isFinite(ema) ? ema : null,
+            }
+          })
+        }
+      }
+      return rowOut
     } catch (e) {
       return {
         symbol: row.symbol,
         quoteVolume24h: row.quoteVolume24h,
         error: e instanceof Error ? e.message : 'failed',
         trades: [],
+        emaSkipped: [],
       }
     }
   })
 
+  const regimeTradesBySymbol =
+    strat === 'regimeFlipEma50' ? runRegimeFlipTradesGlobal(raw, thresholdPct, tradeOpts) : null
   let skipped = 0
   const allTrades = []
+  const allEmaSkipped = []
   const perSymbol = []
+  const effectiveTradeCountBySymbol = new Map()
   for (const r of raw) {
     if (r.error) {
       skipped += 1
       continue
     }
-    const sumR = r.trades.reduce((s, t) => s + t.rMultiple, 0)
-    const tpN = r.trades.filter((t) => t.outcome === 'tp').length
-    const slN = r.trades.filter((t) => t.outcome === 'sl').length
-    const eodN = r.trades.filter((t) => t.outcome === 'eod').length
+    const rowTrades = regimeTradesBySymbol?.get(r.symbol) ?? r.trades
+    if (Array.isArray(r.emaSkipped)) {
+      for (const ev of r.emaSkipped) allEmaSkipped.push(ev)
+    }
+    const sumR = rowTrades.reduce((s, t) => s + t.rMultiple, 0)
+    const tpN = rowTrades.filter((t) => t.outcome === 'tp').length
+    const slN = rowTrades.filter((t) => t.outcome === 'sl').length
+    const eodN = rowTrades.filter((t) => t.outcome === 'eod').length
     perSymbol.push({
       symbol: r.symbol,
       quoteVolume24h: r.quoteVolume24h,
       candleCount: r.candleCount,
-      tradeCount: r.trades.length,
+      tradeCount: rowTrades.length,
+      emaSkipCount: r.emaSkipped?.length ?? 0,
       tpCount: tpN,
       slCount: slN,
       eodCount: eodN,
       sumR,
     })
-    for (const t of r.trades) {
-      allTrades.push({
-        symbol: r.symbol,
-        ...t,
-      })
+    effectiveTradeCountBySymbol.set(r.symbol, rowTrades.length)
+    for (const t of rowTrades) {
+      allTrades.push(t?.symbol ? t : { symbol: r.symbol, ...t })
     }
   }
 
@@ -723,6 +1121,35 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     if (b.sumR !== a.sumR) return b.sumR - a.sumR
     return b.tradeCount - a.tradeCount
   })
+
+  let chartCandlesBySymbol = null
+  let chartEmaBySymbol = null
+  let chartSymbolsWithTradesTotal = 0
+  let chartSymbolsReturned = 0
+  if (includeChartCandles) {
+    const candidates = raw.filter(
+      (r) =>
+        !r.error &&
+        r.chartCandles?.length &&
+        ((effectiveTradeCountBySymbol.get(r.symbol) ?? 0) > 0 || (r.emaSkipped?.length ?? 0) > 0),
+    )
+    chartSymbolsWithTradesTotal = candidates.length
+    candidates.sort(
+      (a, b) =>
+        (effectiveTradeCountBySymbol.get(b.symbol) ?? 0) +
+        (b.emaSkipped?.length ?? 0) -
+        ((effectiveTradeCountBySymbol.get(a.symbol) ?? 0) + (a.emaSkipped?.length ?? 0)),
+    )
+    const acc = {}
+    const emaAcc = {}
+    for (const r of candidates.slice(0, maxChartSyms)) {
+      acc[r.symbol] = r.chartCandles
+      if (r.chartEma?.length) emaAcc[r.symbol] = r.chartEma
+    }
+    chartSymbolsReturned = Object.keys(acc).length
+    chartCandlesBySymbol = chartSymbolsReturned > 0 ? acc : null
+    chartEmaBySymbol = Object.keys(emaAcc).length > 0 ? emaAcc : null
+  }
 
   const totalTrades = allTrades.length
   const tpHits = allTrades.filter((t) => t.outcome === 'tp').length
@@ -767,38 +1194,103 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   )
   const { values: perTradePricePctChron, subsampled: perTradePricePctSubsampled } =
     subsampleFloatSeries(perTradePricePctChronFull, API_PER_TRADE_PCT_MAX)
+  const perTradeRChronFull = chron.map((t) => t.rMultiple)
+  const { values: perTradeRChron } = subsampleArraySeries(perTradeRChronFull, API_PER_TRADE_PCT_MAX)
+  const perTradeOutcomeChronFull = chron.map((t) => t.outcome)
+  const { values: perTradeOutcomeChron } = subsampleArraySeries(
+    perTradeOutcomeChronFull,
+    API_PER_TRADE_PCT_MAX,
+  )
 
   allTrades.sort((a, b) => b.entryOpenTime - a.entryOpenTime)
 
-  const meta =
-    strat === 'shortSpikeLow'
+  const tpRStr = String(tpR)
+  let meta =
+    strat === 'regimeFlipEma50'
+      ? {
+          strategy: 'regimeFlipEma50',
+          riskReward: `Regime flip: long ${tpRStr}R/1R above EMA50, short TP spike low with fixed SL +2R below EMA50`,
+          entryRule:
+            'Green spike trigger only. Regime uses cumulative Σ price % vs EMA(50) of that curve: above/no EMA => long; below => short. Short branch uses TP at spike low with fixed stop width 2R.',
+          tpStatLabel: 'TP (mixed by regime)',
+          slStatLabel: 'SL (mixed by regime)',
+        }
+      : strat === 'shortSpikeLow'
       ? {
           strategy: 'shortSpikeLow',
-          riskReward: 'TP at spike low / SL 2R (risk unit = 2R)',
-          entryRule:
-            'Short next open after green spike; R = spike close − spike low; SL = entry + 2R; TP = spike low',
+          riskReward: `TP at spike low / SL ${tpRStr}R (risk unit = ${tpRStr}R)`,
+          entryRule: `Short next open after green spike; R = spike close − spike low; SL = entry + ${tpRStr}R; TP = spike low`,
           tpStatLabel: 'TP (spike low)',
-          slStatLabel: 'SL (-1R @ 2×R)',
+          slStatLabel: `SL (-1R @ ${tpRStr}×R)`,
         }
       : strat === 'shortRedSpike'
         ? {
             strategy: 'shortRedSpike',
-            riskReward: '2R TP / 1R SL (short, R above)',
-            entryRule:
-              'Short next open after red-body spike; R = spike high − spike close; SL = entry + R; TP = entry − 2R',
-            tpStatLabel: 'TP (2R)',
+            riskReward: `${tpRStr}R TP / 1R SL (short, R above)`,
+            entryRule: `Short next open after red-body spike; R = spike high − spike close; SL = entry + R; TP = entry − ${tpRStr}R`,
+            tpStatLabel: `TP (${tpRStr}R)`,
             slStatLabel: 'SL (-1R)',
           }
         : {
             strategy: 'long',
-            riskReward: '2R TP / 1R SL',
-            entryRule: 'Long next open after green-body spike; R = spike close − spike low',
-            tpStatLabel: 'TP (2R)',
+            riskReward: `${tpRStr}R TP / 1R SL`,
+            entryRule: `Long next open after green-body spike; R = spike close − spike low; SL = entry − R; TP = entry + ${tpRStr}R`,
+            tpStatLabel: `TP (${tpRStr}R)`,
             slStatLabel: 'SL (-1R)',
           }
 
+  if (slAtSpikeOpen) {
+    const extra =
+      strat === 'regimeFlipEma50'
+        ? ' SL at spike open is applied to both branches when valid (long requires spike open below entry; short requires spike open above entry). Short branch still keeps TP at spike low.'
+        : strat === 'shortSpikeLow'
+        ? ' SL price = spike open (above entry); risk width = entry→SL; R for TP distance unchanged.'
+        : strat === 'shortRedSpike'
+          ? ` SL price = spike open (above entry); TP still entry − ${tpRStr}R from body R.`
+          : ` SL price = spike open (below entry); TP still entry + ${tpRStr}R from body R.`
+    meta = { ...meta, entryRule: `${meta.entryRule}.${extra}` }
+  }
+  if (maxSlPct != null) {
+    meta = {
+      ...meta,
+      entryRule: `${meta.entryRule} Max adverse stop distance capped at ${maxSlPct}% of entry.`,
+    }
+  }
+  if (emaFilterActive) {
+    meta = {
+      ...meta,
+      entryRule: `${meta.entryRule} Long filter: next open must be above EMA(${EMA_LONG_FILTER_PERIOD}) on ${EMA_LONG_FILTER_INTERVAL} at spike bar (5m series aligned to main window).`,
+    }
+  }
+
+  const chartTradeMarkers =
+    includeChartCandles && allTrades.length > 0
+      ? allTrades.map((t) => ({
+          symbol: t.symbol,
+          spikeOpenTime: t.spikeOpenTime,
+          entryOpenTime: t.entryOpenTime,
+        }))
+      : undefined
+
+  const chartSkippedMarkers =
+    includeChartCandles && allEmaSkipped.length > 0 ? allEmaSkipped : undefined
+
   return {
     interval,
+    tpR,
+    maxSlPct,
+    slAtSpikeOpen,
+    emaLongFilter96_5m: emaLongFilter96_5m,
+    emaLongFilterApplied: emaFilterActive,
+    includeChartCandles,
+    chartCandlesBySymbol,
+    chartEmaBySymbol,
+    chartSkippedMarkers,
+    chartTradeMarkers,
+    chartMaxCandlesPerSymbol: includeChartCandles ? maxChartCandles : null,
+    chartMaxSymbols: includeChartCandles ? maxChartSyms : null,
+    chartSymbolsReturned: includeChartCandles ? chartSymbolsReturned : null,
+    chartSymbolsWithTradesTotal: includeChartCandles ? chartSymbolsWithTradesTotal : null,
     rangeMode: Boolean(utcRange),
     fromDate: utcRange?.fromDate ?? null,
     toDate: utcRange?.toDate ?? null,
@@ -823,6 +1315,7 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
       tpHits,
       slHits,
       eodHits,
+      emaFilterSkips: allEmaSkipped.length,
       winningTrades,
       losingTrades,
       breakevenTrades,
@@ -836,6 +1329,8 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     equityCurveDownsampled,
     perTradePricePctChron,
     perTradePricePctSubsampled,
+    perTradeRChron,
+    perTradeOutcomeChron,
     perSymbol,
     trades: allTrades.slice(0, 400),
     tradesTruncated: allTrades.length > 400,

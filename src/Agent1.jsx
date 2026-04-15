@@ -67,6 +67,24 @@ async function fetchScanStatus() {
   return data
 }
 
+async function fetchAgent1Regime() {
+  const res = await fetch('/api/agents/agent1/regime', { cache: 'no-store' })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    throw new Error(data.error || `Request failed (${res.status})`)
+  }
+  return data
+}
+
+async function fetchAgent1Execution() {
+  const res = await fetch('/api/agents/agent1/execution', { cache: 'no-store' })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    throw new Error(data.error || `Request failed (${res.status})`)
+  }
+  return data
+}
+
 async function fetchSpikes() {
   const res = await fetch('/api/agents/agent1/spikes?limit=200', { cache: 'no-store' })
   const data = await res.json().catch(() => ({}))
@@ -124,14 +142,22 @@ export function Agent1() {
   const [scanSpikeMetric, setScanSpikeMetric] = useState('body')
   const [scanDirection, setScanDirection] = useState('both')
   const [agentEnabled, setAgentEnabled] = useState(true)
+  const [emaGateEnabled, setEmaGateEnabled] = useState(true)
 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [emaGateSaving, setEmaGateSaving] = useState(false)
   const [error, setError] = useState('')
   const [savedAt, setSavedAt] = useState('')
 
   const [scanStatus, setScanStatus] = useState(null)
+  const [regime, setRegime] = useState(null)
+  const [execution, setExecution] = useState(null)
   const [spikes, setSpikes] = useState([])
+  const [visibleSpikesCount, setVisibleSpikesCount] = useState(30)
+  const [visibleOngoingCount, setVisibleOngoingCount] = useState(30)
+  const [visibleClosedCount, setVisibleClosedCount] = useState(30)
+  const [visibleLogCount, setVisibleLogCount] = useState(30)
   const [spikesLoading, setSpikesLoading] = useState(true)
   const [spikesError, setSpikesError] = useState('')
   const [togglingId, setTogglingId] = useState('')
@@ -139,6 +165,22 @@ export function Agent1() {
   const maxScanSecondsBeforeClose = useMemo(
     () => maxSecondsBeforeCloseForInterval(scanInterval),
     [scanInterval],
+  )
+  const visibleSpikes = useMemo(() => spikes.slice(0, Math.max(30, visibleSpikesCount)), [spikes, visibleSpikesCount])
+  const ongoingTrades = Array.isArray(execution?.ongoingTrades) ? execution.ongoingTrades : []
+  const visibleOngoingTrades = useMemo(
+    () => ongoingTrades.slice(0, Math.max(30, visibleOngoingCount)),
+    [ongoingTrades, visibleOngoingCount],
+  )
+  const closedTrades = Array.isArray(execution?.closedTrades) ? execution.closedTrades : []
+  const visibleClosedTrades = useMemo(
+    () => closedTrades.slice(0, Math.max(30, visibleClosedCount)),
+    [closedTrades, visibleClosedCount],
+  )
+  const logs = Array.isArray(execution?.logs) ? execution.logs : []
+  const visibleLogs = useMemo(
+    () => logs.slice(0, Math.max(30, visibleLogCount)),
+    [logs, visibleLogCount],
   )
 
   const loadSpikes = useCallback(async () => {
@@ -160,6 +202,24 @@ export function Agent1() {
       setScanStatus(st)
     } catch {
       setScanStatus(null)
+    }
+  }, [])
+
+  const loadRegime = useCallback(async () => {
+    try {
+      const data = await fetchAgent1Regime()
+      setRegime(data?.regime ?? null)
+    } catch {
+      setRegime(null)
+    }
+  }, [])
+
+  const loadExecution = useCallback(async () => {
+    try {
+      const data = await fetchAgent1Execution()
+      setExecution(data)
+    } catch {
+      setExecution(null)
     }
   }, [])
 
@@ -187,6 +247,7 @@ export function Agent1() {
         setScanSpikeMetric(String(s.scanSpikeMetric ?? 'body'))
         setScanDirection(String(s.scanDirection ?? 'both'))
         setAgentEnabled(s.agentEnabled !== false)
+        setEmaGateEnabled(s.emaGateEnabled !== false)
         setSavedAt(String(s.updatedAt ?? ''))
       } catch (e) {
         if (!off) setError(e instanceof Error ? e.message : 'Failed to load Agent 1 settings')
@@ -197,15 +258,19 @@ export function Agent1() {
     load()
     loadSpikes()
     loadScanStatus()
+    loadRegime()
+    loadExecution()
     const iv = setInterval(() => {
       loadScanStatus()
       loadSpikes()
+      loadRegime()
+      loadExecution()
     }, 30_000)
     return () => {
       off = true
       clearInterval(iv)
     }
-  }, [loadSpikes, loadScanStatus])
+  }, [loadExecution, loadRegime, loadSpikes, loadScanStatus])
 
   useEffect(() => {
     const onHeaderToggle = () => {
@@ -214,6 +279,7 @@ export function Agent1() {
         try {
           const s = await fetchAgent1Settings()
           setAgentEnabled(s.agentEnabled !== false)
+          setEmaGateEnabled(s.emaGateEnabled !== false)
         } catch {
           /* keep previous */
         }
@@ -241,6 +307,7 @@ export function Agent1() {
         scanSpikeMetric,
         scanDirection,
         agentEnabled,
+        emaGateEnabled,
       })
       setTradeSizeUsd(String(out.tradeSizeUsd))
       setLeverage(String(out.leverage))
@@ -258,6 +325,7 @@ export function Agent1() {
       setScanSpikeMetric(String(out.scanSpikeMetric))
       setScanDirection(String(out.scanDirection))
       setAgentEnabled(out.agentEnabled !== false)
+      setEmaGateEnabled(out.emaGateEnabled !== false)
       setSavedAt(String(out.updatedAt ?? new Date().toISOString()))
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to save Agent 1 settings')
@@ -276,6 +344,29 @@ export function Agent1() {
       setSpikesError(e instanceof Error ? e.message : 'Update failed')
     } finally {
       setTogglingId('')
+    }
+  }
+
+  const onToggleEmaGate = async () => {
+    if (loading || saving || emaGateSaving) return
+    const next = !emaGateEnabled
+    const ok = window.confirm(
+      next
+        ? 'Enable EMA gating for Agent 1 execution? Trades will be blocked when curve is below EMA.'
+        : 'Disable EMA gating for Agent 1 execution? Agent will bypass regime gate and execute by spikes only.',
+    )
+    if (!ok) return
+    setEmaGateSaving(true)
+    setError('')
+    try {
+      const out = await saveAgent1Settings({ emaGateEnabled: next })
+      setEmaGateEnabled(out.emaGateEnabled !== false)
+      setSavedAt(String(out.updatedAt ?? new Date().toISOString()))
+      loadExecution()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to update EMA gate setting')
+    } finally {
+      setEmaGateSaving(false)
     }
   }
 
@@ -307,6 +398,30 @@ export function Agent1() {
           <div className="risk-chip">
             Scan timeframe: <strong>{scanStatus.scanInterval ?? '—'}</strong>
           </div>
+          <div className="risk-chip">
+            Curve PnL: <strong>{Number.isFinite(Number(regime?.latestCumPnlPct)) ? `${Number(regime.latestCumPnlPct).toFixed(3)}%` : '—'}</strong>
+          </div>
+          <div className="risk-chip">
+            EMA50: <strong>{Number.isFinite(Number(regime?.emaValue)) ? `${Number(regime.emaValue).toFixed(3)}%` : '—'}</strong>
+          </div>
+          <div className="risk-chip">
+            Gate:{' '}
+            <strong>
+              {emaGateEnabled ? (regime?.gateAllowLong ? 'ALLOW LONG' : 'BLOCK LONG') : 'DISABLED (BYPASS)'}
+            </strong>
+          </div>
+          <div className="risk-chip">
+            EMA gate: <strong>{emaGateEnabled ? 'ON' : 'OFF'}</strong>
+          </div>
+          <div className="risk-chip">
+            Exec loop: <strong>{execution?.state?.running ? 'running' : 'idle'}</strong>
+          </div>
+          <div className="risk-chip">
+            Exec lease: <strong>{execution?.state?.leaseOwner ? 'owner' : 'standby'}</strong>
+          </div>
+          <div className="risk-chip">
+            Last placed: <strong>{execution?.state?.lastPlaced ?? 0}</strong>
+          </div>
           {scanStatus.running ? (
             <div className="risk-chip">
               <strong>Scan in progress…</strong>
@@ -322,6 +437,18 @@ export function Agent1() {
 
       <h2 className="vol-screener-title agent1-section-title">Execution</h2>
       <div className="backtest1-form agent1-form" aria-busy={loading}>
+        <div className="agent1-form-actions" style={{ gridColumn: '1 / -1', paddingTop: 0 }}>
+          <button
+            type="button"
+            className={`backtest1-btn ${emaGateEnabled ? 'backtest1-btn--secondary' : ''}`}
+            onClick={onToggleEmaGate}
+            disabled={loading || saving || emaGateSaving}
+          >
+            {emaGateSaving
+              ? 'Updating EMA gate…'
+              : `EMA gate: ${emaGateEnabled ? 'ON (click to disable)' : 'OFF (click to enable)'}`}
+          </button>
+        </div>
         <label className="backtest1-field">
           <span className="backtest1-label">Trade size (USDT margin)</span>
           <input
@@ -498,6 +625,8 @@ export function Agent1() {
             onClick={() => {
               loadSpikes()
               loadScanStatus()
+              loadRegime()
+              loadExecution()
             }}
             disabled={spikesLoading}
           >
@@ -515,6 +644,136 @@ export function Agent1() {
       ) : null}
 
       <h2 className="vol-screener-title agent1-section-title agent1-section-title--table">
+        Ongoing trades by Agent 1
+      </h2>
+      {ongoingTrades.length === 0 ? (
+        <p className="hourly-spikes-hint">No ongoing agent trades.</p>
+      ) : (
+        <>
+          <div className="table-wrap agent1-spikes-wrap">
+            <table className="positions-table agent1-spikes-table">
+              <thead>
+                <tr>
+                  <th>Opened (IST)</th>
+                  <th>Symbol</th>
+                  <th>Lev</th>
+                  <th className="cell-right">Qty</th>
+                  <th className="cell-right">Entry</th>
+                  <th className="cell-right">Unrealized</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleOngoingTrades.map((t) => (
+                  <tr key={t.id}>
+                    <td className="cell-mono">{fmtIst(t.opened_at)}</td>
+                    <td className="cell-mono">{t.symbol}</td>
+                    <td className="cell-mono">{t.applied_leverage ?? '—'}x</td>
+                    <td className="cell-mono cell-right">{t.quantity != null ? Number(t.quantity).toFixed(4) : '—'}</td>
+                    <td className="cell-mono cell-right">{t.entry_price != null ? Number(t.entry_price).toFixed(6) : '—'}</td>
+                    <td
+                      className={`cell-mono cell-right ${Number(t.unRealizedProfit) > 0 ? 'pnl-pos' : Number(t.unRealizedProfit) < 0 ? 'pnl-neg' : ''}`}
+                    >
+                      {t.unRealizedProfit != null ? Number(t.unRealizedProfit).toFixed(4) : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {ongoingTrades.length > 30 ? (
+            <div className="agent1-form-actions" style={{ paddingTop: 8, paddingBottom: 0 }}>
+              <button
+                type="button"
+                className="backtest1-btn backtest1-btn--secondary"
+                onClick={() => setVisibleOngoingCount((n) => Math.min(ongoingTrades.length, n + 100))}
+                disabled={visibleOngoingTrades.length >= ongoingTrades.length}
+              >
+                View more (+100)
+              </button>
+              {visibleOngoingCount > 30 ? (
+                <button
+                  type="button"
+                  className="backtest1-btn backtest1-btn--secondary"
+                  onClick={() => setVisibleOngoingCount(30)}
+                >
+                  Show less (30)
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+        </>
+      )}
+
+      <h2 className="vol-screener-title agent1-section-title agent1-section-title--table">
+        Closed trades by Agent 1
+      </h2>
+      {closedTrades.length === 0 ? (
+        <p className="hourly-spikes-hint">No closed agent trades yet.</p>
+      ) : (
+        <>
+          <div className="table-wrap agent1-spikes-wrap">
+            <table className="positions-table agent1-spikes-table">
+              <thead>
+                <tr>
+                  <th>Opened (IST)</th>
+                  <th>Closed (IST)</th>
+                  <th>Symbol</th>
+                  <th>Lev</th>
+                  <th className="cell-right">Realized (USDT)</th>
+                  <th className="cell-right">Commission</th>
+                  <th className="cell-right">Funding</th>
+                  <th>Close reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleClosedTrades.map((t) => (
+                  <tr key={t.id}>
+                    <td className="cell-mono">{fmtIst(t.opened_at)}</td>
+                    <td className="cell-mono">{fmtIst(t.closed_at)}</td>
+                    <td className="cell-mono">{t.symbol}</td>
+                    <td className="cell-mono">{t.applied_leverage ?? '—'}x</td>
+                    <td
+                      className={`cell-mono cell-right ${Number(t.realized_pnl_usdt) > 0 ? 'pnl-pos' : Number(t.realized_pnl_usdt) < 0 ? 'pnl-neg' : ''}`}
+                    >
+                      {t.realized_pnl_usdt != null ? Number(t.realized_pnl_usdt).toFixed(4) : '—'}
+                    </td>
+                    <td className="cell-mono cell-right">
+                      {t.commission_usdt != null ? Number(t.commission_usdt).toFixed(4) : '—'}
+                    </td>
+                    <td className="cell-mono cell-right">
+                      {t.funding_fee_usdt != null ? Number(t.funding_fee_usdt).toFixed(4) : '—'}
+                    </td>
+                    <td>{t.close_reason ?? '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {closedTrades.length > 30 ? (
+            <div className="agent1-form-actions" style={{ paddingTop: 8, paddingBottom: 0 }}>
+              <button
+                type="button"
+                className="backtest1-btn backtest1-btn--secondary"
+                onClick={() => setVisibleClosedCount((n) => Math.min(closedTrades.length, n + 100))}
+                disabled={visibleClosedTrades.length >= closedTrades.length}
+              >
+                View more (+100)
+              </button>
+              {visibleClosedCount > 30 ? (
+                <button
+                  type="button"
+                  className="backtest1-btn backtest1-btn--secondary"
+                  onClick={() => setVisibleClosedCount(30)}
+                >
+                  Show less (30)
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+        </>
+      )}
+
+      <h2 className="vol-screener-title agent1-section-title agent1-section-title--table">
         Recent spikes (last 200)
       </h2>
       {spikesError ? (
@@ -527,50 +786,139 @@ export function Agent1() {
       ) : spikes.length === 0 ? (
         <p className="hourly-spikes-hint">No spikes stored yet. Run the SQL migration and wait for the next scan.</p>
       ) : (
-        <div className="table-wrap agent1-spikes-wrap">
-          <table className="positions-table agent1-spikes-table">
-            <thead>
-              <tr>
-                <th>Stored (IST)</th>
-                <th>Candle open (IST)</th>
-                <th>Symbol</th>
-                <th>Dir</th>
-                <th className="cell-right">Spike %</th>
-                <th className="cell-right">24h vol</th>
-                <th>Trade taken</th>
-              </tr>
-            </thead>
-            <tbody>
-              {spikes.map((r) => (
-                <tr key={r.id}>
-                  <td className="cell-mono">{r.created_at ? fmtIst(r.created_at) : '—'}</td>
-                  <td className="cell-mono">
-                    {r.candle_open_time_ms != null ? fmtIst(Number(r.candle_open_time_ms)) : '—'}
-                  </td>
-                  <td className="cell-mono">{r.symbol}</td>
-                  <td>{r.direction}</td>
-                  <td className="cell-mono cell-right">
-                    {r.spike_pct != null ? `${Number(r.spike_pct).toFixed(3)}%` : '—'}
-                  </td>
-                  <td className="cell-mono cell-right">
-                    {r.quote_volume_24h != null ? Number(r.quote_volume_24h).toFixed(0) : '—'}
-                  </td>
-                  <td>
-                    <label className="backtest1-field" style={{ margin: 0, flexDirection: 'row', gap: 8 }}>
-                      <input
-                        type="checkbox"
-                        checked={Boolean(r.trade_taken)}
-                        disabled={togglingId === r.id}
-                        onChange={(e) => onToggleTradeTaken(r.id, e.target.checked)}
-                      />
-                      <span className="hourly-spikes-hint">{r.trade_taken ? 'Yes' : 'No'}</span>
-                    </label>
-                  </td>
+        <>
+          <div className="table-wrap agent1-spikes-wrap">
+            <table className="positions-table agent1-spikes-table">
+              <thead>
+                <tr>
+                  <th>Stored (IST)</th>
+                  <th>Candle open (IST)</th>
+                  <th>Symbol</th>
+                  <th>Dir</th>
+                  <th className="cell-right">Spike %</th>
+                  <th>Trade taken</th>
+                  <th>Execution</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {visibleSpikes.map((r) => (
+                  <tr key={r.id}>
+                    <td className="cell-mono">{r.created_at ? fmtIst(r.created_at) : '—'}</td>
+                    <td className="cell-mono">
+                      {r.candle_open_time_ms != null ? fmtIst(Number(r.candle_open_time_ms)) : '—'}
+                    </td>
+                    <td className="cell-mono">{r.symbol}</td>
+                    <td>{r.direction}</td>
+                    <td className="cell-mono cell-right">
+                      {r.spike_pct != null ? `${Number(r.spike_pct).toFixed(3)}%` : '—'}
+                    </td>
+                    <td>
+                      <label className="backtest1-field" style={{ margin: 0, flexDirection: 'row', gap: 8 }}>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(r.trade_taken)}
+                          disabled={togglingId === r.id}
+                          onChange={(e) => onToggleTradeTaken(r.id, e.target.checked)}
+                        />
+                        <span className="hourly-spikes-hint">{r.trade_taken ? 'Yes' : 'No'}</span>
+                      </label>
+                    </td>
+                    <td className="cell-mono" title={r.skip_reason ? String(r.skip_reason) : undefined}>
+                      {r.trade_taken ? (
+                        <span className="hourly-spikes-hint">Placed</span>
+                      ) : r.execution_skipped ? (
+                        <span className="hourly-spikes-hint" style={{ color: '#a16207' }}>
+                          Skipped
+                          {r.skip_reason
+                            ? `: ${
+                                String(r.skip_reason).length > 48
+                                  ? `${String(r.skip_reason).slice(0, 48)}…`
+                                  : String(r.skip_reason)
+                              }`
+                            : ''}
+                        </span>
+                      ) : (
+                        <span className="hourly-spikes-hint">—</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {spikes.length > 30 ? (
+            <div className="agent1-form-actions" style={{ paddingTop: 8, paddingBottom: 0 }}>
+              <button
+                type="button"
+                className="backtest1-btn backtest1-btn--secondary"
+                onClick={() => setVisibleSpikesCount((n) => Math.min(spikes.length, n + 100))}
+                disabled={visibleSpikes.length >= spikes.length}
+              >
+                View more (+100)
+              </button>
+              {visibleSpikesCount > 30 ? (
+                <button
+                  type="button"
+                  className="backtest1-btn backtest1-btn--secondary"
+                  onClick={() => setVisibleSpikesCount(30)}
+                >
+                  Show less (30)
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+        </>
+      )}
+
+      <h2 className="vol-screener-title agent1-section-title agent1-section-title--table">
+        Agent 1 logs
+      </h2>
+      {logs.length === 0 ? (
+        <p className="hourly-spikes-hint">No logs yet.</p>
+      ) : (
+        <>
+          <div className="table-wrap agent1-spikes-wrap">
+            <table className="positions-table agent1-spikes-table">
+              <thead>
+                <tr>
+                  <th>Time (IST)</th>
+                  <th>Level</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleLogs.map((l, idx) => (
+                  <tr key={`${l.at}-${idx}`}>
+                    <td className="cell-mono">{fmtIst(l.at)}</td>
+                    <td className="cell-mono">{String(l.level ?? '').toUpperCase()}</td>
+                    <td>{l.msg}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {logs.length > 30 ? (
+            <div className="agent1-form-actions" style={{ paddingTop: 8, paddingBottom: 0 }}>
+              <button
+                type="button"
+                className="backtest1-btn backtest1-btn--secondary"
+                onClick={() => setVisibleLogCount((n) => Math.min(logs.length, n + 100))}
+                disabled={visibleLogs.length >= logs.length}
+              >
+                View more (+100)
+              </button>
+              {visibleLogCount > 30 ? (
+                <button
+                  type="button"
+                  className="backtest1-btn backtest1-btn--secondary"
+                  onClick={() => setVisibleLogCount(30)}
+                >
+                  Show less (30)
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+        </>
       )}
     </div>
   )
