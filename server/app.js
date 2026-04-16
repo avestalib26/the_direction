@@ -2656,13 +2656,30 @@ app.get('/api/agents/agent2/execution', async (_req, res) => {
       )
       openTrades = Array.isArray(openTrades) ? openTrades : []
       closedTrades = await supabaseRest(
-        '/rest/v1/agent2_trades?select=*&status=eq.closed&order=closed_at.desc&limit=200',
+        '/rest/v1/agent2_trades?select=*&status=eq.closed&order=closed_at.desc&limit=100',
       )
       closedTrades = Array.isArray(closedTrades) ? closedTrades : []
       entryOrders = await supabaseRest(
         '/rest/v1/agent2_entry_orders?select=*&order=created_at.desc&limit=200',
       )
       entryOrders = Array.isArray(entryOrders) ? entryOrders : []
+      const spikeIds = [...new Set(entryOrders.map((o) => o.spike_id).filter(Boolean))]
+      if (spikeIds.length > 0) {
+        const inList = spikeIds.map((id) => encodeURIComponent(String(id))).join(',')
+        const spikeRows = await supabaseRest(
+          `/rest/v1/agent2_spikes?id=in.(${inList})&select=id,candle_open_time_ms`,
+        )
+        const spikeTimeById = new Map()
+        if (Array.isArray(spikeRows)) {
+          for (const s of spikeRows) {
+            if (s?.id != null) spikeTimeById.set(String(s.id), s.candle_open_time_ms ?? null)
+          }
+        }
+        entryOrders = entryOrders.map((o) => ({
+          ...o,
+          spike_candle_open_time_ms: spikeTimeById.get(String(o.spike_id)) ?? null,
+        }))
+      }
     }
     const openPositionMap = new Map()
     const apiKey = process.env.BINANCE_API_KEY

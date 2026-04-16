@@ -825,7 +825,7 @@ export async function runAgent2ScanTick() {
   const { futuresBase, supabaseRest } = ctx()
   const settings = await readAgent2Settings()
   if (!settings.agentEnabled || !settings.signalsSchedulerEnabled) {
-    agent2SchedulerState.scanLeaseOwner = false
+    agent2SchedulerState.scanLeaseOwner = null
     return { spikes: 0, skipped: 'master_or_signals_off' }
   }
 
@@ -1141,14 +1141,15 @@ export async function runAgent2ExecutionTick() {
   }
 }
 
-/** @type {{ nextFireAt: number | null, lastRunAt: number | null, lastError: string | null, lastSpikeCount: number | null, running: boolean, scanLeaseOwner: boolean }} */
+/** @type {{ nextFireAt: number | null, lastRunAt: number | null, lastError: string | null, lastSpikeCount: number | null, running: boolean, scanLeaseOwner: boolean | null }} */
 export const agent2SchedulerState = {
   nextFireAt: null,
   lastRunAt: null,
   lastError: null,
   lastSpikeCount: null,
   running: false,
-  scanLeaseOwner: false,
+  /** null = scan not competing for lock (master/signals off, or no tick yet); true/false = lease result when scan runs */
+  scanLeaseOwner: null,
 }
 
 export function startAgent2ScanScheduler({ futuresBase, logger = console }) {

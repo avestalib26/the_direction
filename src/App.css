@@ -585,6 +585,15 @@
   box-shadow: inset 3px 0 0 color-mix(in srgb, #ca8a04 75%, var(--text-muted));
 }
 
+.agent2-page .agent2-equity-pane--bars {
+  min-height: 200px;
+  margin-bottom: 0.5rem;
+}
+
+.agent2-page .agent2-equity-pane--line {
+  min-height: 240px;
+}
+
 @media (min-width: 640px) {
   .agent1-spikes-table th,
   .agent1-spikes-table td {

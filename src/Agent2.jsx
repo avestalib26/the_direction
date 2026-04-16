@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Agent2ClosedTradesCharts } from './Agent2ClosedTradesCharts.jsx'
 
 const UI_POLL_MS = 12_000
 
@@ -41,6 +42,14 @@ function formatCountdown(targetMs, nowMs) {
   if (m < 60) return `${m}m ${s}s`
   const h = Math.floor(m / 60)
   return `${h}h ${m % 60}m`
+}
+
+/** Green body % from spike OHLC; matches scan gate (body vs open). */
+function spikeBodyPct(r) {
+  const o = Number(r.spike_open)
+  const c = Number(r.spike_close)
+  if (!Number.isFinite(o) || o <= 0 || !Number.isFinite(c) || !(c > o)) return null
+  return ((c - o) / o) * 100
 }
 
 async function fetchJson(url, options) {
@@ -152,7 +161,6 @@ export function Agent2() {
 
   const [visiblePendingCount, setVisiblePendingCount] = useState(30)
   const [visibleOpenCount, setVisibleOpenCount] = useState(30)
-  const [visibleClosedCount, setVisibleClosedCount] = useState(30)
   const [visibleSpikesCount, setVisibleSpikesCount] = useState(30)
   const [visibleLogCount, setVisibleLogCount] = useState(30)
 
@@ -177,10 +185,6 @@ export function Agent2() {
   const visibleOngoingTrades = useMemo(
     () => ongoingTradesAll.slice(0, Math.max(30, visibleOpenCount)),
     [ongoingTradesAll, visibleOpenCount],
-  )
-  const visibleClosedTrades = useMemo(
-    () => closedTradesAll.slice(0, Math.max(30, visibleClosedCount)),
-    [closedTradesAll, visibleClosedCount],
   )
   const visibleSpikesRows = useMemo(
     () => spikes.slice(0, Math.max(30, visibleSpikesCount)),
@@ -315,8 +319,19 @@ export function Agent2() {
             Exec loop: <strong>{execRunning ? 'running' : 'idle'}</strong>
           </div>
           <div className="risk-chip">
-            Scan lease: <strong>{scanStatus.scanLeaseOwner ? 'owner' : 'standby'}</strong>
-            <span className="hourly-spikes-hint"> (Supabase lock)</span>
+            Scan lease:{' '}
+            <strong>
+              {scanStatus.scanLeaseOwner === true
+                ? 'owner'
+                : scanStatus.scanLeaseOwner === false
+                  ? 'standby'
+                  : 'inactive'}
+            </strong>
+            <span className="hourly-spikes-hint">
+              {scanStatus.scanLeaseOwner === true || scanStatus.scanLeaseOwner === false
+                ? ' (Supabase lock)'
+                : ' (no scan tick yet, or agent/signals scan off)'}
+            </span>
           </div>
           <div className="risk-chip">
             Exec lease: <strong>{execution?.state?.leaseOwner ? 'owner' : 'standby'}</strong>
@@ -554,6 +569,7 @@ export function Agent2() {
           <thead>
             <tr>
               <th>Symbol</th>
+              <th>Spike candle (IST)</th>
               <th>Trigger</th>
               <th>Status</th>
               <th>Exchange</th>
@@ -563,7 +579,7 @@ export function Agent2() {
           <tbody>
             {pendingOrders.length === 0 ? (
               <tr>
-                <td colSpan={5} className="muted">
+                <td colSpan={6} className="muted">
                   None
                 </td>
               </tr>
@@ -571,6 +587,9 @@ export function Agent2() {
               visiblePendingOrders.map((o) => (
                 <tr key={o.id}>
                   <td>{o.symbol}</td>
+                  <td className="cell-mono">
+                    {o.spike_candle_open_time_ms != null ? fmtIst(o.spike_candle_open_time_ms) : '—'}
+                  </td>
                   <td>{o.stop_price}</td>
                   <td>{o.status}</td>
                   <td className="cell-mono muted">{o.last_exchange_status ?? '—'}</td>
@@ -622,16 +641,25 @@ export function Agent2() {
                 </td>
               </tr>
             ) : (
-              visibleOngoingTrades.map((t) => (
-                <tr key={t.id}>
-                  <td>{t.symbol}</td>
-                  <td>{t.entry_price ?? '—'}</td>
-                  <td>{t.bracket_state}</td>
-                  <td>
-                    {t.tp_trigger_price ?? '—'} / {t.sl_trigger_price ?? '—'}
-                  </td>
-                </tr>
-              ))
+              visibleOngoingTrades.map((t) => {
+                const ur = Number(t.unRealizedProfit)
+                const rowCls =
+                  Number.isFinite(ur) && ur > 0
+                    ? 'agent1-trade-row agent1-trade-row--pos'
+                    : Number.isFinite(ur) && ur < 0
+                      ? 'agent1-trade-row agent1-trade-row--neg'
+                      : 'agent1-trade-row'
+                return (
+                  <tr key={t.id} className={rowCls}>
+                    <td>{t.symbol}</td>
+                    <td>{t.entry_price ?? '—'}</td>
+                    <td>{t.bracket_state}</td>
+                    <td>
+                      {t.tp_trigger_price ?? '—'} / {t.sl_trigger_price ?? '—'}
+                    </td>
+                  </tr>
+                )
+              })
             )}
           </tbody>
         </table>
@@ -659,6 +687,10 @@ export function Agent2() {
       ) : null}
 
       <h3 className="vol-screener-title agent1-section-title">Closed trades (this agent only)</h3>
+      <p className="muted" style={{ margin: '0 0 0.5rem', fontSize: '0.8125rem' }}>
+        Last 100 closes (newest at top). Row tint = realized P&amp;L sign.
+      </p>
+      <Agent2ClosedTradesCharts closedTrades={closedTrades} />
       <div className="table-wrap agent1-spikes-wrap">
         <table className="positions-table agent1-spikes-table">
           <thead>
@@ -667,7 +699,6 @@ export function Agent2() {
               <th>Opened</th>
               <th>Closed</th>
               <th>Entry</th>
-              <th>Qty</th>
               <th>TP / SL</th>
               <th>Reason</th>
               <th>Realized</th>
@@ -676,54 +707,46 @@ export function Agent2() {
           <tbody>
             {closedTrades.length === 0 ? (
               <tr>
-                <td colSpan={8} className="muted">
+                <td colSpan={7} className="muted">
                   None
                 </td>
               </tr>
             ) : (
-              visibleClosedTrades.map((t) => (
-                <tr key={t.id}>
-                  <td>{t.symbol}</td>
-                  <td className="cell-mono">{t.opened_at != null ? fmtIst(t.opened_at) : '—'}</td>
-                  <td className="cell-mono">{t.closed_at != null ? fmtIst(t.closed_at) : '—'}</td>
-                  <td>{t.entry_price ?? '—'}</td>
-                  <td>{t.quantity ?? '—'}</td>
-                  <td className="cell-mono muted">
-                    {t.tp_trigger_price ?? '—'} / {t.sl_trigger_price ?? '—'}
-                  </td>
-                  <td className="muted">{t.close_reason ?? '—'}</td>
-                  <td className="cell-mono">
-                    {Number.isFinite(Number(t.realized_pnl_usdt))
-                      ? Number(t.realized_pnl_usdt).toFixed(4)
-                      : '—'}
-                  </td>
-                </tr>
-              ))
+              closedTrades.map((t) => {
+                const pnl = Number(t.realized_pnl_usdt)
+                const rowCls = Number.isFinite(pnl)
+                  ? pnl > 0
+                    ? 'agent1-trade-row agent1-trade-row--pos'
+                    : pnl < 0
+                      ? 'agent1-trade-row agent1-trade-row--neg'
+                      : 'agent1-trade-row'
+                  : 'agent1-trade-row'
+                const pnlCellCls =
+                  Number.isFinite(pnl) && pnl > 0
+                    ? 'cell-mono cell-right cell-pnl pnl-pos'
+                    : Number.isFinite(pnl) && pnl < 0
+                      ? 'cell-mono cell-right cell-pnl pnl-neg'
+                      : 'cell-mono cell-right'
+                return (
+                  <tr key={t.id} className={rowCls}>
+                    <td>{t.symbol}</td>
+                    <td className="cell-mono">{t.opened_at != null ? fmtIst(t.opened_at) : '—'}</td>
+                    <td className="cell-mono">{t.closed_at != null ? fmtIst(t.closed_at) : '—'}</td>
+                    <td>{t.entry_price ?? '—'}</td>
+                    <td className="cell-mono muted">
+                      {t.tp_trigger_price ?? '—'} / {t.sl_trigger_price ?? '—'}
+                    </td>
+                    <td className="muted">{t.close_reason ?? '—'}</td>
+                    <td className={pnlCellCls}>
+                      {Number.isFinite(pnl) ? pnl.toFixed(4) : '—'}
+                    </td>
+                  </tr>
+                )
+              })
             )}
           </tbody>
         </table>
       </div>
-      {closedTrades.length > 30 ? (
-        <div className="agent1-form-actions" style={{ paddingTop: 8, paddingBottom: 0 }}>
-          <button
-            type="button"
-            className="backtest1-btn backtest1-btn--secondary"
-            onClick={() => setVisibleClosedCount((n) => Math.min(closedTrades.length, n + 100))}
-            disabled={visibleClosedTrades.length >= closedTrades.length}
-          >
-            View more (+100)
-          </button>
-          {visibleClosedCount > 30 ? (
-            <button
-              type="button"
-              className="backtest1-btn backtest1-btn--secondary"
-              onClick={() => setVisibleClosedCount(30)}
-            >
-              Show less (30)
-            </button>
-          ) : null}
-        </div>
-      ) : null}
 
       <h2 ref={spikesRef} className="vol-screener-title agent1-section-title agent1-anchor-target">
         Recent spikes
@@ -735,6 +758,7 @@ export function Agent2() {
               <th>Time</th>
               <th>Symbol</th>
               <th>Low</th>
+              <th>Body %</th>
               <th>Status</th>
               <th>Detail</th>
             </tr>
@@ -742,7 +766,7 @@ export function Agent2() {
           <tbody>
             {spikes.length === 0 ? (
               <tr>
-                <td colSpan={5} className="muted">
+                <td colSpan={6} className="muted">
                   None yet
                 </td>
               </tr>
@@ -751,6 +775,7 @@ export function Agent2() {
                 const issue =
                   String(r.status ?? '').toLowerCase() === 'arm_failed' ||
                   String(r.status ?? '').toLowerCase() === 'skipped'
+                const bodyPct = spikeBodyPct(r)
                 return (
                   <tr key={r.id} className={issue ? 'agent2-spike-row--issue' : undefined}>
                     <td className="cell-mono">
@@ -758,6 +783,9 @@ export function Agent2() {
                     </td>
                     <td>{r.symbol}</td>
                     <td>{r.spike_low}</td>
+                    <td className="cell-mono cell-right">
+                      {bodyPct != null ? `${bodyPct.toFixed(2)}%` : '—'}
+                    </td>
                     <td>{r.status}</td>
                     <td className="cell-mono muted" style={{ maxWidth: '24rem' }}>
                       {r.skip_reason ?? '—'}
