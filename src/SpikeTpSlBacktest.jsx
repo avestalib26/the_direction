@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   computeEquityEmaFilterStats,
   computePerTradeSubsampleStats,
@@ -175,6 +175,8 @@ export function SpikeTpSlBacktest() {
   const [includeOhlcCharts, setIncludeOhlcCharts] = useState(true)
   /** Long only: require next open > EMA(96) on 5m at spike bar (server aligns 5m to main window). */
   const [emaLongFilter96_5m, setEmaLongFilter96_5m] = useState(false)
+  /** Long only: allow another same-symbol spike trade even if a prior one is still open. */
+  const [allowOverlap, setAllowOverlap] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [data, setData] = useState(null)
@@ -185,6 +187,12 @@ export function SpikeTpSlBacktest() {
   const [equityEmaStatsFilterOn, setEquityEmaStatsFilterOn] = useState(true)
   /** Take-profit multiple vs 1R stop (long / red short); green short uses this for stop width (TP still spike low). */
   const [tpR, setTpR] = useState('2')
+
+  const isLongStrategyFamily = strategy === 'long' || strategy === 'longRedSpikeTpHigh'
+
+  useEffect(() => {
+    if (strategy === 'longRedSpikeTpHigh') setSlAtSpikeOpen(false)
+  }, [strategy])
 
   const run = useCallback(async () => {
     setLoading(true)
@@ -212,8 +220,14 @@ export function SpikeTpSlBacktest() {
         ...(Number.isFinite(maxSl) && maxSl > 0 ? { maxSlPct: maxSl } : {}),
         ...(slAtSpikeOpen ? { slAtSpikeOpen: true } : {}),
         includeChartCandles: includeOhlcCharts,
-        ...(emaLongFilter96_5m && strategy === 'long' ? { emaLongFilter96_5m: true } : {}),
-        ...(Number.isFinite(tpRVal) && tpRVal > 0 && tpRVal <= 100 ? { tpR: tpRVal } : {}),
+        ...(emaLongFilter96_5m && isLongStrategyFamily ? { emaLongFilter96_5m: true } : {}),
+        ...(allowOverlap && isLongStrategyFamily ? { allowOverlap: true } : {}),
+        ...(strategy !== 'longRedSpikeTpHigh' &&
+        Number.isFinite(tpRVal) &&
+        tpRVal > 0 &&
+        tpRVal <= 100
+          ? { tpR: tpRVal }
+          : {}),
       })
       setData(out)
     } catch (e) {
@@ -233,7 +247,9 @@ export function SpikeTpSlBacktest() {
     slAtSpikeOpen,
     includeOhlcCharts,
     emaLongFilter96_5m,
+    allowOverlap,
     tpR,
+    isLongStrategyFamily,
   ])
 
   const tpRDisplay = useMemo(() => {
@@ -279,13 +295,23 @@ export function SpikeTpSlBacktest() {
       <h1 className="vol-screener-title">Spike TP/SL backtest</h1>
       <p className="vol-screener-lead">
         Filters USDT-M perpetuals by <strong>24h quote volume</strong>, loads <strong>N</strong> candles
-        per symbol, finds <strong>{strategy === 'shortRedSpike' ? 'red' : 'green'}</strong> candles whose{' '}
-        <strong>body</strong> is at least your threshold % vs open.{' '}
+        per symbol, finds{' '}
+        <strong>
+          {strategy === 'shortRedSpike' || strategy === 'longRedSpikeTpHigh' ? 'red' : 'green'}
+        </strong>{' '}
+        candles whose <strong>body</strong> is at least your threshold % vs open.{' '}
         {strategy === 'shortRedSpike' ? (
           <>
             <strong>R = spike high − spike close</strong>. <strong>Short</strong> at the{' '}
             <strong>next open</strong>: stop <code className="inline-code">entry + R</code>, target{' '}
             <code className="inline-code">entry − 2R</code> (same 2:1 R-multiple idea as long, mirrored).{' '}
+          </>
+        ) : strategy === 'longRedSpikeTpHigh' ? (
+          <>
+            <strong>Long</strong> at the <strong>next open</strong> after a <strong>red-body spike</strong>: take-profit
+            at the <strong>spike candle high</strong>; stop is{' '}
+            <code className="inline-code">entry − 2×(TP − entry)</code> (about <strong>+0.5R vs −1R</strong> when the
+            stop is not tightened by max SL %). <strong>tpR</strong> does not apply.{' '}
           </>
         ) : strategy === 'regimeFlipEma50' ? (
           <>
@@ -352,6 +378,16 @@ export function SpikeTpSlBacktest() {
           <strong>entry + R</strong>; target is <strong>entry − {tpRDisplay}R</strong> ({tpRDisplay}R profit vs 1R
           risk, mirrored from the long rule). Same bar priority: if both levels touch one bar,{' '}
           <strong>stop first</strong> (conservative).
+        </p>
+      )}
+
+      {(strategy === 'longRedSpikeTpHigh' || data?.strategy === 'longRedSpikeTpHigh') && (
+        <p className="hourly-spikes-hint spike-tpsl-short-plain">
+          <strong>Long on red spike (TP = spike high):</strong> After a large <strong>red</strong> body vs open, you{' '}
+          <strong>buy at the next candle&apos;s open</strong>, targeting a fill back up to the{' '}
+          <strong>high of that spike candle</strong>. The stop sits below entry by <strong>twice</strong> the distance
+          from entry to that TP (about <strong>0.5R reward vs 1R risk</strong> if max SL % does not tighten the stop).
+          Trades where the next open is already at or above the spike high are skipped.
         </p>
       )}
 
@@ -435,6 +471,9 @@ export function SpikeTpSlBacktest() {
             <option value="shortRedSpike">
               Short — TP −{tpRDisplay}R / SL +1R (red spike, mirrored)
             </option>
+            <option value="longRedSpikeTpHigh">
+              Long — TP spike high / SL 2× reward (~0.5R, red spike)
+            </option>
             <option value="regimeFlipEma50">
               Regime flip — above EMA50: long, below EMA50: short (TP spike low / fixed SL +2R)
             </option>
@@ -449,6 +488,7 @@ export function SpikeTpSlBacktest() {
             placeholder="default 2"
             value={tpR}
             onChange={(e) => setTpR(e.target.value)}
+            disabled={strategy === 'longRedSpikeTpHigh'}
           />
         </label>
         {strategy === 'regimeFlipEma50' && (
@@ -456,6 +496,11 @@ export function SpikeTpSlBacktest() {
             In regime flip mode, <strong>TP R</strong> above applies only to the <strong>long</strong> branch. The{' '}
             <strong>short</strong> branch is fixed to <strong>TP at spike low</strong> and{' '}
             <strong>SL = entry + 2R</strong>.
+          </p>
+        )}
+        {strategy === 'longRedSpikeTpHigh' && (
+          <p className="hourly-spikes-hint spike-tpsl-range-hint">
+            <strong>TP R</strong> is ignored for this mode (TP is fixed at the spike high).
           </p>
         )}
         <label className="vol-screener-field">
@@ -473,6 +518,7 @@ export function SpikeTpSlBacktest() {
           <input
             type="checkbox"
             checked={slAtSpikeOpen}
+            disabled={strategy === 'longRedSpikeTpHigh'}
             onChange={(e) => setSlAtSpikeOpen(e.target.checked)}
           />
           <span>
@@ -487,13 +533,26 @@ export function SpikeTpSlBacktest() {
           <input
             type="checkbox"
             checked={emaLongFilter96_5m}
-            disabled={strategy !== 'long'}
+            disabled={!isLongStrategyFamily}
             onChange={(e) => setEmaLongFilter96_5m(e.target.checked)}
           />
           <span>
             <strong>EMA 96 (5m) long filter</strong> — only take a <strong>long</strong> when the{' '}
             <strong>entry open</strong> is above <strong>EMA(96)</strong> on <strong>5m</strong> at the spike bar
             (5m series is loaded for the same time window as your main interval). Ignored for short strategies.
+          </span>
+        </label>
+        <label className="vol-screener-field spike-tpsl-sl-open-toggle">
+          <input
+            type="checkbox"
+            checked={allowOverlap}
+            disabled={!isLongStrategyFamily}
+            onChange={(e) => setAllowOverlap(e.target.checked)}
+          />
+          <span>
+            <strong>Allow overlapping longs (same symbol)</strong> — in <strong>long</strong> mode, do not block a new
+            spike trade on the same coin while a previous one is still open. Turn off to use the current non-overlap
+            behavior.
           </span>
         </label>
         <label className="vol-screener-field spike-tpsl-sl-open-toggle">
@@ -911,7 +970,9 @@ export function SpikeTpSlBacktest() {
               <strong>R</strong> ={' '}
               {(data?.strategy ?? strategy) === 'shortRedSpike'
                 ? 'spike high − spike close'
-                : 'spike close − spike low'}
+                : (data?.strategy ?? strategy) === 'longRedSpikeTpHigh'
+                  ? 'stop distance (entry − SL); table column is price risk to SL'
+                  : 'spike close − spike low'}
               .{' '}
               <strong>Exit</strong> is the model fill (SL, TP, or last close for EOD). Spike/exit times use
               your browser&apos;s <strong>local</strong> timezone.{' '}

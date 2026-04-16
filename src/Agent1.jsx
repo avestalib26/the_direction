@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 /** Must match server `AGENT1_SCAN_INTERVALS` / `AGENT1_INTERVAL_MS`. */
 const AGENT1_INTERVAL_MS = Object.freeze({
@@ -128,12 +128,27 @@ function fmtIst(msOrIso) {
   )
 }
 
+function toNum(v) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+function fmtSignedUsd(v, digits = 4) {
+  const n = toNum(v)
+  if (n == null) return '—'
+  const abs = Math.abs(n).toFixed(digits)
+  if (n > 0) return `+${abs}`
+  if (n < 0) return `-${abs}`
+  return abs
+}
+
 export function Agent1() {
   const [tradeSizeUsd, setTradeSizeUsd] = useState('1')
   const [leverage, setLeverage] = useState('10')
   const [marginMode, setMarginMode] = useState('cross')
   const [maxTpPct, setMaxTpPct] = useState('1.5')
   const [maxSlPct, setMaxSlPct] = useState('1')
+  const [maxOpenPositions, setMaxOpenPositions] = useState('30')
   const [scanInterval, setScanInterval] = useState('5m')
   const [scanSecondsBeforeClose, setScanSecondsBeforeClose] = useState('20')
   const [scanThresholdPct, setScanThresholdPct] = useState('3')
@@ -161,6 +176,11 @@ export function Agent1() {
   const [spikesLoading, setSpikesLoading] = useState(true)
   const [spikesError, setSpikesError] = useState('')
   const [togglingId, setTogglingId] = useState('')
+  const [activeTab, setActiveTab] = useState('execution')
+  const executionRef = useRef(null)
+  const tradesRef = useRef(null)
+  const spikesRef = useRef(null)
+  const logsRef = useRef(null)
 
   const maxScanSecondsBeforeClose = useMemo(
     () => maxSecondsBeforeCloseForInterval(scanInterval),
@@ -181,6 +201,15 @@ export function Agent1() {
   const visibleLogs = useMemo(
     () => logs.slice(0, Math.max(30, visibleLogCount)),
     [logs, visibleLogCount],
+  )
+  const sectionTabs = useMemo(
+    () => [
+      { id: 'execution', label: 'Execution', ref: executionRef },
+      { id: 'trades', label: 'Trades', ref: tradesRef },
+      { id: 'spikes', label: 'Spikes', ref: spikesRef },
+      { id: 'logs', label: 'Logs', ref: logsRef },
+    ],
+    [],
   )
 
   const loadSpikes = useCallback(async () => {
@@ -236,6 +265,7 @@ export function Agent1() {
         setMarginMode(String(s.marginMode ?? 'cross'))
         setMaxTpPct(String(s.maxTpPct ?? '1.5'))
         setMaxSlPct(String(s.maxSlPct ?? '1'))
+        setMaxOpenPositions(String(s.maxOpenPositions ?? '30'))
         const loadedInterval = String(s.scanInterval ?? '5m').trim()
         setScanInterval(
           AGENT1_INTERVAL_MS[loadedInterval] != null ? loadedInterval : '5m',
@@ -289,6 +319,37 @@ export function Agent1() {
     return () => window.removeEventListener('agent1-enabled-changed', onHeaderToggle)
   }, [loadScanStatus])
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    const heads = sectionTabs.map((t) => t.ref.current).filter(Boolean)
+    if (heads.length === 0) return undefined
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((e) => e.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)
+        const first = visible[0]
+        if (!first) return
+        const hit = sectionTabs.find((t) => t.ref.current === first.target)
+        if (hit) setActiveTab(hit.id)
+      },
+      {
+        root: null,
+        rootMargin: '-120px 0px -55% 0px',
+        threshold: [0.15, 0.35, 0.6],
+      },
+    )
+    for (const el of heads) observer.observe(el)
+    return () => observer.disconnect()
+  }, [sectionTabs])
+
+  const onClickTab = useCallback((tab) => {
+    setActiveTab(tab.id)
+    const el = tab.ref.current
+    if (!el) return
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [])
+
   const onSave = async () => {
     setSaving(true)
     setError('')
@@ -299,6 +360,7 @@ export function Agent1() {
         marginMode,
         maxTpPct: Number.parseFloat(maxTpPct),
         maxSlPct: Number.parseFloat(maxSlPct),
+        maxOpenPositions: Number.parseInt(maxOpenPositions, 10),
         scanInterval,
         scanSecondsBeforeClose: Number.parseInt(scanSecondsBeforeClose, 10),
         scanThresholdPct: Number.parseFloat(scanThresholdPct),
@@ -314,6 +376,7 @@ export function Agent1() {
       setMarginMode(String(out.marginMode))
       setMaxTpPct(String(out.maxTpPct))
       setMaxSlPct(String(out.maxSlPct))
+      setMaxOpenPositions(String(out.maxOpenPositions ?? '30'))
       const outInterval = String(out.scanInterval ?? '5m').trim()
       setScanInterval(
         AGENT1_INTERVAL_MS[outInterval] != null ? outInterval : '5m',
@@ -372,6 +435,18 @@ export function Agent1() {
 
   return (
     <div className="vol-screener agent1-page">
+      <nav className="agent1-tabs" aria-label="Agent 1 sections">
+        {sectionTabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            className={`agent1-tab ${activeTab === tab.id ? 'agent1-tab--active' : ''}`}
+            onClick={() => onClickTab(tab)}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </nav>
       {scanStatus ? (
         <div className="risk-summary agent1-risk-summary">
           <div className="risk-chip">
@@ -422,6 +497,9 @@ export function Agent1() {
           <div className="risk-chip">
             Last placed: <strong>{execution?.state?.lastPlaced ?? 0}</strong>
           </div>
+          <div className="risk-chip">
+            Max open: <strong>{maxOpenPositions || '30'}</strong>
+          </div>
           {scanStatus.running ? (
             <div className="risk-chip">
               <strong>Scan in progress…</strong>
@@ -435,7 +513,9 @@ export function Agent1() {
         </div>
       ) : null}
 
-      <h2 className="vol-screener-title agent1-section-title">Execution</h2>
+      <h2 ref={executionRef} className="vol-screener-title agent1-section-title agent1-anchor-target">
+        Execution
+      </h2>
       <div className="backtest1-form agent1-form" aria-busy={loading}>
         <div className="agent1-form-actions" style={{ gridColumn: '1 / -1', paddingTop: 0 }}>
           <button
@@ -507,6 +587,19 @@ export function Agent1() {
             step={0.01}
             value={maxSlPct}
             onChange={(e) => setMaxSlPct(e.target.value)}
+            disabled={loading || saving}
+          />
+        </label>
+        <label className="backtest1-field">
+          <span className="backtest1-label">Max open positions</span>
+          <input
+            type="number"
+            className="backtest1-input"
+            min={1}
+            max={300}
+            step={1}
+            value={maxOpenPositions}
+            onChange={(e) => setMaxOpenPositions(e.target.value)}
             disabled={loading || saving}
           />
         </label>
@@ -643,7 +736,10 @@ export function Agent1() {
         </p>
       ) : null}
 
-      <h2 className="vol-screener-title agent1-section-title agent1-section-title--table">
+      <h2
+        ref={tradesRef}
+        className="vol-screener-title agent1-section-title agent1-section-title--table agent1-anchor-target"
+      >
         Ongoing trades by Agent 1
       </h2>
       {ongoingTrades.length === 0 ? (
@@ -664,7 +760,16 @@ export function Agent1() {
               </thead>
               <tbody>
                 {visibleOngoingTrades.map((t) => (
-                  <tr key={t.id}>
+                  <tr
+                    key={t.id}
+                    className={
+                      Number(t.unRealizedProfit) > 0
+                        ? 'agent1-trade-row agent1-trade-row--pos'
+                        : Number(t.unRealizedProfit) < 0
+                          ? 'agent1-trade-row agent1-trade-row--neg'
+                          : 'agent1-trade-row'
+                    }
+                  >
                     <td className="cell-mono">{fmtIst(t.opened_at)}</td>
                     <td className="cell-mono">{t.symbol}</td>
                     <td className="cell-mono">{t.applied_leverage ?? '—'}x</td>
@@ -673,7 +778,7 @@ export function Agent1() {
                     <td
                       className={`cell-mono cell-right ${Number(t.unRealizedProfit) > 0 ? 'pnl-pos' : Number(t.unRealizedProfit) < 0 ? 'pnl-neg' : ''}`}
                     >
-                      {t.unRealizedProfit != null ? Number(t.unRealizedProfit).toFixed(4) : '—'}
+                      {fmtSignedUsd(t.unRealizedProfit)}
                     </td>
                   </tr>
                 ))}
@@ -722,30 +827,56 @@ export function Agent1() {
                   <th className="cell-right">Realized (USDT)</th>
                   <th className="cell-right">Commission</th>
                   <th className="cell-right">Funding</th>
+                  <th className="cell-right">Net PnL (USDT)</th>
                   <th>Close reason</th>
                 </tr>
               </thead>
               <tbody>
-                {visibleClosedTrades.map((t) => (
-                  <tr key={t.id}>
-                    <td className="cell-mono">{fmtIst(t.opened_at)}</td>
-                    <td className="cell-mono">{fmtIst(t.closed_at)}</td>
-                    <td className="cell-mono">{t.symbol}</td>
-                    <td className="cell-mono">{t.applied_leverage ?? '—'}x</td>
-                    <td
-                      className={`cell-mono cell-right ${Number(t.realized_pnl_usdt) > 0 ? 'pnl-pos' : Number(t.realized_pnl_usdt) < 0 ? 'pnl-neg' : ''}`}
+                {visibleClosedTrades.map((t) => {
+                  const realized = toNum(t.realized_pnl_usdt)
+                  const commission = toNum(t.commission_usdt)
+                  const funding = toNum(t.funding_fee_usdt)
+                  const net =
+                    realized == null && commission == null && funding == null
+                      ? null
+                      : (realized ?? 0) + (commission ?? 0) + (funding ?? 0)
+                  return (
+                    <tr
+                      key={t.id}
+                      className={
+                        net != null && net > 0
+                          ? 'agent1-trade-row agent1-trade-row--pos'
+                          : net != null && net < 0
+                            ? 'agent1-trade-row agent1-trade-row--neg'
+                            : 'agent1-trade-row'
+                      }
                     >
-                      {t.realized_pnl_usdt != null ? Number(t.realized_pnl_usdt).toFixed(4) : '—'}
-                    </td>
-                    <td className="cell-mono cell-right">
-                      {t.commission_usdt != null ? Number(t.commission_usdt).toFixed(4) : '—'}
-                    </td>
-                    <td className="cell-mono cell-right">
-                      {t.funding_fee_usdt != null ? Number(t.funding_fee_usdt).toFixed(4) : '—'}
-                    </td>
-                    <td>{t.close_reason ?? '—'}</td>
-                  </tr>
-                ))}
+                      <td className="cell-mono">{fmtIst(t.opened_at)}</td>
+                      <td className="cell-mono">{fmtIst(t.closed_at)}</td>
+                      <td className="cell-mono">{t.symbol}</td>
+                      <td className="cell-mono">{t.applied_leverage ?? '—'}x</td>
+                      <td
+                        className={`cell-mono cell-right ${Number(t.realized_pnl_usdt) > 0 ? 'pnl-pos' : Number(t.realized_pnl_usdt) < 0 ? 'pnl-neg' : ''}`}
+                      >
+                        {fmtSignedUsd(t.realized_pnl_usdt)}
+                      </td>
+                      <td
+                        className={`cell-mono cell-right ${Number(t.commission_usdt) > 0 ? 'pnl-pos' : Number(t.commission_usdt) < 0 ? 'pnl-neg' : ''}`}
+                      >
+                        {fmtSignedUsd(t.commission_usdt)}
+                      </td>
+                      <td
+                        className={`cell-mono cell-right ${Number(t.funding_fee_usdt) > 0 ? 'pnl-pos' : Number(t.funding_fee_usdt) < 0 ? 'pnl-neg' : ''}`}
+                      >
+                        {fmtSignedUsd(t.funding_fee_usdt)}
+                      </td>
+                      <td className={`cell-mono cell-right ${net != null && net > 0 ? 'pnl-pos' : net != null && net < 0 ? 'pnl-neg' : ''}`}>
+                        {fmtSignedUsd(net)}
+                      </td>
+                      <td>{t.close_reason ?? '—'}</td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -773,7 +904,10 @@ export function Agent1() {
         </>
       )}
 
-      <h2 className="vol-screener-title agent1-section-title agent1-section-title--table">
+      <h2
+        ref={spikesRef}
+        className="vol-screener-title agent1-section-title agent1-section-title--table agent1-anchor-target"
+      >
         Recent spikes (last 200)
       </h2>
       {spikesError ? (
@@ -870,7 +1004,10 @@ export function Agent1() {
         </>
       )}
 
-      <h2 className="vol-screener-title agent1-section-title agent1-section-title--table">
+      <h2
+        ref={logsRef}
+        className="vol-screener-title agent1-section-title agent1-section-title--table agent1-anchor-target"
+      >
         Agent 1 logs
       </h2>
       {logs.length === 0 ? (

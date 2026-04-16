@@ -95,6 +95,7 @@ const AGENT1_DEFAULT_SETTINGS = Object.freeze({
   marginMode: 'cross',
   maxTpPct: 1.5,
   maxSlPct: 1.0,
+  maxOpenPositions: 30,
   scanSecondsBeforeClose: 20,
   scanThresholdPct: 3,
   scanMinQuoteVolume: 0,
@@ -786,6 +787,10 @@ function normalizeAgent1Settings(raw = {}) {
     .toLowerCase()
   const maxTpPct = Number.parseFloat(String(raw.maxTpPct ?? raw.max_tp_pct ?? AGENT1_DEFAULT_SETTINGS.maxTpPct))
   const maxSlPct = Number.parseFloat(String(raw.maxSlPct ?? raw.max_sl_pct ?? AGENT1_DEFAULT_SETTINGS.maxSlPct))
+  const maxOpenPositions = Number.parseInt(
+    String(raw.maxOpenPositions ?? raw.max_open_positions ?? AGENT1_DEFAULT_SETTINGS.maxOpenPositions),
+    10,
+  )
 
   const scanIntervalRaw = String(
     raw.scanInterval ?? raw.scan_interval ?? AGENT1_DEFAULT_SETTINGS.scanInterval,
@@ -843,6 +848,9 @@ function normalizeAgent1Settings(raw = {}) {
   if (!Number.isFinite(maxSlPct) || maxSlPct <= 0) {
     throw new Error('maxSlPct must be a positive number')
   }
+  if (!Number.isFinite(maxOpenPositions) || maxOpenPositions < 1 || maxOpenPositions > 300) {
+    throw new Error('maxOpenPositions must be between 1 and 300')
+  }
   if (!Number.isFinite(scanThresholdPct) || scanThresholdPct <= 0) {
     throw new Error('scanThresholdPct must be a positive number')
   }
@@ -866,6 +874,7 @@ function normalizeAgent1Settings(raw = {}) {
     marginMode,
     maxTpPct,
     maxSlPct,
+    maxOpenPositions,
     scanSecondsBeforeClose,
     scanThresholdPct,
     scanMinQuoteVolume,
@@ -879,6 +888,9 @@ function normalizeAgent1Settings(raw = {}) {
 }
 
 const AGENT1_SETTINGS_SELECT =
+  'agent_name,trade_size_usd,leverage,margin_mode,max_tp_pct,max_sl_pct,max_open_positions,updated_at,' +
+  'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled'
+const AGENT1_SETTINGS_SELECT_LEGACY =
   'agent_name,trade_size_usd,leverage,margin_mode,max_tp_pct,max_sl_pct,updated_at,' +
   'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled'
 
@@ -887,7 +899,18 @@ async function readAgent1Settings() {
     `/rest/v1/agent_settings?select=${AGENT1_SETTINGS_SELECT}` +
     '&agent_name=eq.agent1' +
     '&limit=1'
-  const rows = await supabaseRest(p)
+  let rows
+  try {
+    rows = await supabaseRest(p)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (!/max_open_positions/i.test(msg)) throw e
+    const legacyPath =
+      `/rest/v1/agent_settings?select=${AGENT1_SETTINGS_SELECT_LEGACY}` +
+      '&agent_name=eq.agent1' +
+      '&limit=1'
+    rows = await supabaseRest(legacyPath)
+  }
   if (!Array.isArray(rows) || rows.length === 0) {
     return {
       ...AGENT1_DEFAULT_SETTINGS,
@@ -922,6 +945,20 @@ function normalizePositionSideForKey(v) {
 
 function buildAgentTradePositionKey(symbol, positionSide) {
   return `${String(symbol ?? '').toUpperCase()}|${normalizePositionSideForKey(positionSide)}`
+}
+
+async function fetchAgent1OpenPositionKeys(apiKey, apiSecret) {
+  const out = new Set()
+  const rows = await fetchPositionRisk(apiKey, apiSecret)
+  if (!Array.isArray(rows)) return out
+  for (const p of rows) {
+    const amt = Number.parseFloat(String(p?.positionAmt ?? '0'))
+    if (!Number.isFinite(amt) || Math.abs(amt) <= 0) continue
+    const symbol = normalizeUsdtFuturesSymbol(p?.symbol, { allowMissingSuffix: false })
+    if (!symbol) continue
+    out.add(buildAgentTradePositionKey(symbol, p?.positionSide))
+  }
+  return out
 }
 
 /**
@@ -1065,6 +1102,15 @@ async function runAgent1ExecutionTick() {
     const openKeys = new Set(
       openTrades.map((t) => buildAgentTradePositionKey(t.symbol, t.position_side)),
     )
+    try {
+      const exchangeOpenKeys = await fetchAgent1OpenPositionKeys(apiKey, apiSecret)
+      for (const k of exchangeOpenKeys) openKeys.add(k)
+    } catch (e) {
+      pushAgent1ExecutionLog(
+        'warn',
+        `open-position sync failed: ${e instanceof Error ? e.message : String(e)}`,
+      )
+    }
 
     for (const spike of pending) {
       processed += 1
@@ -1094,6 +1140,14 @@ async function runAgent1ExecutionTick() {
         pushAgent1ExecutionLog('info', `skip ${symbol}: long already open`)
         continue
       }
+      if (openKeys.size >= settings.maxOpenPositions) {
+        await markAgent1SpikeSkipped(spike.id, `max open positions reached (${settings.maxOpenPositions})`)
+        pushAgent1ExecutionLog(
+          'warn',
+          `skip ${symbol}: max open positions reached (${settings.maxOpenPositions})`,
+        )
+        continue
+      }
       let placedOut = null
       let lastErrMsg = ''
       for (let attempt = 1; attempt <= 2; attempt++) {
@@ -1117,6 +1171,20 @@ async function runAgent1ExecutionTick() {
           break
         } catch (e) {
           lastErrMsg = e instanceof Error ? e.message : String(e)
+          const criticalProtectionFailure = /position should be flat/i.test(lastErrMsg)
+          if (criticalProtectionFailure) {
+            pushAgent1ExecutionLog(
+              'error',
+              `critical ${symbol}: ${lastErrMsg} (retry blocked to avoid stacked exposure)`,
+            )
+            try {
+              const exchangeOpenKeys = await fetchAgent1OpenPositionKeys(apiKey, apiSecret)
+              for (const k of exchangeOpenKeys) openKeys.add(k)
+            } catch {
+              // best-effort sync only
+            }
+            break
+          }
           if (attempt === 1) {
             pushAgent1ExecutionLog('warn', `failed ${symbol}: ${lastErrMsg} (retrying once now)`)
           }
@@ -1205,6 +1273,7 @@ async function upsertAgent1Settings(input) {
     margin_mode: s.marginMode,
     max_tp_pct: s.maxTpPct,
     max_sl_pct: s.maxSlPct,
+    max_open_positions: s.maxOpenPositions,
     scan_seconds_before_close: s.scanSecondsBeforeClose,
     scan_threshold_pct: s.scanThresholdPct,
     scan_min_quote_volume: s.scanMinQuoteVolume,
@@ -1215,14 +1284,25 @@ async function upsertAgent1Settings(input) {
     agent_enabled: s.agentEnabled,
     ema_gate_enabled: s.emaGateEnabled,
   }
-  const rows = await supabaseRest('/rest/v1/agent_settings?on_conflict=agent_name&select=*', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Prefer: 'resolution=merge-duplicates,return=representation',
-    },
-    body: JSON.stringify(body),
-  })
+  let rows
+  try {
+    rows = await supabaseRest('/rest/v1/agent_settings?on_conflict=agent_name&select=*', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates,return=representation',
+      },
+      body: JSON.stringify(body),
+    })
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/max_open_positions/i.test(msg)) {
+      throw new Error(
+        'maxOpenPositions requires DB migration. Run supabase/agent_settings_alter_agent1.sql (or supabase/agent_settings.sql) and retry.',
+      )
+    }
+    throw e
+  }
   const row = Array.isArray(rows) && rows[0] ? rows[0] : body
   const out = normalizeAgent1Settings(row)
   return {
@@ -1833,8 +1913,29 @@ async function placeFuturesOrderWithProtection({
       `Invalid TP/SL bracket vs entry ${entryPrice} for ${symbol} after tick rounding. Position flattened if possible.`,
     )
   }
-  const tpPrice = fmtByStep(tpPriceNum, spec.tickSize, spec.pricePrecision)
-  const slPrice = fmtByStep(slPriceNum, spec.tickSize, spec.pricePrecision)
+  const tpPrice = fmtByStep(tpPriceNum, spec.tickSize)
+  const slPrice = fmtByStep(slPriceNum, spec.tickSize)
+  const tpPriceCheck = Number.parseFloat(tpPrice)
+  const slPriceCheck = Number.parseFloat(slPrice)
+  if (!(tpPriceCheck > 0) || !(slPriceCheck > 0)) {
+    try {
+      await closeFuturesMarketReduceOnlyBestEffort({
+        apiKey,
+        apiSecret,
+        symbol,
+        entrySide: side,
+        entryPositionSide,
+        isHedgeMode,
+        spec,
+        fallbackQuantityStr: quantity,
+      })
+    } catch (e) {
+      warnings.push(`Emergency flatten failed (non-positive trigger price): ${e instanceof Error ? e.message : String(e)}`)
+    }
+    throw new Error(
+      `TP/SL trigger rounded to non-positive value (TP=${tpPrice}, SL=${slPrice}) for ${symbol}. Position flattened if possible.`,
+    )
+  }
 
   let tpOrder = null
   let slOrder = null
@@ -2770,10 +2871,17 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
     s === 'regime'
   ) {
     strategy = 'regimeFlipEma50'
+  } else if (
+    s === 'longredspiketphigh' ||
+    s === 'long_red_spike_tp_high' ||
+    s === 'longredspikehigh' ||
+    s === 'redspike_long_tp_high'
+  ) {
+    strategy = 'longRedSpikeTpHigh'
   } else {
     return res.status(400).json({
       error:
-        'strategy must be long, shortSpikeLow, shortRedSpike / negative_spike, or regimeFlipEma50',
+        'strategy must be long, longRedSpikeTpHigh / long_red_spike_tp_high, shortSpikeLow, shortRedSpike / negative_spike, or regimeFlipEma50',
     })
   }
 
@@ -2814,6 +2922,7 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
     String(req.query.includeChartCandles ?? 'true').toLowerCase() !== 'false'
   const emaLongFilter96_5m =
     String(req.query.emaLongFilter96_5m ?? '').toLowerCase() === 'true'
+  const allowOverlap = String(req.query.allowOverlap ?? '').toLowerCase() === 'true'
 
   const tpRQ = req.query.tpR
   let tpROpt
@@ -2838,6 +2947,7 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
       toDate: toDate || undefined,
       maxSlPct: maxSlPctOpt,
       slAtSpikeOpen,
+      allowOverlap,
       includeChartCandles,
       emaLongFilter96_5m,
       ...(tpROpt != null ? { tpR: tpROpt } : {}),

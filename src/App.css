@@ -181,6 +181,7 @@
 .agent1-page {
   width: 100%;
   box-sizing: border-box;
+  --agent1-sticky-offset: calc(3.8rem + env(safe-area-inset-top, 0px));
 }
 
 .longsim5m-page .longsim5m-status {
@@ -342,7 +343,8 @@
 .agent1-page > .agent1-risk-summary,
 .agent1-page > .agent1-section-title,
 .agent1-page > .hourly-spikes-hint,
-.agent1-page > .vol-screener-lead {
+.agent1-page > .vol-screener-lead,
+.agent1-page > .agent1-tabs {
   padding-inline: 0.65rem;
 }
 
@@ -353,10 +355,15 @@
 }
 
 @media (min-width: 720px) {
+  .agent1-page {
+    --agent1-sticky-offset: calc(4.1rem + env(safe-area-inset-top, 0px));
+  }
+
   .agent1-page > .agent1-risk-summary,
   .agent1-page > .agent1-section-title,
   .agent1-page > .hourly-spikes-hint,
-  .agent1-page > .vol-screener-lead {
+  .agent1-page > .vol-screener-lead,
+  .agent1-page > .agent1-tabs {
     padding-inline: 0;
   }
 
@@ -368,6 +375,52 @@
 
 .agent1-page .vol-screener-title {
   text-align: left;
+}
+
+.agent1-tabs {
+  position: sticky;
+  top: var(--agent1-sticky-offset);
+  z-index: 35;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  padding: 0.45rem 0.65rem 0.5rem;
+  margin: -0.35rem 0 0.55rem;
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid color-mix(in srgb, var(--menu-border) 80%, transparent);
+}
+
+.agent1-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.agent1-tab {
+  flex: 0 0 auto;
+  border: 1px solid var(--menu-border);
+  border-radius: 999px;
+  background: var(--menu-surface);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  min-height: 2rem;
+  padding: 0.28rem 0.78rem;
+  cursor: pointer;
+}
+
+.agent1-tab--active {
+  border-color: color-mix(in srgb, var(--text-heading) 60%, var(--menu-border));
+  color: var(--text-heading);
+  background: color-mix(in srgb, var(--menu-hover) 85%, var(--text-heading) 15%);
+}
+
+.agent1-anchor-target {
+  scroll-margin-top: calc(var(--agent1-sticky-offset) + 2.9rem);
 }
 
 .agent1-section-title {
@@ -459,6 +512,14 @@
 .agent1-spikes-table th,
 .agent1-spikes-table td {
   padding: 0.5rem 0.45rem;
+}
+
+.agent1-trade-row--pos td {
+  background: color-mix(in srgb, var(--pnl-pos) 10%, var(--menu-surface));
+}
+
+.agent1-trade-row--neg td {
+  background: color-mix(in srgb, var(--pnl-neg) 10%, var(--menu-surface));
 }
 
 @media (min-width: 640px) {

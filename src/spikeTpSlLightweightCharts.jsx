@@ -154,9 +154,6 @@ export function SpikeTpSlEquityLightChart({ points }) {
         borderColor: COL_GRID,
         scaleMargins: { top: 0.08, bottom: 0.08 },
       },
-      localization: {
-        priceFormatter: (p) => `${Number(p).toFixed(2)}%`,
-      },
     })
 
     const last = lineData[lineData.length - 1]?.value ?? 0
@@ -164,6 +161,11 @@ export function SpikeTpSlEquityLightChart({ points }) {
       color: last >= 0 ? COL_POS : COL_NEG,
       lineWidth: 2,
       priceScaleId: 'right',
+      priceFormat: {
+        type: 'custom',
+        minMove: 0.01,
+        formatter: (p) => `${Number(p).toFixed(2)}%`,
+      },
     })
     series.setData(lineData)
 

@@ -2,6 +2,7 @@
  * Universe backtest: volume-filtered USDT-M perps, green-body spikes.
  *
  * Long (default): next open long, R = spike close − spike low, SL = entry − R, TP = entry + 2R.
+ * Long (longRedSpikeTpHigh): next open long after red-body spike; TP = spike high; SL = entry − 2×(TP−entry) → 0.5R reward vs 1R risk.
  * Short (shortRedSpike): next open short after red-body spike, R = spike high − spike close, SL = entry + R, TP = entry − 2R.
  * Short (shortSpikeLow): next open short, same R as long on green spike, SL = entry + 2R, TP = spike low (cover when low tags).
  *
@@ -493,6 +494,99 @@ export function simulateLongTrade(candles, spikeIndex, tradeOpts = {}) {
  * Short at next open after red-body spike. R = spike high − spike close. SL = entry + R, TP = entry − 2R.
  * Mirror of long green-spike 2R/1R; pessimistic intrabar uses shortBarOutcome.
  */
+/**
+ * Long at next open after red-body spike. TP = spike high. SL distance = 2×(TP−entry) below entry (0.5R vs 1R if R = stop width).
+ * Skipped when next open is not below spike high. Pessimistic intrabar: SL before TP.
+ */
+function simulateLongRedSpikeTpHighTrade(candles, spikeIndex, tradeOpts = {}) {
+  const maxSlPct = tradeOpts.maxSlPct
+  const i = spikeIndex
+  if (i + 1 >= candles.length) return null
+  const sp = candles[i]
+
+  const entry = candles[i + 1].open
+  if (!Number.isFinite(entry)) return null
+
+  const tpPrice = sp.high
+  if (!Number.isFinite(tpPrice) || !(tpPrice > entry)) return null
+
+  const reward = tpPrice - entry
+  let slPrice = entry - 2 * reward
+  if (!Number.isFinite(slPrice) || !(slPrice < entry)) return null
+  slPrice = capStopLong(entry, slPrice, maxSlPct)
+  if (!Number.isFinite(slPrice) || !(slPrice < entry)) return null
+
+  const R = entry - slPrice
+  if (!(R > 0)) return null
+
+  for (let j = i + 1; j < candles.length; j++) {
+    const { low, high, openTime } = candles[j]
+    if (!Number.isFinite(low) || !Number.isFinite(high)) continue
+    const o = longBarOutcome(low, high, slPrice, tpPrice)
+    if (o === 'sl') {
+      return {
+        side: 'long',
+        spikeOpenTime: sp.openTime,
+        entryOpenTime: candles[i + 1].openTime,
+        entryPrice: entry,
+        exitPrice: slPrice,
+        entry,
+        R,
+        slPrice,
+        tpPrice,
+        outcome: 'sl',
+        rMultiple: -1,
+        exitOpenTime: openTime,
+        exitBarIndex: j,
+        ...tradeBarMeta(i, j),
+        ...spikeSnapshot(sp),
+      }
+    }
+    if (o === 'tp') {
+      const rMult = (tpPrice - entry) / R
+      return {
+        side: 'long',
+        spikeOpenTime: sp.openTime,
+        entryOpenTime: candles[i + 1].openTime,
+        entryPrice: entry,
+        exitPrice: tpPrice,
+        entry,
+        R,
+        slPrice,
+        tpPrice,
+        outcome: 'tp',
+        rMultiple: rMult,
+        exitOpenTime: openTime,
+        exitBarIndex: j,
+        ...tradeBarMeta(i, j),
+        ...spikeSnapshot(sp),
+      }
+    }
+  }
+
+  const last = candles[candles.length - 1]
+  const close = last.close
+  const rMultiple = Number.isFinite(close) ? (close - entry) / R : 0
+  const exitIdx = candles.length - 1
+  return {
+    side: 'long',
+    spikeOpenTime: sp.openTime,
+    entryOpenTime: candles[i + 1].openTime,
+    entryPrice: entry,
+    exitPrice: Number.isFinite(close) ? close : null,
+    entry,
+    R,
+    slPrice,
+    tpPrice,
+    outcome: 'eod',
+    rMultiple,
+    exitOpenTime: last.openTime,
+    exitBarIndex: exitIdx,
+    ...tradeBarMeta(i, exitIdx),
+    ...spikeSnapshot(sp),
+  }
+}
+
 function simulateShortRedSpikeTrade(candles, spikeIndex, tradeOpts = {}) {
   const maxSlPct = tradeOpts.maxSlPct
   const slAtSpikeOpen = Boolean(tradeOpts.slAtSpikeOpen)
@@ -688,7 +782,7 @@ function spikeIndices(candles, thresholdPct, strategy = 'long') {
   const out = []
   for (let i = 0; i < candles.length - 1; i++) {
     const c = candles[i]
-    if (strategy === 'shortRedSpike') {
+    if (strategy === 'shortRedSpike' || strategy === 'longRedSpikeTpHigh') {
       if (isRedBodySpike(c, thresholdPct)) out.push(i)
     } else if (isGreenBodySpike(c, thresholdPct)) {
       out.push(i)
@@ -748,21 +842,26 @@ function buildEquityCurveSummedPricePct(tradesChronAsc) {
  * @param {string} emaCtx.symbol
  * @param {ReturnType<typeof mapKlineRow>[]} emaCtx.candles5m
  * @param {(number | null)[]} emaCtx.emaArr
+ * @param {object} replayOpts
+ * @param {boolean} replayOpts.allowOverlap — when true in long mode, allow same-symbol overlapping trades.
  */
-function runSymbolTrades(candles, thresholdPct, strategy = 'long', tradeOpts = {}, emaCtx = null) {
+function runSymbolTrades(candles, thresholdPct, strategy = 'long', tradeOpts = {}, emaCtx = null, replayOpts = {}) {
   let sim = simulateLongTrade
   if (strategy === 'shortSpikeLow') sim = simulateShortSpikeLowTrade
   else if (strategy === 'shortRedSpike') sim = simulateShortRedSpikeTrade
+  else if (strategy === 'longRedSpikeTpHigh') sim = simulateLongRedSpikeTpHighTrade
   const spikes = spikeIndices(candles, thresholdPct, strategy)
+  const allowOverlap =
+    (strategy === 'long' || strategy === 'longRedSpikeTpHigh') && replayOpts?.allowOverlap === true
   let lastExitBar = -1
   const trades = []
   const emaSkipped = []
 
   for (const si of spikes) {
     // Entry is at open of bar si+1; allow spike si when that entry bar is after the prior exit bar.
-    if (si + 1 <= lastExitBar) continue
+    if (!allowOverlap && si + 1 <= lastExitBar) continue
 
-    if (emaCtx && strategy === 'long') {
+    if (emaCtx && (strategy === 'long' || strategy === 'longRedSpikeTpHigh')) {
       const entryOpen = candles[si + 1].open
       const spikeOpenTime = candles[si].openTime
       const entryOpenTime = candles[si + 1].openTime
@@ -782,7 +881,7 @@ function runSymbolTrades(candles, thresholdPct, strategy = 'long', tradeOpts = {
     const tr = sim(candles, si, tradeOpts)
     if (!tr) continue
     trades.push(tr)
-    lastExitBar = tr.exitBarIndex
+    if (!allowOverlap) lastExitBar = tr.exitBarIndex
   }
   return { trades, emaSkipped }
 }
@@ -872,11 +971,12 @@ async function mapPool(items, concurrency, mapper) {
  * @param {string} opts.interval
  * @param {number} opts.candleCount
  * @param {number} opts.thresholdPct
- * @param {'long'|'shortSpikeLow'|'shortRedSpike'|'regimeFlipEma50'} [opts.strategy]
+ * @param {'long'|'longRedSpikeTpHigh'|'shortSpikeLow'|'shortRedSpike'|'regimeFlipEma50'} [opts.strategy]
  * @param {number | null} [opts.maxSlPct] cap adverse SL distance as % of entry (omit or ≤0 = no cap)
  * @param {boolean} [opts.slAtSpikeOpen] place stop at spike open; R and TP targets unchanged
  * @param {boolean} [opts.includeChartCandles] attach OHLC for symbols with trades (for Lightweight Charts)
  * @param {boolean} [opts.emaLongFilter96_5m] long only: require entry open > EMA(96) on 5m at spike bar
+ * @param {boolean} [opts.allowOverlap] long only: allow same-symbol overlapping trades
  * @param {number} [opts.tpR] take-profit distance in R multiples vs 1R stop (default 2, clamped 0.1–100)
  * @param {string} [opts.fromDate] YYYY-MM-DD UTC (with toDate)
  * @param {string} [opts.toDate] YYYY-MM-DD UTC (with fromDate)
@@ -894,6 +994,7 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     slAtSpikeOpen: slAtSpikeOpenRaw,
     includeChartCandles: includeChartCandlesRaw,
     emaLongFilter96_5m: emaLongFilterRaw,
+    allowOverlap: allowOverlapRaw,
   } = opts
 
   let maxSlPct = null
@@ -904,6 +1005,7 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const slAtSpikeOpen = Boolean(slAtSpikeOpenRaw)
   const includeChartCandles = Boolean(includeChartCandlesRaw)
   const emaLongFilter96_5m = Boolean(emaLongFilterRaw)
+  const allowOverlap = Boolean(allowOverlapRaw)
   const tpR = normalizeTpR({ tpR: opts?.tpR })
   const tradeOpts = { maxSlPct, slAtSpikeOpen, tpR }
 
@@ -945,9 +1047,17 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     sNorm === 'regime'
   ) {
     strat = 'regimeFlipEma50'
+  } else if (
+    sNorm === 'longredspiketphigh' ||
+    sNorm === 'long_red_spike_tp_high' ||
+    sNorm === 'longredspikehigh' ||
+    sNorm === 'redspike_long_tp_high'
+  ) {
+    strat = 'longRedSpikeTpHigh'
   }
 
-  const emaFilterActive = emaLongFilter96_5m && strat === 'long'
+  const emaFilterActive =
+    emaLongFilter96_5m && (strat === 'long' || strat === 'longRedSpikeTpHigh')
 
   const utcRange = parseSpikeTpSlUtcRange(fromDateOpt, toDateOpt)
   const n = Math.max(50, Math.min(1500, Math.floor(candleCount)))
@@ -1031,7 +1141,9 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
 
       const useLegacyPerSymbolSim = strat !== 'regimeFlipEma50'
       const { trades, emaSkipped } = useLegacyPerSymbolSim
-        ? runSymbolTrades(candles, thresholdPct, strat, tradeOpts, emaCtx)
+        ? runSymbolTrades(candles, thresholdPct, strat, tradeOpts, emaCtx, {
+            allowOverlap: allowOverlap && (strat === 'long' || strat === 'longRedSpikeTpHigh'),
+          })
         : { trades: [], emaSkipped: [] }
 
       const rowOut = {
@@ -1231,15 +1343,25 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
             tpStatLabel: `TP (${tpRStr}R)`,
             slStatLabel: 'SL (-1R)',
           }
-        : {
-            strategy: 'long',
-            riskReward: `${tpRStr}R TP / 1R SL`,
-            entryRule: `Long next open after green-body spike; R = spike close − spike low; SL = entry − R; TP = entry + ${tpRStr}R`,
-            tpStatLabel: `TP (${tpRStr}R)`,
-            slStatLabel: 'SL (-1R)',
-          }
+        : strat === 'longRedSpikeTpHigh'
+          ? {
+              strategy: 'longRedSpikeTpHigh',
+              riskReward:
+                'TP at spike high / SL = 2×(TP−entry) below entry (+0.5R vs −1R when uncapped)',
+              entryRule:
+                'Long next open after red-body spike (same body threshold as other modes). TP = spike candle high. SL = entry − 2×(TP−entry). Skipped if next open ≥ spike high. tpR setting does not apply.',
+              tpStatLabel: 'TP (spike high)',
+              slStatLabel: 'SL (-1R; 1R = entry - SL)',
+            }
+          : {
+              strategy: 'long',
+              riskReward: `${tpRStr}R TP / 1R SL`,
+              entryRule: `Long next open after green-body spike; R = spike close − spike low; SL = entry − R; TP = entry + ${tpRStr}R`,
+              tpStatLabel: `TP (${tpRStr}R)`,
+              slStatLabel: 'SL (-1R)',
+            }
 
-  if (slAtSpikeOpen) {
+  if (slAtSpikeOpen && strat !== 'longRedSpikeTpHigh') {
     const extra =
       strat === 'regimeFlipEma50'
         ? ' SL at spike open is applied to both branches when valid (long requires spike open below entry; short requires spike open above entry). Short branch still keeps TP at spike low.'
@@ -1262,6 +1384,12 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
       entryRule: `${meta.entryRule} Long filter: next open must be above EMA(${EMA_LONG_FILTER_PERIOD}) on ${EMA_LONG_FILTER_INTERVAL} at spike bar (5m series aligned to main window).`,
     }
   }
+  if (allowOverlap && (strat === 'long' || strat === 'longRedSpikeTpHigh')) {
+    meta = {
+      ...meta,
+      entryRule: `${meta.entryRule} Overlap mode: do not block a new long on the same symbol while a prior one is still open.`,
+    }
+  }
 
   const chartTradeMarkers =
     includeChartCandles && allTrades.length > 0
@@ -1280,6 +1408,7 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     tpR,
     maxSlPct,
     slAtSpikeOpen,
+    allowOverlap: allowOverlap && (strat === 'long' || strat === 'longRedSpikeTpHigh'),
     emaLongFilter96_5m: emaLongFilter96_5m,
     emaLongFilterApplied: emaFilterActive,
     includeChartCandles,

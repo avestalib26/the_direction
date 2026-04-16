@@ -52,6 +52,9 @@ alter table public.agent_settings
   add column if not exists agent_enabled boolean not null default true;
 
 alter table public.agent_settings
+  add column if not exists max_open_positions integer not null default 30;
+
+alter table public.agent_settings
   add column if not exists scan_interval text not null default '5m';
 
 do $$
@@ -62,6 +65,17 @@ begin
     alter table public.agent_settings
       add constraint agent_settings_scan_spike_metric_chk
       check (scan_spike_metric in ('body', 'wick'));
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'agent_settings_max_open_positions_chk'
+  ) then
+    alter table public.agent_settings
+      add constraint agent_settings_max_open_positions_chk
+      check (max_open_positions between 1 and 300);
   end if;
 end $$;
 

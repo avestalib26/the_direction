@@ -11,6 +11,7 @@ create table if not exists public.agent_settings (
   margin_mode text not null check (margin_mode in ('cross', 'isolated')),
   max_tp_pct numeric not null,
   max_sl_pct numeric not null,
+  max_open_positions integer not null default 30,
   updated_at timestamptz not null default now(),
   -- 5m pre-close spike scan (Agent 1 scheduler reads these from the agent1 row)
   scan_seconds_before_close integer not null default 20,
@@ -24,6 +25,7 @@ create table if not exists public.agent_settings (
   ema_gate_enabled boolean not null default true,
   constraint agent_settings_scan_spike_metric_chk check (scan_spike_metric in ('body', 'wick')),
   constraint agent_settings_scan_direction_chk check (scan_direction in ('up', 'down', 'both')),
+  constraint agent_settings_max_open_positions_chk check (max_open_positions between 1 and 300),
   constraint agent_settings_scan_interval_chk check (
     scan_interval in ('1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d')
   )
