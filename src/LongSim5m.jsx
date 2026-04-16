@@ -357,6 +357,7 @@ function SimCurveChart({ lineData, emaData = null, lineColor = COL_LINE }) {
 export function LongSim5m() {
   const [payload, setPayload] = useState(null)
   const [error, setError] = useState('')
+  const [simToggleBusy, setSimToggleBusy] = useState(false)
   /** Bumps once per second so "Xs ago" stays accurate without polling every second. */
   const [, bumpAgeDisplay] = useState(0)
   /** @type {[LongSimChartMode, (m: LongSimChartMode) => void]} */
@@ -374,6 +375,28 @@ export function LongSim5m() {
     }
   }, [])
 
+  const setSimulationPaused = useCallback(
+    async (paused) => {
+      if (payload?.shadowSchedulerActive === false) return
+      setSimToggleBusy(true)
+      try {
+        const res = await fetch('/api/agents/agent1/shadow-simulation', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paused }),
+        })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+        await load()
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to update simulation')
+      } finally {
+        setSimToggleBusy(false)
+      }
+    },
+    [load, payload?.shadowSchedulerActive],
+  )
+
   useEffect(() => {
     load()
     const t = setInterval(load, LIVE_POLL_MS)
@@ -386,6 +409,8 @@ export function LongSim5m() {
   }, [])
 
   const sched = payload?.scheduler
+  const shadowSchedulerActive = payload?.shadowSchedulerActive !== false
+  const simulationPaused = payload?.simulationPaused === true
   const curve = payload?.curve
   const liveCurve = payload?.liveCurve
   const trades = payload?.trades
@@ -458,6 +483,16 @@ export function LongSim5m() {
           <div className="risk-chip">
             Next: <strong>{fmtIso(sched.nextFireAt)}</strong>
           </div>
+          {simulationPaused && shadowSchedulerActive ? (
+            <div className="risk-chip" style={{ color: '#fbbf24' }} title="Full replay and mark polls are paused; last curve is frozen.">
+              Simulation paused
+            </div>
+          ) : null}
+          {!shadowSchedulerActive ? (
+            <div className="risk-chip muted" title="Enable AGENT1_SHADOW_SCHEDULER on the API (not false) and restart.">
+              Scheduler off in config
+            </div>
+          ) : null}
           {sched.lastError ? (
             <div className="risk-chip" style={{ color: '#f87171' }}>
               {sched.lastError}
@@ -468,6 +503,26 @@ export function LongSim5m() {
 
       <div className="longsim5m-toolbar">
         <div className="longsim5m-meta">
+          {shadowSchedulerActive ? (
+            <>
+              <button
+                type="button"
+                className={`btn-refresh longsim5m-sim-toggle ${simulationPaused ? 'longsim5m-sim-toggle--paused' : ''}`}
+                disabled={simToggleBusy}
+                onClick={() => void setSimulationPaused(!simulationPaused)}
+                title={
+                  simulationPaused
+                    ? 'Resume full market replay and mark-to-market polls'
+                    : 'Stop simulation: no new Binance kline replay or mark updates until resumed'
+                }
+              >
+                {simToggleBusy ? '…' : simulationPaused ? 'Resume simulation' : 'Stop simulation'}
+              </button>
+              <span className="longsim5m-meta-sep" aria-hidden>
+                ·
+              </span>
+            </>
+          ) : null}
           <span className="longsim5m-live" title="UI polls every few seconds; curve changes when the server finishes a sim step (each closed 5m bar).">
             <span className="longsim5m-live-dot" aria-hidden />
             Live

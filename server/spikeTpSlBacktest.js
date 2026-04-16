@@ -5,6 +5,9 @@
  * Long (longRedSpikeTpHigh): next open long after red-body spike; TP = spike high; SL = entry − 2×(TP−entry) → 0.5R reward vs 1R risk.
  * Short (shortRedSpike): next open short after red-body spike, R = spike high − spike close, SL = entry + R, TP = entry − 2R.
  * Short (shortSpikeLow): next open short, same R as long on green spike, SL = entry + 2R, TP = spike low (cover when low tags).
+ * Short (shortGreenSpike2R): next open short on green spike, R = spike close − spike low, SL = entry + R, TP = entry − 2R.
+ * Short (shortGreenRetestLow): wait for touch of spike low after green spike; short at touch price, SL = spike high, TP = 1R.
+ * Long (longGreenRetestLow): wait for touch of spike low after green spike; long at touch price, SL = 1R below entry (R = spike close − spike low), TP = tpR×R or TP = spike high when longRetestTpAtSpikeHigh.
  *
  * Optional: maxSlPct caps adverse stop distance as % of entry (tighter stop if model SL is wider).
  * Optional: slAtSpikeOpen — R and TP still from spike body/low rules; stop price is spike open (when valid vs entry).
@@ -333,13 +336,17 @@ function spikeSnapshot(sp) {
   }
 }
 
-/** Inclusive candle count from entry bar (spikeIndex+1) through exit bar. 1 = exit on entry candle. */
-function tradeBarMeta(spikeIndex, exitBarIndex) {
-  const i = spikeIndex
+/**
+ * Per-trade bar indexing. Default entry bar is spikeIndex+1 (next-open entries).
+ * Retest strategies pass `entryBarIndex` explicitly (touch bar may be far after the spike).
+ * barsInTrade = inclusive bars from entry through exit (1 = SL/TP on entry candle).
+ */
+function tradeBarMeta(spikeIndex, exitBarIndex, entryBarIndex = null) {
+  const eb = entryBarIndex != null ? entryBarIndex : spikeIndex + 1
   return {
-    spikeBarIndex: i,
-    entryBarIndex: i + 1,
-    barsInTrade: exitBarIndex - i,
+    spikeBarIndex: spikeIndex,
+    entryBarIndex: eb,
+    barsInTrade: exitBarIndex - eb + 1,
   }
 }
 
@@ -674,6 +681,373 @@ function simulateShortRedSpikeTrade(candles, spikeIndex, tradeOpts = {}) {
 }
 
 /**
+ * Short at next open after green-body spike. R = spike close − spike low. SL = entry + R, TP = entry − 2R (fixed).
+ * Stop-at-spike-open may override SL when valid. Pessimistic intrabar: SL before TP.
+ */
+function simulateShortGreenSpike2RTrade(candles, spikeIndex, tradeOpts = {}) {
+  const maxSlPct = tradeOpts.maxSlPct
+  const slAtSpikeOpen = Boolean(tradeOpts.slAtSpikeOpen)
+  const i = spikeIndex
+  if (i + 1 >= candles.length) return null
+  const sp = candles[i]
+  const R = sp.close - sp.low
+  if (!(R > 0) || !Number.isFinite(R)) return null
+
+  const entry = candles[i + 1].open
+  if (!Number.isFinite(entry)) return null
+
+  let slPrice = slAtSpikeOpen ? sp.open : entry + R
+  if (!Number.isFinite(slPrice) || !(slPrice > entry)) return null
+  slPrice = capStopShort(entry, slPrice, maxSlPct)
+  const riskWidth = slPrice - entry
+  if (!(riskWidth > 0) || !Number.isFinite(slPrice) || !(slPrice > entry)) return null
+
+  const tpPrice = entry - 2 * R
+
+  for (let j = i + 1; j < candles.length; j++) {
+    const { low, high, openTime } = candles[j]
+    if (!Number.isFinite(low) || !Number.isFinite(high)) continue
+    const o = shortBarOutcome(low, high, slPrice, tpPrice)
+    if (o === 'sl') {
+      return {
+        side: 'short',
+        spikeOpenTime: sp.openTime,
+        entryOpenTime: candles[i + 1].openTime,
+        entryPrice: entry,
+        exitPrice: slPrice,
+        entry,
+        R,
+        riskWidth,
+        slPrice,
+        tpPrice,
+        outcome: 'sl',
+        rMultiple: -1,
+        exitOpenTime: openTime,
+        exitBarIndex: j,
+        ...tradeBarMeta(i, j),
+        ...spikeSnapshot(sp),
+      }
+    }
+    if (o === 'tp') {
+      const rMultiple = (entry - tpPrice) / riskWidth
+      return {
+        side: 'short',
+        spikeOpenTime: sp.openTime,
+        entryOpenTime: candles[i + 1].openTime,
+        entryPrice: entry,
+        exitPrice: tpPrice,
+        entry,
+        R,
+        riskWidth,
+        slPrice,
+        tpPrice,
+        outcome: 'tp',
+        rMultiple,
+        exitOpenTime: openTime,
+        exitBarIndex: j,
+        ...tradeBarMeta(i, j),
+        ...spikeSnapshot(sp),
+      }
+    }
+  }
+
+  const last = candles[candles.length - 1]
+  const close = last.close
+  const rMultiple = Number.isFinite(close) ? (entry - close) / riskWidth : 0
+  const exitIdx = candles.length - 1
+  return {
+    side: 'short',
+    spikeOpenTime: sp.openTime,
+    entryOpenTime: candles[i + 1].openTime,
+    entryPrice: entry,
+    exitPrice: Number.isFinite(close) ? close : null,
+    entry,
+    R,
+    riskWidth,
+    slPrice,
+    tpPrice,
+    outcome: 'eod',
+    rMultiple,
+    exitOpenTime: last.openTime,
+    exitBarIndex: exitIdx,
+    ...tradeBarMeta(i, exitIdx),
+    ...spikeSnapshot(sp),
+  }
+}
+
+/**
+ * Setup logic for short-on-retest:
+ * - Detect green spike candle (body >= threshold).
+ * - Wait for future bar to touch that spike low; short at spike low touch price.
+ * - If a newer green spike appears before touch, replace pending setup with latest spike.
+ * - Fixed exits: SL at spike high, TP at 1R below entry.
+ */
+function runShortGreenRetestLowTrades(candles, thresholdPct, tradeOpts = {}) {
+  const maxSlPct = tradeOpts.maxSlPct
+  const trades = []
+  let pending = null
+
+  for (let i = 0; i < candles.length; i++) {
+    const bar = candles[i]
+    if (!bar) continue
+
+    if (
+      pending &&
+      i > pending.spikeIndex &&
+      Number.isFinite(bar.low) &&
+      Number.isFinite(bar.high) &&
+      bar.low <= pending.spikeLow &&
+      bar.high >= pending.spikeLow
+    ) {
+      const entry = pending.spikeLow
+      const entryOpenTime = bar.openTime
+      let slPrice = pending.spikeHigh
+      if (Number.isFinite(entry) && Number.isFinite(slPrice) && slPrice > entry) {
+        slPrice = capStopShort(entry, slPrice, maxSlPct)
+        const riskWidth = slPrice - entry
+        if (Number.isFinite(riskWidth) && riskWidth > 0) {
+          const tpPrice = entry - riskWidth
+          let closed = false
+          for (let j = i; j < candles.length; j++) {
+            const bj = candles[j]
+            if (!Number.isFinite(bj?.low) || !Number.isFinite(bj?.high)) continue
+            const o = shortBarOutcome(bj.low, bj.high, slPrice, tpPrice)
+            if (o === 'sl') {
+              trades.push({
+                side: 'short',
+                spikeOpenTime: pending.spikeOpenTime,
+                entryOpenTime,
+                entryPrice: entry,
+                exitPrice: slPrice,
+                entry,
+                R: riskWidth,
+                riskWidth,
+                slPrice,
+                tpPrice,
+                outcome: 'sl',
+                rMultiple: -1,
+                exitOpenTime: bj.openTime,
+                exitBarIndex: j,
+                ...tradeBarMeta(pending.spikeIndex, j, i),
+                ...spikeSnapshot(pending.spikeBar),
+              })
+              i = j
+              closed = true
+              break
+            }
+            if (o === 'tp') {
+              trades.push({
+                side: 'short',
+                spikeOpenTime: pending.spikeOpenTime,
+                entryOpenTime,
+                entryPrice: entry,
+                exitPrice: tpPrice,
+                entry,
+                R: riskWidth,
+                riskWidth,
+                slPrice,
+                tpPrice,
+                outcome: 'tp',
+                rMultiple: 1,
+                exitOpenTime: bj.openTime,
+                exitBarIndex: j,
+                ...tradeBarMeta(pending.spikeIndex, j, i),
+                ...spikeSnapshot(pending.spikeBar),
+              })
+              i = j
+              closed = true
+              break
+            }
+          }
+          if (!closed) {
+            const last = candles[candles.length - 1]
+            const close = last?.close
+            const rMultiple = Number.isFinite(close) ? (entry - close) / riskWidth : 0
+            const exitIdx = candles.length - 1
+            trades.push({
+              side: 'short',
+              spikeOpenTime: pending.spikeOpenTime,
+              entryOpenTime,
+              entryPrice: entry,
+              exitPrice: Number.isFinite(close) ? close : null,
+              entry,
+              R: riskWidth,
+              riskWidth,
+              slPrice,
+              tpPrice,
+              outcome: 'eod',
+              rMultiple,
+              exitOpenTime: last?.openTime,
+              exitBarIndex: exitIdx,
+              ...tradeBarMeta(pending.spikeIndex, exitIdx, i),
+              ...spikeSnapshot(pending.spikeBar),
+            })
+            break
+          }
+          pending = null
+          continue
+        }
+      }
+      pending = null
+    }
+
+    if (i < candles.length - 1 && isGreenBodySpike(bar, thresholdPct)) {
+      pending = {
+        spikeIndex: i,
+        spikeOpenTime: bar.openTime,
+        spikeLow: bar.low,
+        spikeHigh: bar.high,
+        spikeBar: bar,
+      }
+    }
+  }
+
+  return trades
+}
+
+/**
+ * Setup logic for long-on-retest:
+ * - Detect green spike candle (body >= threshold).
+ * - Wait for future bar to touch that spike low; long at spike low touch price.
+ * - If a newer green spike appears before touch, replace pending setup with latest spike.
+ * - Exits: SL is 1R below entry where R = spike close − spike low; TP = tpR×R above entry, or spike high if longRetestTpAtSpikeHigh.
+ */
+function runLongGreenRetestLowTrades(candles, thresholdPct, tradeOpts = {}) {
+  const maxSlPct = tradeOpts.maxSlPct
+  const tpR = normalizeTpR(tradeOpts)
+  const tpAtSpikeHigh = Boolean(tradeOpts.longRetestTpAtSpikeHigh)
+  const trades = []
+  let pending = null
+
+  for (let i = 0; i < candles.length; i++) {
+    const bar = candles[i]
+    if (!bar) continue
+
+    if (
+      pending &&
+      i > pending.spikeIndex &&
+      Number.isFinite(bar.low) &&
+      Number.isFinite(bar.high) &&
+      bar.low <= pending.spikeLow &&
+      bar.high >= pending.spikeLow
+    ) {
+      const entry = pending.spikeLow
+      const entryOpenTime = bar.openTime
+      let slPrice = entry - pending.baseR
+      if (Number.isFinite(entry) && Number.isFinite(slPrice) && slPrice < entry) {
+        slPrice = capStopLong(entry, slPrice, maxSlPct)
+        const riskWidth = entry - slPrice
+        if (Number.isFinite(riskWidth) && riskWidth > 0) {
+          let tpPrice
+          if (tpAtSpikeHigh) {
+            const sh = pending.spikeBar?.high
+            if (!Number.isFinite(sh) || !(sh > entry)) {
+              pending = null
+              continue
+            }
+            tpPrice = sh
+          } else {
+            tpPrice = entry + tpR * riskWidth
+          }
+          let closed = false
+          for (let j = i; j < candles.length; j++) {
+            const bj = candles[j]
+            if (!Number.isFinite(bj?.low) || !Number.isFinite(bj?.high)) continue
+            const o = longBarOutcome(bj.low, bj.high, slPrice, tpPrice)
+            if (o === 'sl') {
+              trades.push({
+                side: 'long',
+                spikeOpenTime: pending.spikeOpenTime,
+                entryOpenTime,
+                entryPrice: entry,
+                exitPrice: slPrice,
+                entry,
+                R: riskWidth,
+                slPrice,
+                tpPrice,
+                outcome: 'sl',
+                rMultiple: -1,
+                exitOpenTime: bj.openTime,
+                exitBarIndex: j,
+                ...tradeBarMeta(pending.spikeIndex, j, i),
+                ...spikeSnapshot(pending.spikeBar),
+              })
+              i = j
+              closed = true
+              break
+            }
+            if (o === 'tp') {
+              const rMultTp = tpAtSpikeHigh ? (tpPrice - entry) / riskWidth : tpR
+              trades.push({
+                side: 'long',
+                spikeOpenTime: pending.spikeOpenTime,
+                entryOpenTime,
+                entryPrice: entry,
+                exitPrice: tpPrice,
+                entry,
+                R: riskWidth,
+                slPrice,
+                tpPrice,
+                outcome: 'tp',
+                rMultiple: rMultTp,
+                exitOpenTime: bj.openTime,
+                exitBarIndex: j,
+                ...tradeBarMeta(pending.spikeIndex, j, i),
+                ...spikeSnapshot(pending.spikeBar),
+              })
+              i = j
+              closed = true
+              break
+            }
+          }
+          if (!closed) {
+            const last = candles[candles.length - 1]
+            const close = last?.close
+            const rMultiple = Number.isFinite(close) ? (close - entry) / riskWidth : 0
+            const exitIdx = candles.length - 1
+            trades.push({
+              side: 'long',
+              spikeOpenTime: pending.spikeOpenTime,
+              entryOpenTime,
+              entryPrice: entry,
+              exitPrice: Number.isFinite(close) ? close : null,
+              entry,
+              R: riskWidth,
+              slPrice,
+              tpPrice,
+              outcome: 'eod',
+              rMultiple,
+              exitOpenTime: last?.openTime,
+              exitBarIndex: exitIdx,
+              ...tradeBarMeta(pending.spikeIndex, exitIdx, i),
+              ...spikeSnapshot(pending.spikeBar),
+            })
+            break
+          }
+          pending = null
+          continue
+        }
+      }
+      pending = null
+    }
+
+    if (i < candles.length - 1 && isGreenBodySpike(bar, thresholdPct)) {
+      const baseR = bar.close - bar.low
+      if (!(Number.isFinite(baseR) && baseR > 0)) continue
+      pending = {
+        spikeIndex: i,
+        spikeOpenTime: bar.openTime,
+        spikeLow: bar.low,
+        spikeBar: bar,
+        baseR,
+      }
+    }
+  }
+
+  return trades
+}
+
+/**
  * Short at next open after green spike. R = spike close − spike low. Stop entry + tpR×R. TP = spike low.
  * Risk unit = 2R (full stop width): SL → −1R, TP → +(entry − spike low) / (2R). Skips if entry ≤ spike low.
  */
@@ -846,9 +1220,16 @@ function buildEquityCurveSummedPricePct(tradesChronAsc) {
  * @param {boolean} replayOpts.allowOverlap — when true in long mode, allow same-symbol overlapping trades.
  */
 function runSymbolTrades(candles, thresholdPct, strategy = 'long', tradeOpts = {}, emaCtx = null, replayOpts = {}) {
+  if (strategy === 'shortGreenRetestLow') {
+    return { trades: runShortGreenRetestLowTrades(candles, thresholdPct, tradeOpts), emaSkipped: [] }
+  }
+  if (strategy === 'longGreenRetestLow') {
+    return { trades: runLongGreenRetestLowTrades(candles, thresholdPct, tradeOpts), emaSkipped: [] }
+  }
   let sim = simulateLongTrade
   if (strategy === 'shortSpikeLow') sim = simulateShortSpikeLowTrade
   else if (strategy === 'shortRedSpike') sim = simulateShortRedSpikeTrade
+  else if (strategy === 'shortGreenSpike2R') sim = simulateShortGreenSpike2RTrade
   else if (strategy === 'longRedSpikeTpHigh') sim = simulateLongRedSpikeTpHighTrade
   const spikes = spikeIndices(candles, thresholdPct, strategy)
   const allowOverlap =
@@ -971,13 +1352,14 @@ async function mapPool(items, concurrency, mapper) {
  * @param {string} opts.interval
  * @param {number} opts.candleCount
  * @param {number} opts.thresholdPct
- * @param {'long'|'longRedSpikeTpHigh'|'shortSpikeLow'|'shortRedSpike'|'regimeFlipEma50'} [opts.strategy]
+ * @param {'long'|'longRedSpikeTpHigh'|'longGreenRetestLow'|'shortSpikeLow'|'shortRedSpike'|'shortGreenSpike2R'|'shortGreenRetestLow'|'regimeFlipEma50'} [opts.strategy]
  * @param {number | null} [opts.maxSlPct] cap adverse SL distance as % of entry (omit or ≤0 = no cap)
  * @param {boolean} [opts.slAtSpikeOpen] place stop at spike open; R and TP targets unchanged
  * @param {boolean} [opts.includeChartCandles] attach OHLC for symbols with trades (for Lightweight Charts)
  * @param {boolean} [opts.emaLongFilter96_5m] long only: require entry open > EMA(96) on 5m at spike bar
  * @param {boolean} [opts.allowOverlap] long only: allow same-symbol overlapping trades
  * @param {number} [opts.tpR] take-profit distance in R multiples vs 1R stop (default 2, clamped 0.1–100)
+ * @param {boolean} [opts.longRetestTpAtSpikeHigh] longGreenRetestLow only: TP = spike candle high; tpR ignored
  * @param {string} [opts.fromDate] YYYY-MM-DD UTC (with toDate)
  * @param {string} [opts.toDate] YYYY-MM-DD UTC (with fromDate)
  */
@@ -995,6 +1377,7 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     includeChartCandles: includeChartCandlesRaw,
     emaLongFilter96_5m: emaLongFilterRaw,
     allowOverlap: allowOverlapRaw,
+    longRetestTpAtSpikeHigh: longRetestTpAtSpikeHighRaw,
   } = opts
 
   let maxSlPct = null
@@ -1007,7 +1390,8 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const emaLongFilter96_5m = Boolean(emaLongFilterRaw)
   const allowOverlap = Boolean(allowOverlapRaw)
   const tpR = normalizeTpR({ tpR: opts?.tpR })
-  const tradeOpts = { maxSlPct, slAtSpikeOpen, tpR }
+  const longRetestTpAtSpikeHigh = Boolean(longRetestTpAtSpikeHighRaw)
+  const tradeOpts = { maxSlPct, slAtSpikeOpen, tpR, longRetestTpAtSpikeHigh }
 
   const maxChartCandles = Math.min(
     1500,
@@ -1033,6 +1417,28 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     .toLowerCase()
   let strat = 'long'
   if (sNorm === 'shortspikelow' || sNorm === 'short_spike_low') strat = 'shortSpikeLow'
+  else if (
+    sNorm === 'shortgreenspike2r' ||
+    sNorm === 'short_green_spike_2r' ||
+    sNorm === 'short_green_spike' ||
+    sNorm === 'short_long_spike'
+  ) {
+    strat = 'shortGreenSpike2R'
+  } else if (
+    sNorm === 'shortgreenretestlow' ||
+    sNorm === 'short_green_retest_low' ||
+    sNorm === 'shortretestspikelow' ||
+    sNorm === 'short_spike_retest_low'
+  ) {
+    strat = 'shortGreenRetestLow'
+  } else if (
+    sNorm === 'longgreenretestlow' ||
+    sNorm === 'long_green_retest_low' ||
+    sNorm === 'longretestspikelow' ||
+    sNorm === 'long_spike_retest_low'
+  ) {
+    strat = 'longGreenRetestLow'
+  }
   else if (
     sNorm === 'shortredspike' ||
     sNorm === 'short_red_spike' ||
@@ -1343,6 +1749,42 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
             tpStatLabel: `TP (${tpRStr}R)`,
             slStatLabel: 'SL (-1R)',
           }
+        : strat === 'shortGreenSpike2R'
+          ? {
+              strategy: 'shortGreenSpike2R',
+              riskReward: '2R TP / 1R SL (short on green spike, fixed)',
+              entryRule:
+                'Short next open after green-body spike; R = spike close − spike low; SL = entry + R; TP = entry − 2R (fixed).',
+              tpStatLabel: 'TP (2R fixed)',
+              slStatLabel: 'SL (-1R)',
+            }
+        : strat === 'shortGreenRetestLow'
+          ? {
+              strategy: 'shortGreenRetestLow',
+              riskReward: 'Retest entry, 1R TP / 1R SL (short on green spike low touch)',
+              entryRule:
+                'After a green-body spike, wait until price touches that spike low; short at that touch price. If a newer green spike appears before touch, older setup is dropped. SL = spike high. TP = 1R below entry.',
+              tpStatLabel: 'TP (1R)',
+              slStatLabel: 'SL (-1R @ spike high)',
+            }
+        : strat === 'longGreenRetestLow'
+          ? longRetestTpAtSpikeHigh
+            ? {
+                strategy: 'longGreenRetestLow',
+                riskReward: 'TP at spike high / 1R SL (long on green spike low retest)',
+                entryRule:
+                  'After a green-body spike, wait until price touches that spike low; long at that touch price. If a newer green spike appears before touch, older setup is dropped. R = spike close − spike low; SL = entry − 1R; TP = spike candle high. tpR setting does not apply.',
+                tpStatLabel: 'TP (spike high)',
+                slStatLabel: 'SL (-1R)',
+              }
+            : {
+                strategy: 'longGreenRetestLow',
+                riskReward: `${tpRStr}R TP / 1R SL (long on green spike low retest)`,
+                entryRule:
+                  `After a green-body spike, wait until price touches that spike low; long at that touch price. If a newer green spike appears before touch, older setup is dropped. R = spike close − spike low; SL = entry − 1R; TP = entry + ${tpRStr}R.`,
+                tpStatLabel: `TP (${tpRStr}R)`,
+                slStatLabel: 'SL (-1R)',
+              }
         : strat === 'longRedSpikeTpHigh'
           ? {
               strategy: 'longRedSpikeTpHigh',
@@ -1369,6 +1811,12 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
         ? ' SL price = spike open (above entry); risk width = entry→SL; R for TP distance unchanged.'
         : strat === 'shortRedSpike'
           ? ` SL price = spike open (above entry); TP still entry − ${tpRStr}R from body R.`
+          : strat === 'shortGreenSpike2R'
+            ? ' SL price = spike open (above entry); TP remains entry − 2R from body R.'
+            : strat === 'shortGreenRetestLow'
+              ? ' Stop-at-spike-open is ignored in this mode (SL is fixed at spike high).'
+            : strat === 'longGreenRetestLow'
+              ? ' Stop-at-spike-open is ignored in this mode (entry waits for spike-low retest; SL stays entry − 1R).'
           : ` SL price = spike open (below entry); TP still entry + ${tpRStr}R from body R.`
     meta = { ...meta, entryRule: `${meta.entryRule}.${extra}` }
   }
@@ -1406,6 +1854,7 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   return {
     interval,
     tpR,
+    longRetestTpAtSpikeHigh: strat === 'longGreenRetestLow' ? longRetestTpAtSpikeHigh : false,
     maxSlPct,
     slAtSpikeOpen,
     allowOverlap: allowOverlap && (strat === 'long' || strat === 'longRedSpikeTpHigh'),

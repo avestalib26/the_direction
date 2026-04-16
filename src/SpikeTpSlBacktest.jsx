@@ -171,6 +171,8 @@ export function SpikeTpSlBacktest() {
   const [maxSlPct, setMaxSlPct] = useState('')
   /** R and +2R / TP levels unchanged; stop price anchored to spike candle open (when valid vs entry). */
   const [slAtSpikeOpen, setSlAtSpikeOpen] = useState(false)
+  /** longGreenRetestLow only: TP = spike candle high; Take-profit (R) field ignored. */
+  const [longRetestTpAtSpikeHigh, setLongRetestTpAtSpikeHigh] = useState(false)
   /** Adds OHLC candlesticks (per symbol with trades) — larger API payload. */
   const [includeOhlcCharts, setIncludeOhlcCharts] = useState(true)
   /** Long only: require next open > EMA(96) on 5m at spike bar (server aligns 5m to main window). */
@@ -189,9 +191,24 @@ export function SpikeTpSlBacktest() {
   const [tpR, setTpR] = useState('2')
 
   const isLongStrategyFamily = strategy === 'long' || strategy === 'longRedSpikeTpHigh'
+  const isFixedTpStrategy =
+    strategy === 'longRedSpikeTpHigh' ||
+    strategy === 'shortGreenSpike2R' ||
+    strategy === 'shortGreenRetestLow' ||
+    (strategy === 'longGreenRetestLow' && longRetestTpAtSpikeHigh)
 
   useEffect(() => {
-    if (strategy === 'longRedSpikeTpHigh') setSlAtSpikeOpen(false)
+    if (
+      strategy === 'longRedSpikeTpHigh' ||
+      strategy === 'shortGreenRetestLow' ||
+      strategy === 'longGreenRetestLow'
+    ) {
+      setSlAtSpikeOpen(false)
+    }
+  }, [strategy])
+
+  useEffect(() => {
+    if (strategy !== 'longGreenRetestLow') setLongRetestTpAtSpikeHigh(false)
   }, [strategy])
 
   const run = useCallback(async () => {
@@ -222,7 +239,13 @@ export function SpikeTpSlBacktest() {
         includeChartCandles: includeOhlcCharts,
         ...(emaLongFilter96_5m && isLongStrategyFamily ? { emaLongFilter96_5m: true } : {}),
         ...(allowOverlap && isLongStrategyFamily ? { allowOverlap: true } : {}),
+        ...(strategy === 'longGreenRetestLow' && longRetestTpAtSpikeHigh
+          ? { longRetestTpAtSpikeHigh: true }
+          : {}),
         ...(strategy !== 'longRedSpikeTpHigh' &&
+        strategy !== 'shortGreenSpike2R' &&
+        strategy !== 'shortGreenRetestLow' &&
+        !(strategy === 'longGreenRetestLow' && longRetestTpAtSpikeHigh) &&
         Number.isFinite(tpRVal) &&
         tpRVal > 0 &&
         tpRVal <= 100
@@ -249,7 +272,9 @@ export function SpikeTpSlBacktest() {
     emaLongFilter96_5m,
     allowOverlap,
     tpR,
+    longRetestTpAtSpikeHigh,
     isLongStrategyFamily,
+    isFixedTpStrategy,
   ])
 
   const tpRDisplay = useMemo(() => {
@@ -296,9 +321,7 @@ export function SpikeTpSlBacktest() {
       <p className="vol-screener-lead">
         Filters USDT-M perpetuals by <strong>24h quote volume</strong>, loads <strong>N</strong> candles
         per symbol, finds{' '}
-        <strong>
-          {strategy === 'shortRedSpike' || strategy === 'longRedSpikeTpHigh' ? 'red' : 'green'}
-        </strong>{' '}
+        <strong>{strategy === 'shortRedSpike' || strategy === 'longRedSpikeTpHigh' ? 'red' : 'green'}</strong>{' '}
         candles whose <strong>body</strong> is at least your threshold % vs open.{' '}
         {strategy === 'shortRedSpike' ? (
           <>
@@ -306,6 +329,36 @@ export function SpikeTpSlBacktest() {
             <strong>next open</strong>: stop <code className="inline-code">entry + R</code>, target{' '}
             <code className="inline-code">entry − 2R</code> (same 2:1 R-multiple idea as long, mirrored).{' '}
           </>
+        ) : strategy === 'shortGreenSpike2R' ? (
+          <>
+            <strong>R = spike close − spike low</strong>. <strong>Short</strong> at the <strong>next open</strong>:{' '}
+            stop <code className="inline-code">entry + R</code>, target{' '}
+            <code className="inline-code">entry − 2R</code> (fixed).{' '}
+          </>
+        ) : strategy === 'shortGreenRetestLow' ? (
+          <>
+            <strong>Green spike retest short</strong>: after a green spike, wait for price to <strong>touch that spike
+            low</strong>, then short at the touch. SL = <strong>spike high</strong>, TP = <strong>1R</strong> below
+            entry. If a newer green spike appears before touch, the older setup is dropped.{' '}
+          </>
+        ) : strategy === 'longGreenRetestLow' ? (
+          longRetestTpAtSpikeHigh ? (
+            <>
+              <strong>Green spike retest long (TP at spike high)</strong>: after a green spike, wait for price to{' '}
+              <strong>touch that spike low</strong>, then long at the touch. <strong>R = spike close − spike low</strong>
+              , stop is <code className="inline-code">entry − 1R</code>, take-profit at the{' '}
+              <strong>spike candle high</strong>. <strong>Take-profit (R multiples)</strong> is ignored. If a newer
+              green spike appears before touch, the older setup is dropped.{' '}
+            </>
+          ) : (
+            <>
+              <strong>Green spike retest long</strong>: after a green spike, wait for price to <strong>touch that spike
+              low</strong>, then long at the touch. <strong>R = spike close − spike low</strong>, stop is{' '}
+              <code className="inline-code">entry − 1R</code>, and target is{' '}
+              <code className="inline-code">entry + {tpRDisplay}R</code>. If a newer green spike appears before touch,
+              the older setup is dropped.{' '}
+            </>
+          )
         ) : strategy === 'longRedSpikeTpHigh' ? (
           <>
             <strong>Long</strong> at the <strong>next open</strong> after a <strong>red-body spike</strong>: take-profit
@@ -380,6 +433,43 @@ export function SpikeTpSlBacktest() {
           <strong>stop first</strong> (conservative).
         </p>
       )}
+
+      {(strategy === 'shortGreenSpike2R' || data?.strategy === 'shortGreenSpike2R') && (
+        <p className="hourly-spikes-hint spike-tpsl-short-plain">
+          <strong>Short on green spike (2R fixed):</strong> After a big <strong>green</strong> spike, you{' '}
+          <strong>sell (short) at the next candle&apos;s open</strong>. Risk unit{' '}
+          <strong>R = spike close − spike low</strong>. Stop is <strong>entry + R</strong>; target is{' '}
+          <strong>entry − 2R</strong>. Same-bar rule is conservative: if stop and target both touch in one bar,
+          <strong> stop first</strong>.
+        </p>
+      )}
+
+      {(strategy === 'shortGreenRetestLow' || data?.strategy === 'shortGreenRetestLow') && (
+        <p className="hourly-spikes-hint spike-tpsl-short-plain">
+          <strong>Short on spike-low retest (latest setup wins):</strong> A green spike creates a pending setup. You
+          wait for price to trade back to that spike&apos;s <strong>low</strong>; on touch, you short. Stop is fixed at
+          that spike&apos;s <strong>high</strong>, and TP is <strong>1R</strong> below entry. If another green spike
+          forms before touch, the old setup is discarded and replaced by the latest spike.
+        </p>
+      )}
+
+      {(strategy === 'longGreenRetestLow' || data?.strategy === 'longGreenRetestLow') &&
+        (longRetestTpAtSpikeHigh || data?.longRetestTpAtSpikeHigh ? (
+          <p className="hourly-spikes-hint spike-tpsl-short-plain">
+            <strong>Long on spike-low retest, TP at spike high (latest setup wins):</strong> Same wait-and-touch entry at
+            the spike <strong>low</strong>. Stop remains <strong>entry − 1R</strong> (body <strong>R</strong> from the
+            spike). Take-profit is the <strong>high of the spike candle</strong>, not the TP R field. If another green
+            spike forms before touch, the old setup is discarded and replaced by the latest spike.
+          </p>
+        ) : (
+          <p className="hourly-spikes-hint spike-tpsl-short-plain">
+            <strong>Long on spike-low retest (latest setup wins):</strong> A green spike creates a pending setup. You
+            wait for price to trade back to that spike&apos;s <strong>low</strong>; on touch, you go long.{' '}
+            <strong>R = spike close − spike low</strong>. Stop is <strong>entry − 1R</strong>; target is{' '}
+            <strong>entry + {tpRDisplay}R</strong>. If another green spike forms before touch, the old setup is
+            discarded and replaced by the latest spike.
+          </p>
+        ))}
 
       {(strategy === 'longRedSpikeTpHigh' || data?.strategy === 'longRedSpikeTpHigh') && (
         <p className="hourly-spikes-hint spike-tpsl-short-plain">
@@ -471,6 +561,15 @@ export function SpikeTpSlBacktest() {
             <option value="shortRedSpike">
               Short — TP −{tpRDisplay}R / SL +1R (red spike, mirrored)
             </option>
+            <option value="shortGreenSpike2R">
+              Short — TP −2R / SL +1R (green spike, fixed)
+            </option>
+            <option value="shortGreenRetestLow">
+              Short — wait touch spike low, SL spike high, TP 1R (latest spike wins)
+            </option>
+            <option value="longGreenRetestLow">
+              Long — wait touch spike low, SL −1R, TP +{tpRDisplay}R (latest spike wins)
+            </option>
             <option value="longRedSpikeTpHigh">
               Long — TP spike high / SL 2× reward (~0.5R, red spike)
             </option>
@@ -488,7 +587,7 @@ export function SpikeTpSlBacktest() {
             placeholder="default 2"
             value={tpR}
             onChange={(e) => setTpR(e.target.value)}
-            disabled={strategy === 'longRedSpikeTpHigh'}
+            disabled={isFixedTpStrategy}
           />
         </label>
         {strategy === 'regimeFlipEma50' && (
@@ -501,6 +600,36 @@ export function SpikeTpSlBacktest() {
         {strategy === 'longRedSpikeTpHigh' && (
           <p className="hourly-spikes-hint spike-tpsl-range-hint">
             <strong>TP R</strong> is ignored for this mode (TP is fixed at the spike high).
+          </p>
+        )}
+        {strategy === 'shortGreenSpike2R' && (
+          <p className="hourly-spikes-hint spike-tpsl-range-hint">
+            <strong>TP R</strong> is ignored for this mode (TP is fixed at <strong>2R</strong> below entry).
+          </p>
+        )}
+        {strategy === 'shortGreenRetestLow' && (
+          <p className="hourly-spikes-hint spike-tpsl-range-hint">
+            <strong>TP R</strong> is ignored for this mode (TP is fixed at <strong>1R</strong> below entry).
+          </p>
+        )}
+        {strategy === 'longGreenRetestLow' && (
+          <label className="vol-screener-field spike-tpsl-sl-open-toggle">
+            <input
+              type="checkbox"
+              checked={longRetestTpAtSpikeHigh}
+              onChange={(e) => setLongRetestTpAtSpikeHigh(e.target.checked)}
+            />
+            <span>
+              <strong>TP at spike candle high</strong> — for <strong>long retest</strong> only: take-profit is the{' '}
+              <strong>spike&apos;s high</strong> (not <strong>entry + TP R</strong>). The Take-profit (R multiples) field
+              is ignored when this is on.
+            </span>
+          </label>
+        )}
+        {strategy === 'longGreenRetestLow' && longRetestTpAtSpikeHigh && (
+          <p className="hourly-spikes-hint spike-tpsl-range-hint">
+            <strong>TP R</strong> is ignored — target is <strong>spike high</strong>. Touches are skipped when spike high
+            is not above entry.
           </p>
         )}
         <label className="vol-screener-field">
@@ -518,7 +647,11 @@ export function SpikeTpSlBacktest() {
           <input
             type="checkbox"
             checked={slAtSpikeOpen}
-            disabled={strategy === 'longRedSpikeTpHigh'}
+            disabled={
+              strategy === 'longRedSpikeTpHigh' ||
+              strategy === 'shortGreenRetestLow' ||
+              strategy === 'longGreenRetestLow'
+            }
             onChange={(e) => setSlAtSpikeOpen(e.target.checked)}
           />
           <span>
@@ -971,6 +1104,8 @@ export function SpikeTpSlBacktest() {
               {(data?.strategy ?? strategy) === 'shortRedSpike'
                 ? 'spike high − spike close'
                 : (data?.strategy ?? strategy) === 'longRedSpikeTpHigh'
+                  || (data?.strategy ?? strategy) === 'shortGreenRetestLow'
+                  || (data?.strategy ?? strategy) === 'longGreenRetestLow'
                   ? 'stop distance (entry − SL); table column is price risk to SL'
                   : 'spike close − spike low'}
               .{' '}

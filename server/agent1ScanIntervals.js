@@ -64,3 +64,31 @@ export function msUntilNextAgent1Scan(nowMs, secondsBeforeClose, intervalMs) {
   const nextFire = nextOpen + intervalMs - offsetMs
   return { delayMs: nextFire - nowMs, nextFireAt: nextFire }
 }
+
+/**
+ * Clamp delay (seconds) after each bar boundary before running a scan.
+ * Bar "closes" when the next bar opens (Binance openTime advances by intervalMs).
+ */
+export function clampScanSecondsAfterClose(rawSeconds, intervalMs) {
+  const intervalSec = Math.floor(intervalMs / 1000)
+  const cap = Math.max(0, Math.min(120, Math.max(0, intervalSec - 1)))
+  const s = Number.parseInt(String(rawSeconds ?? ''), 10)
+  if (!Number.isFinite(s)) return Math.min(5, cap)
+  return Math.min(Math.max(Math.floor(s), 0), cap)
+}
+
+/**
+ * Next fire: current bar open (UTC-aligned) + delay — i.e. `secondsAfterClose` after the previous bar finished.
+ * Ensures the scan runs only after the completed candle exists, not while the prior bar is still forming.
+ */
+export function msUntilNextScanAfterBarClose(nowMs, secondsAfterClose, intervalMs) {
+  const delayMs = clampScanSecondsAfterClose(secondsAfterClose, intervalMs) * 1000
+  const currentOpen = Math.floor(nowMs / intervalMs) * intervalMs
+  const fireThis = currentOpen + delayMs
+  if (nowMs <= fireThis) {
+    return { delayMs: Math.max(0, fireThis - nowMs), nextFireAt: fireThis }
+  }
+  const nextOpen = currentOpen + intervalMs
+  const fireNext = nextOpen + delayMs
+  return { delayMs: fireNext - nowMs, nextFireAt: fireNext }
+}

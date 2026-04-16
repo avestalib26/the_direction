@@ -30,6 +30,17 @@ export const agent1ShadowSchedulerState = {
   running: false,
 }
 
+/** Runtime pause (API / UI). When true, full replay ticks and mark polls are skipped (no Binance sim load). */
+let agent1ShadowSimulationPaused = false
+
+export function getAgent1ShadowSimulationPaused() {
+  return agent1ShadowSimulationPaused
+}
+
+export function setAgent1ShadowSimulationPaused(paused) {
+  agent1ShadowSimulationPaused = Boolean(paused)
+}
+
 let shadowPayload = {
   mode: 'market',
   symbol: null,
@@ -59,6 +70,7 @@ export function getAgent1ShadowSnapshot() {
   return {
     ...publicPayload,
     scheduler: { ...agent1ShadowSchedulerState },
+    simulationPaused: agent1ShadowSimulationPaused,
   }
 }
 
@@ -249,6 +261,7 @@ export function startAgent1ShadowScheduler(deps) {
 
   async function runMarkTick() {
     if (stopped) return
+    if (agent1ShadowSimulationPaused) return
     if (!latestOpenTradesRaw.length) return
     try {
       if (shouldMarkTick) {
@@ -316,6 +329,7 @@ export function startAgent1ShadowScheduler(deps) {
         const ok = await shouldRunTick()
         if (!ok) return
       }
+      if (agent1ShadowSimulationPaused) return
       await runAgent1ShadowTickOnce({ futuresBase, readSettings })
       latestFuturesBase = futuresBase
       latestClosedCurve = Array.isArray(shadowPayload.curve) ? shadowPayload.curve : []

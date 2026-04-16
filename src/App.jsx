@@ -9,6 +9,7 @@ import { Emotions } from './Emotions'
 import { EmotionsErrorBoundary } from './EmotionsErrorBoundary'
 import { MlDatasetPrep } from './MlDatasetPrep'
 import { Agent1 } from './Agent1'
+import { Agent2 } from './Agent2'
 import { LongSim5m } from './LongSim5m'
 import { TestPage } from './TestPage'
 import './App.css'
@@ -25,6 +26,7 @@ const APP_VIEWS = new Set([
   'spiketpsl',
   'spiketpslv3',
   'agent1',
+  'agent2',
   'longsim5m',
   'testpage',
 ])
@@ -66,6 +68,10 @@ function App() {
   /** null = loading; master on/off persisted in Supabase (header toggle). */
   const [agent1MasterEnabled, setAgent1MasterEnabled] = useState(null)
   const [agent1MasterSaving, setAgent1MasterSaving] = useState(false)
+  const [agent2MasterEnabled, setAgent2MasterEnabled] = useState(null)
+  const [agent2MasterSaving, setAgent2MasterSaving] = useState(false)
+  const [agent2TradingEnabled, setAgent2TradingEnabled] = useState(null)
+  const [agent2TradingSaving, setAgent2TradingSaving] = useState(false)
 
   const loadPositions = useCallback(async () => {
     setLoading(true)
@@ -127,7 +133,7 @@ function App() {
     if (isBacktestView) setBacktestMenuOpen(true)
   }, [view, isBacktestView])
 
-  const AGENTS_VIEWS = ['agent1', 'longsim5m']
+  const AGENTS_VIEWS = ['agent1', 'agent2', 'longsim5m']
   const isAgentsView = AGENTS_VIEWS.includes(view)
   const [agentsMenuOpen, setAgentsMenuOpen] = useState(isAgentsView)
 
@@ -153,6 +159,46 @@ function App() {
     return () => {
       cancelled = true
     }
+  }, [view])
+
+  useEffect(() => {
+    if (view !== 'agent2') return
+    let cancelled = false
+    setAgent2MasterEnabled(null)
+    ;(async () => {
+      try {
+        const res = await fetch('/api/agents/agent2/settings', { cache: 'no-store' })
+        const data = await res.json().catch(() => ({}))
+        if (cancelled) return
+        if (!res.ok) throw new Error(data.error || String(res.status))
+        setAgent2MasterEnabled(data.settings?.agentEnabled === true)
+      } catch {
+        if (!cancelled) setAgent2MasterEnabled(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [view])
+
+  useEffect(() => {
+    const onA2 = () => {
+      if (view !== 'agent2') return
+      void (async () => {
+        try {
+          const res = await fetch('/api/agents/agent2/settings', { cache: 'no-store' })
+          const data = await res.json().catch(() => ({}))
+          if (res.ok) {
+            setAgent2MasterEnabled(data.settings?.agentEnabled === true)
+            setAgent2TradingEnabled(data.settings?.tradingEnabled === true)
+          }
+        } catch {
+          /* */
+        }
+      })()
+    }
+    window.addEventListener('agent2-settings-changed', onA2)
+    return () => window.removeEventListener('agent2-settings-changed', onA2)
   }, [view])
 
   const requestAgent1MasterToggle = useCallback(async () => {
@@ -181,6 +227,58 @@ function App() {
       setAgent1MasterSaving(false)
     }
   }, [agent1MasterEnabled, agent1MasterSaving])
+
+  const requestAgent2MasterToggle = useCallback(async () => {
+    if (agent2MasterEnabled == null || agent2MasterSaving) return
+    const next = !agent2MasterEnabled
+    const ok = window.confirm(
+      next
+        ? 'Turn Agent 2 ON? Enable signal scan and/or trading on the Agent 2 page when ready.'
+        : 'Turn Agent 2 OFF? Pending entry orders will be canceled on the next execution tick.',
+    )
+    if (!ok) return
+    setAgent2MasterSaving(true)
+    try {
+      const res = await fetch('/api/agents/agent2/enabled', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+      setAgent2MasterEnabled(data.settings?.agentEnabled === true)
+      window.dispatchEvent(new Event('agent2-settings-changed'))
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'Failed to update Agent 2')
+    } finally {
+      setAgent2MasterSaving(false)
+    }
+  }, [agent2MasterEnabled, agent2MasterSaving])
+
+  const requestAgent2TradingToggle = useCallback(async () => {
+    if (agent2TradingEnabled == null || agent2TradingSaving) return
+    const next = !agent2TradingEnabled
+    if (next && agent2MasterEnabled !== true) {
+      window.alert('Turn Agent 2 master on first, then you can enable trading.')
+      return
+    }
+    setAgent2TradingSaving(true)
+    try {
+      const res = await fetch('/api/agents/agent2/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tradingEnabled: next }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+      setAgent2TradingEnabled(data.settings?.tradingEnabled === true)
+      window.dispatchEvent(new Event('agent2-settings-changed'))
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'Failed to update trading')
+    } finally {
+      setAgent2TradingSaving(false)
+    }
+  }, [agent2MasterEnabled, agent2TradingEnabled, agent2TradingSaving])
 
   const totalOpenPnl = useMemo(() => {
     if (!positions?.length) return null
@@ -257,7 +355,7 @@ function App() {
   return (
     <div className="layout">
       <header
-        className={`top-bar ${view === 'agent1' || view === 'longsim5m' ? 'top-bar--agent1' : ''}`}
+        className={`top-bar ${view === 'agent1' || view === 'agent2' || view === 'longsim5m' ? 'top-bar--agent1' : ''}`}
       >
         <button
           type="button"
@@ -291,6 +389,57 @@ function App() {
                 <span className="agent1-master-toggle__thumb" aria-hidden />
                 <span className="agent1-master-toggle__text">
                   {agent1MasterSaving ? '…' : agent1MasterEnabled ? 'On' : 'Off'}
+                </span>
+              </button>
+            </div>
+          </>
+        )}
+        {view === 'agent2' && (
+          <>
+            <h1 className="top-bar-title">Agent 2</h1>
+            <div className="top-bar-agent1-actions">
+              <button
+                type="button"
+                className={`agent1-master-toggle ${agent2MasterEnabled ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
+                onClick={() => requestAgent2MasterToggle()}
+                disabled={agent2MasterEnabled == null || agent2MasterSaving}
+                aria-label="Agent 2 master switch"
+                aria-pressed={agent2MasterEnabled === true}
+                title={
+                  agent2MasterEnabled
+                    ? 'Master ON — click to turn OFF'
+                    : 'Master OFF — click to turn ON'
+                }
+              >
+                <span className="agent1-master-toggle__track" aria-hidden />
+                <span className="agent1-master-toggle__thumb" aria-hidden />
+                <span className="agent1-master-toggle__text">
+                  {agent2MasterSaving ? '…' : agent2MasterEnabled ? 'Master on' : 'Master off'}
+                </span>
+              </button>
+              <button
+                type="button"
+                className={`agent1-master-toggle ${agent2TradingEnabled ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
+                onClick={() => requestAgent2TradingToggle()}
+                disabled={
+                  agent2TradingEnabled == null ||
+                  agent2TradingSaving ||
+                  (agent2TradingEnabled === false && agent2MasterEnabled !== true)
+                }
+                aria-label="Agent 2 trading switch"
+                aria-pressed={agent2TradingEnabled === true}
+                title={
+                  agent2TradingEnabled === false && agent2MasterEnabled !== true
+                    ? 'Enable master first to turn trading on'
+                    : agent2TradingEnabled
+                      ? 'Trading ON — click to turn OFF'
+                      : 'Trading OFF — click to turn ON'
+                }
+              >
+                <span className="agent1-master-toggle__track" aria-hidden />
+                <span className="agent1-master-toggle__thumb" aria-hidden />
+                <span className="agent1-master-toggle__text">
+                  {agent2TradingSaving ? '…' : agent2TradingEnabled ? 'Trading on' : 'Trading off'}
                 </span>
               </button>
             </div>
@@ -349,6 +498,18 @@ function App() {
                     }}
                   >
                     Agent 1
+                  </a>
+                </li>
+                <li>
+                  <a
+                    href="#"
+                    className={`menu-link menu-sublink ${view === 'agent2' ? 'menu-link--active' : ''}`}
+                    onClick={(e) => {
+                      e.preventDefault()
+                      go('agent2')
+                    }}
+                  >
+                    Agent 2
                   </a>
                 </li>
                 <li>
@@ -493,7 +654,7 @@ function App() {
       </nav>
 
       <main
-        className={`app ${view === 'breadth' || view === 'history' || view === 'emotions' || view === 'mldataset' || view === 'the100k' || view === 'gptbacktest' || view === 'spiketpsl' || view === 'spiketpslv3' || view === 'agent1' || view === 'longsim5m' || view === 'testpage' ? 'app--breadth' : ''} ${view === 'agent1' || view === 'longsim5m' ? 'app--agent1' : ''}`}
+        className={`app ${view === 'breadth' || view === 'history' || view === 'emotions' || view === 'mldataset' || view === 'the100k' || view === 'gptbacktest' || view === 'spiketpsl' || view === 'spiketpslv3' || view === 'agent1' || view === 'agent2' || view === 'longsim5m' || view === 'testpage' ? 'app--breadth' : ''} ${view === 'agent1' || view === 'agent2' || view === 'longsim5m' ? 'app--agent1' : ''}`}
         id="main"
       >
         {view === 'home' && (
@@ -679,6 +840,7 @@ function App() {
         {view === 'spiketpsl' && <SpikeTpSlBacktest />}
         {view === 'spiketpslv3' && <SpikeTpSlBacktestV3 />}
         {view === 'agent1' && <Agent1 />}
+        {view === 'agent2' && <Agent2 />}
         {view === 'longsim5m' && <LongSim5m />}
         {view === 'testpage' && <TestPage />}
       </main>

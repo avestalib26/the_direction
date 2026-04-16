@@ -33,7 +33,9 @@ import {
   startAgent1ScanScheduler,
 } from './agent1ScanScheduler.js'
 import {
+  getAgent1ShadowSimulationPaused,
   getAgent1ShadowSnapshot,
+  setAgent1ShadowSimulationPaused,
   setAgent1ShadowSnapshot,
   startAgent1ShadowScheduler,
 } from './agent1ShadowScheduler.js'
@@ -42,6 +44,17 @@ import {
   AGENT1_SCAN_INTERVALS,
   clampScanSecondsBeforeClose,
 } from './agent1ScanIntervals.js'
+import {
+  agent2ExecutionState,
+  agent2SchedulerState,
+  initAgent2Context,
+  listAgent2ExecutionLogRows,
+  readAgent2Settings,
+  runAgent2ExecutionTick,
+  runAgent2ScanOnce,
+  startAgent2ScanScheduler,
+  upsertAgent2Settings,
+} from './agent2Service.js'
 
 const USE_TESTNET = process.env.BINANCE_USE_TESTNET === 'true'
 const FUTURES_BASE =
@@ -77,6 +90,11 @@ const AGENT1_EXECUTION_LOCK_TTL_SEC = Math.min(
 const AGENT1_EXECUTION_WRITER_ID = String(
   process.env.AGENT1_EXECUTION_WRITER_ID ?? `${os.hostname?.() ?? 'host'}:${process.pid}`,
 ).replace(/[^a-zA-Z0-9._:-]/g, '_')
+const AGENT2_EXECUTION_ENABLED = process.env.AGENT2_EXECUTION_ENABLED !== 'false'
+const AGENT2_EXECUTION_POLL_MS = Math.min(
+  120_000,
+  Math.max(5_000, Number.parseInt(String(process.env.AGENT2_EXECUTION_POLL_MS ?? '15000'), 10) || 15_000),
+)
 const AGENT1_SHADOW_SINGLE_WRITER = process.env.AGENT1_SHADOW_SINGLE_WRITER !== 'false'
 const AGENT1_SHADOW_LOCK_NAME = String(process.env.AGENT1_SHADOW_LOCK_NAME ?? 'agent1_shadow_main').trim()
 const AGENT1_SHADOW_SNAPSHOT_KEY = 'main'
@@ -340,6 +358,51 @@ async function signedFuturesJsonPost(apiKey, apiSecret, path, params) {
       await acquireFuturesRestWeight(futuresSignedPathWeight(path))
       const retryRes = await fetch(retryUrl, {
         method: 'POST',
+        headers: { 'X-MBX-APIKEY': apiKey },
+      })
+      const retryText = await retryRes.text()
+      let retryData
+      try {
+        retryData = retryText ? JSON.parse(retryText) : {}
+      } catch {
+        throw new BinanceApiError(
+          `Invalid JSON from Binance (${retryRes.status}): ${retryText.slice(0, 240)}`,
+          retryRes.status,
+        )
+      }
+      if (retryRes.ok) return retryData
+      const retryMsg = retryData.msg || retryData.message || retryText
+      throw new BinanceApiError(`Binance ${retryRes.status}: ${retryMsg}`, retryRes.status)
+    }
+    throw new BinanceApiError(`Binance ${res.status}: ${msg}`, res.status)
+  }
+  return data
+}
+
+async function signedFuturesJsonDelete(apiKey, apiSecret, path, params) {
+  const url = await signedFuturesUrl(path, apiSecret, params)
+  await acquireFuturesRestWeight(futuresSignedPathWeight(path))
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: { 'X-MBX-APIKEY': apiKey },
+  })
+  const text = await res.text()
+  let data
+  try {
+    data = text ? JSON.parse(text) : {}
+  } catch {
+    throw new BinanceApiError(
+      `Invalid JSON from Binance DELETE (${res.status}): ${text.slice(0, 240)}`,
+      res.status,
+    )
+  }
+  if (!res.ok) {
+    const msg = data.msg || data.message || text
+    if (res.status === 400 && /timestamp|recvWindow/i.test(String(msg))) {
+      const retryUrl = await signedFuturesUrl(path, apiSecret, params, true)
+      await acquireFuturesRestWeight(futuresSignedPathWeight(path))
+      const retryRes = await fetch(retryUrl, {
+        method: 'DELETE',
         headers: { 'X-MBX-APIKEY': apiKey },
       })
       const retryText = await retryRes.text()
@@ -2110,6 +2173,28 @@ async function getFundingUsdtTotal(apiKey, apiSecret) {
   }
 }
 
+initAgent2Context({
+  supabaseRest,
+  futuresBase: FUTURES_BASE,
+  postSigned: signedFuturesJsonPost,
+  getSigned: signedFuturesJson,
+  deleteSigned: signedFuturesJsonDelete,
+  normalizeSymbol: normalizeUsdtFuturesSymbol,
+  getSymbolSpec,
+  quantizeToStep,
+  fmtByStep,
+  toNum,
+  sleep,
+  fetchPositionMode,
+  fetchPositionRisk,
+  fetchMaxLeverageForSymbol,
+  parseMaxLeverageFromBinanceError,
+  enforceExitBracketAgainstEntry,
+  buildAgentTradePositionKey,
+  normalizePositionSideForKey,
+  fetchTradeCloseAccounting: fetchAgentTradeCloseAccounting,
+})
+
 export const app = express()
 app.use(cors({ origin: true }))
 app.use(express.json({ limit: '512kb' }))
@@ -2250,10 +2335,37 @@ app.get('/api/agents/agent1/shadow-curve', async (_req, res) => {
       await maybeHydrateAgent1ShadowSnapshot()
     }
     const snap = getAgent1ShadowSnapshot()
-    res.json(snap)
+    res.json({
+      ...snap,
+      shadowSchedulerActive: process.env.AGENT1_SHADOW_SCHEDULER !== 'false',
+    })
   } catch (e) {
     res.status(500).json({
       error: e instanceof Error ? e.message : 'Failed to load shadow curve',
+    })
+  }
+})
+
+app.patch('/api/agents/agent1/shadow-simulation', (req, res) => {
+  try {
+    if (typeof req.body?.paused !== 'boolean') {
+      return res.status(400).json({ error: 'JSON body must include paused: boolean' })
+    }
+    if (process.env.AGENT1_SHADOW_SCHEDULER === 'false') {
+      return res.status(400).json({
+        error:
+          'Shadow scheduler is off in server config (AGENT1_SHADOW_SCHEDULER=false). Remove it or set to true and restart to run simulation.',
+      })
+    }
+    setAgent1ShadowSimulationPaused(req.body.paused)
+    return res.json({
+      ok: true,
+      simulationPaused: getAgent1ShadowSimulationPaused(),
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    return res.status(500).json({
+      error: e instanceof Error ? e.message : 'Failed to update shadow simulation',
     })
   }
 })
@@ -2374,6 +2486,220 @@ app.patch('/api/agents/agent1/spikes/:id', async (req, res) => {
     console.error(e)
     return res.status(502).json({
       error: e instanceof Error ? e.message : 'Failed to update spike',
+    })
+  }
+})
+
+app.get('/api/agents/agent2/settings', async (_req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const settings = await readAgent2Settings()
+    return res.json({ settings, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to load Agent 2 settings',
+    })
+  }
+})
+
+app.put('/api/agents/agent2/settings', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const body = req.body ?? {}
+    const current = await readAgent2Settings()
+    const merged = { ...current, ...body }
+    if (typeof body.agentEnabled !== 'boolean' && typeof body.agent_enabled !== 'boolean') {
+      merged.agentEnabled = current.agentEnabled
+    }
+    if (typeof body.signalsSchedulerEnabled !== 'boolean' && typeof body.signals_scheduler_enabled !== 'boolean') {
+      merged.signalsSchedulerEnabled = current.signalsSchedulerEnabled
+    }
+    if (typeof body.tradingEnabled !== 'boolean' && typeof body.trading_enabled !== 'boolean') {
+      merged.tradingEnabled = current.tradingEnabled
+    }
+    const { id: _id, updatedAt: _u, ...forUpsert } = merged
+    const settings = await upsertAgent2Settings(forUpsert)
+    return res.json({ ok: true, settings, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    if (e instanceof Error && /must be/i.test(e.message)) {
+      return res.status(400).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to save Agent 2 settings',
+    })
+  }
+})
+
+app.patch('/api/agents/agent2/enabled', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    if (typeof req.body?.enabled !== 'boolean') {
+      return res.status(400).json({ error: 'JSON body must include enabled: boolean' })
+    }
+    const current = await readAgent2Settings()
+    const { id: _i, updatedAt: _u, ...rest } = current
+    const settings = await upsertAgent2Settings({
+      ...rest,
+      agentEnabled: req.body.enabled,
+    })
+    return res.json({ ok: true, settings, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to update Agent 2 master switch',
+    })
+  }
+})
+
+app.get('/api/agents/agent2/scan-status', async (_req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const settings = await readAgent2Settings()
+    const schedOn = process.env.AGENT2_SCAN_SCHEDULER !== 'false'
+    return res.json({
+      schedulerEnabled: schedOn,
+      agentEnabled: settings.agentEnabled,
+      signalsSchedulerEnabled: settings.signalsSchedulerEnabled,
+      tradingEnabled: settings.tradingEnabled,
+      scanInterval: settings.scanInterval,
+      scanSecondsAfterClose: settings.scanSecondsAfterClose,
+      nextFireAt: agent2SchedulerState.nextFireAt,
+      nextFireAtIso:
+        agent2SchedulerState.nextFireAt != null
+          ? new Date(agent2SchedulerState.nextFireAt).toISOString()
+          : null,
+      lastRunAt: agent2SchedulerState.lastRunAt,
+      lastSpikeCount: agent2SchedulerState.lastSpikeCount,
+      lastError: agent2SchedulerState.lastError,
+      running: agent2SchedulerState.running,
+      scanLeaseOwner: agent2SchedulerState.scanLeaseOwner,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    console.error(e)
+    return res.status(500).json({ error: 'agent2 scan-status failed' })
+  }
+})
+
+app.post('/api/agents/agent2/scan-now', async (_req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const out = await runAgent2ScanOnce()
+    return res.json({ ok: true, ...out, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Agent 2 scan failed',
+    })
+  }
+})
+
+app.get('/api/agents/agent2/spikes', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const limitRaw = Number.parseInt(String(req.query.limit ?? '200'), 10)
+    const limit = Math.min(500, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 200))
+    const rows = await supabaseRest(`/rest/v1/agent2_spikes?select=*&order=created_at.desc&limit=${limit}`)
+    return res.json({ spikes: Array.isArray(rows) ? rows : [], fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    console.error(e)
+    return res.status(502).json({ error: e instanceof Error ? e.message : 'Failed to load spikes' })
+  }
+})
+
+app.get('/api/agents/agent2/entry-orders', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const limitRaw = Number.parseInt(String(req.query.limit ?? '100'), 10)
+    const limit = Math.min(200, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 100))
+    const rows = await supabaseRest(
+      `/rest/v1/agent2_entry_orders?select=*&order=created_at.desc&limit=${limit}`,
+    )
+    return res.json({ orders: Array.isArray(rows) ? rows : [], fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    console.error(e)
+    return res.status(502).json({ error: e instanceof Error ? e.message : 'Failed to load entry orders' })
+  }
+})
+
+app.get('/api/agents/agent2/execution', async (_req, res) => {
+  try {
+    let logs = []
+    let openTrades = []
+    let closedTrades = []
+    let entryOrders = []
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      const dbLogs = await listAgent2ExecutionLogRows(500)
+      logs = dbLogs.map((r) => ({
+        at: r.logged_at ?? r.created_at ?? null,
+        level: r.level ?? 'info',
+        msg: r.message ?? '',
+      }))
+      openTrades = await supabaseRest(
+        '/rest/v1/agent2_trades?select=*&status=eq.open&order=opened_at.desc&limit=200',
+      )
+      openTrades = Array.isArray(openTrades) ? openTrades : []
+      closedTrades = await supabaseRest(
+        '/rest/v1/agent2_trades?select=*&status=eq.closed&order=closed_at.desc&limit=200',
+      )
+      closedTrades = Array.isArray(closedTrades) ? closedTrades : []
+      entryOrders = await supabaseRest(
+        '/rest/v1/agent2_entry_orders?select=*&order=created_at.desc&limit=200',
+      )
+      entryOrders = Array.isArray(entryOrders) ? entryOrders : []
+    }
+    const openPositionMap = new Map()
+    const apiKey = process.env.BINANCE_API_KEY
+    const apiSecret = process.env.BINANCE_API_SECRET
+    if (apiKey && apiSecret) {
+      try {
+        const all = await fetchPositionRisk(apiKey, apiSecret)
+        const openRows = Array.isArray(all)
+          ? all.filter((p) => Math.abs(parseFloat(p?.positionAmt ?? '0')) > 0)
+          : []
+        for (const r of openRows) {
+          openPositionMap.set(buildAgentTradePositionKey(r.symbol, r.positionSide), r)
+        }
+      } catch {
+        /* */
+      }
+    }
+    const ongoingTrades = openTrades.map((t) => {
+      const row = openPositionMap.get(buildAgentTradePositionKey(t.symbol, t.position_side))
+      return {
+        ...t,
+        positionAmt: row?.positionAmt ?? null,
+        markPrice: row?.markPrice ?? null,
+        unRealizedProfit: row?.unRealizedProfit ?? null,
+      }
+    })
+    return res.json({
+      state: agent2ExecutionState,
+      logs,
+      ongoingTrades,
+      closedTrades,
+      entryOrders,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    return res.status(500).json({
+      error: e instanceof Error ? e.message : 'Failed to load agent2 execution',
     })
   }
 })
@@ -2858,6 +3184,28 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
   if (s === 'long') strategy = 'long'
   else if (s === 'short' || s === 'short_spike_low' || s === 'shortspikelow') strategy = 'shortSpikeLow'
   else if (
+    s === 'shortgreenspike2r' ||
+    s === 'short_green_spike_2r' ||
+    s === 'short_green_spike' ||
+    s === 'short_long_spike'
+  ) {
+    strategy = 'shortGreenSpike2R'
+  } else if (
+    s === 'shortgreenretestlow' ||
+    s === 'short_green_retest_low' ||
+    s === 'shortretestspikelow' ||
+    s === 'short_spike_retest_low'
+  ) {
+    strategy = 'shortGreenRetestLow'
+  } else if (
+    s === 'longgreenretestlow' ||
+    s === 'long_green_retest_low' ||
+    s === 'longretestspikelow' ||
+    s === 'long_spike_retest_low'
+  ) {
+    strategy = 'longGreenRetestLow'
+  }
+  else if (
     s === 'short_red_spike' ||
     s === 'shortredspike' ||
     s === 'negative_spike' ||
@@ -2881,7 +3229,7 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
   } else {
     return res.status(400).json({
       error:
-        'strategy must be long, longRedSpikeTpHigh / long_red_spike_tp_high, shortSpikeLow, shortRedSpike / negative_spike, or regimeFlipEma50',
+        'strategy must be long, longRedSpikeTpHigh / long_red_spike_tp_high, longGreenRetestLow / long_green_retest_low, shortSpikeLow, shortGreenSpike2R / short_long_spike, shortGreenRetestLow / short_green_retest_low, shortRedSpike / negative_spike, or regimeFlipEma50',
     })
   }
 
@@ -2936,6 +3284,10 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
     tpROpt = tr
   }
 
+  const longRetestTpAtSpikeHigh =
+    strategy === 'longGreenRetestLow' &&
+    String(req.query.longRetestTpAtSpikeHigh ?? '').toLowerCase() === 'true'
+
   try {
     const result = await computeSpikeTpSlBacktest(FUTURES_BASE, {
       minQuoteVolume24h,
@@ -2951,6 +3303,7 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
       includeChartCandles,
       emaLongFilter96_5m,
       ...(tpROpt != null ? { tpR: tpROpt } : {}),
+      ...(longRetestTpAtSpikeHigh ? { longRetestTpAtSpikeHigh: true } : {}),
     })
     res.json(result)
   } catch (e) {
@@ -3137,6 +3490,22 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && process.env.AGENT1_SCAN_SCHEDUL
     persistScan: persistAgent1ScanResult,
     logger: console,
   })
+}
+
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && process.env.AGENT2_SCAN_SCHEDULER !== 'false') {
+  startAgent2ScanScheduler({ futuresBase: FUTURES_BASE, logger: console })
+}
+
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && process.env.AGENT2_BOOT_SCAN !== 'false') {
+  void runAgent2ScanOnce().catch((e) => console.error('[agent2] boot scan failed', e))
+}
+
+if (AGENT2_EXECUTION_ENABLED) {
+  setInterval(() => {
+    void runAgent2ExecutionTick()
+  }, AGENT2_EXECUTION_POLL_MS)
+  console.log(`[agent2] execution loop started (${AGENT2_EXECUTION_POLL_MS}ms poll)`)
+  void runAgent2ExecutionTick()
 }
 
 if (AGENT1_EXECUTION_ENABLED) {
