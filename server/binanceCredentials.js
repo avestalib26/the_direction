@@ -5,6 +5,15 @@
 
 const PROFILES = ['master', 'sub1', 'sub2']
 
+/** First non-empty trimmed value, else null. Fixes `BINANCE_MASTER_API_KEY=` blocking fallback to `BINANCE_API_KEY`. */
+function pickEnv(...names) {
+  for (const name of names) {
+    const v = String(process.env[name] ?? '').trim()
+    if (v) return v
+  }
+  return null
+}
+
 export function normalizeBinanceAccountId(raw) {
   const v = String(raw ?? 'master')
     .trim()
@@ -20,17 +29,14 @@ export function resolveBinanceCredentials(accountIdRaw) {
   let apiKey
   let apiSecret
   if (id === 'master') {
-    apiKey =
-      String(process.env.BINANCE_MASTER_API_KEY ?? process.env.BINANCE_API_KEY ?? '').trim() || null
-    apiSecret =
-      String(process.env.BINANCE_MASTER_API_SECRET ?? process.env.BINANCE_API_SECRET ?? '').trim() ||
-      null
+    apiKey = pickEnv('BINANCE_MASTER_API_KEY', 'BINANCE_API_KEY')
+    apiSecret = pickEnv('BINANCE_MASTER_API_SECRET', 'BINANCE_API_SECRET')
   } else if (id === 'sub1') {
-    apiKey = String(process.env.BINANCE_SUB1_API_KEY ?? '').trim() || null
-    apiSecret = String(process.env.BINANCE_SUB1_API_SECRET ?? '').trim() || null
+    apiKey = pickEnv('BINANCE_SUB1_API_KEY')
+    apiSecret = pickEnv('BINANCE_SUB1_API_SECRET')
   } else {
-    apiKey = String(process.env.BINANCE_SUB2_API_KEY ?? '').trim() || null
-    apiSecret = String(process.env.BINANCE_SUB2_API_SECRET ?? '').trim() || null
+    apiKey = pickEnv('BINANCE_SUB2_API_KEY')
+    apiSecret = pickEnv('BINANCE_SUB2_API_SECRET')
   }
   return { accountId: id, apiKey, apiSecret }
 }
