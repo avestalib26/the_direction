@@ -568,10 +568,29 @@ async function closeFuturesMarketReduceOnlyBestEffort({
   return signedFuturesJsonPost(apiKey, apiSecret, '/fapi/v1/order', params)
 }
 
+/**
+ * Digits after decimal for Binance step/tick. Handles scientific notation (e.g. 1e-7)
+ * so fmtByStep does not use toFixed(0) on sub-cent prices.
+ */
 function decimalPlaces(step) {
-  const s = String(step ?? '').trim()
-  if (!s || !s.includes('.')) return 0
-  return s.replace(/0+$/, '').split('.')[1]?.length ?? 0
+  if (!Number.isFinite(step) || step <= 0) return 0
+  const s = String(step).trim()
+  const lower = s.toLowerCase()
+  if (lower.includes('e')) {
+    const m = lower.match(/e([+-]?\d+)$/i)
+    if (m) {
+      const exp = Number.parseInt(m[1], 10)
+      if (exp < 0) return Math.min(12, -exp)
+    }
+  }
+  if (s.includes('.')) {
+    const frac = s.split('.')[1]?.replace(/0+$/, '') ?? ''
+    if (frac.length > 0) return Math.min(12, frac.length)
+  }
+  if (step < 1) {
+    return Math.min(12, Math.max(1, Math.round(-Math.log10(step))))
+  }
+  return 0
 }
 
 function quantizeToStep(value, step, mode = 'floor') {
@@ -589,10 +608,16 @@ function quantizeToStep(value, step, mode = 'floor') {
 }
 
 function fmtByStep(value, step, precisionCap = null) {
-  const d = decimalPlaces(step)
+  let d = decimalPlaces(step)
+  if (d <= 0 && Number.isFinite(precisionCap) && precisionCap > 0) {
+    d = Math.min(12, Math.floor(precisionCap))
+  }
   let use = Math.max(0, d)
   if (Number.isFinite(precisionCap) && precisionCap >= 0) {
     use = Math.min(use, Math.floor(precisionCap))
+  }
+  if (use <= 0) {
+    use = Math.min(12, 8)
   }
   return value.toFixed(Math.min(12, use))
 }
@@ -2726,8 +2751,8 @@ async function placeFuturesOrderWithProtection({
       `Invalid TP/SL bracket vs entry ${entryPrice} for ${symbol} after tick rounding. Position flattened if possible.`,
     )
   }
-  const tpPrice = fmtByStep(tpPriceNum, spec.tickSize)
-  const slPrice = fmtByStep(slPriceNum, spec.tickSize)
+  const tpPrice = fmtByStep(tpPriceNum, spec.tickSize, spec.pricePrecision)
+  const slPrice = fmtByStep(slPriceNum, spec.tickSize, spec.pricePrecision)
   const tpPriceCheck = Number.parseFloat(tpPrice)
   const slPriceCheck = Number.parseFloat(slPrice)
   if (!(tpPriceCheck > 0) || !(slPriceCheck > 0)) {
