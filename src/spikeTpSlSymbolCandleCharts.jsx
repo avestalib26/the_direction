@@ -90,11 +90,19 @@ function emaLineFromApi(chartEma) {
 
 function markerDataForSymbol(chartTradeMarkers, symbol, tMin, tMax) {
   if (!Array.isArray(chartTradeMarkers) || chartTradeMarkers.length === 0) {
-    return { candleMarkers: [], spikeLineData: [], entryLineData: [] }
+    return {
+      candleMarkers: [],
+      spikeLineData: [],
+      entryLineData: [],
+      occurrenceLineData: [],
+      closeLineData: [],
+    }
   }
 
   const spikeTimes = new Set()
   const entryTimes = new Set()
+  const occurrenceTimes = new Set()
+  const closeTimes = new Set()
 
   for (const row of chartTradeMarkers) {
     if (row.symbol !== symbol) continue
@@ -107,11 +115,21 @@ function markerDataForSymbol(chartTradeMarkers, symbol, tMin, tMax) {
       const sec = Math.floor(row.entryOpenTime / 1000)
       if (sec >= tMin && sec <= tMax) entryTimes.add(sec)
     }
+    if (Number.isFinite(row.occurrenceOpenTime)) {
+      const sec = Math.floor(row.occurrenceOpenTime / 1000)
+      if (sec >= tMin && sec <= tMax) occurrenceTimes.add(sec)
+    }
+    if (Number.isFinite(row.exitOpenTime)) {
+      const sec = Math.floor(row.exitOpenTime / 1000)
+      if (sec >= tMin && sec <= tMax) closeTimes.add(sec)
+    }
   }
 
   const candleMarkers = []
   const spikeLineData = []
   const entryLineData = []
+  const occurrenceLineData = []
+  const closeLineData = []
 
   for (const sec of [...spikeTimes].sort((a, b) => a - b)) {
     candleMarkers.push({
@@ -143,8 +161,38 @@ function markerDataForSymbol(chartTradeMarkers, symbol, tMin, tMax) {
     })
   }
 
+  for (const sec of [...occurrenceTimes].sort((a, b) => a - b)) {
+    candleMarkers.push({
+      time: sec,
+      position: 'aboveBar',
+      color: '#facc15',
+      shape: 'circle',
+      text: 'Occurrence',
+    })
+    occurrenceLineData.push({
+      time: sec,
+      value: 1,
+      color: 'rgba(250, 204, 21, 0.55)',
+    })
+  }
+
+  for (const sec of [...closeTimes].sort((a, b) => a - b)) {
+    candleMarkers.push({
+      time: sec,
+      position: 'belowBar',
+      color: '#22c55e',
+      shape: 'circle',
+      text: 'Close',
+    })
+    closeLineData.push({
+      time: sec,
+      value: 1,
+      color: 'rgba(34, 197, 94, 0.52)',
+    })
+  }
+
   candleMarkers.sort((a, b) => Number(a.time) - Number(b.time))
-  return { candleMarkers, spikeLineData, entryLineData }
+  return { candleMarkers, spikeLineData, entryLineData, occurrenceLineData, closeLineData }
 }
 
 /** Filter-rejected long setups: yellow verticals at spike + would-be entry (same times as live trades). */
@@ -157,7 +205,12 @@ function skippedMarkerDataForSymbol(chartSkippedMarkers, symbol, tMin, tMax) {
   const entryTimes = new Set()
 
   for (const row of chartSkippedMarkers) {
-    if (row.symbol !== symbol || row.reason !== 'ema96_5m') continue
+    const isEmaSkip =
+      row.reason === 'ema96_5m' ||
+      row.reason === 'ema96_5m_long' ||
+      row.reason === 'ema96_5m_slope_long' ||
+      row.reason === 'ema96_5m_short'
+    if (row.symbol !== symbol || !isEmaSkip) continue
     if (Number.isFinite(row.spikeOpenTime)) {
       const sec = Math.floor(row.spikeOpenTime / 1000)
       if (sec >= tMin && sec <= tMax) spikeTimes.add(sec)
@@ -228,6 +281,8 @@ function SymbolCandleChart({
         candleMarkers: [],
         spikeLineData: [],
         entryLineData: [],
+        occurrenceLineData: [],
+        closeLineData: [],
         skipSpikeLineData: [],
         skipEntryLineData: [],
       }
@@ -243,6 +298,8 @@ function SymbolCandleChart({
       candleMarkers,
       spikeLineData: trade.spikeLineData,
       entryLineData: trade.entryLineData,
+      occurrenceLineData: trade.occurrenceLineData,
+      closeLineData: trade.closeLineData,
       skipSpikeLineData: skip.skipSpikeLineData,
       skipEntryLineData: skip.skipEntryLineData,
     }
@@ -294,6 +351,18 @@ function SymbolCandleChart({
       lastValueVisible: false,
       priceLineVisible: false,
     })
+    const occurrenceLineSeries = chart.addSeries(HistogramSeries, {
+      priceScaleId: 'marker-lines',
+      base: 0,
+      lastValueVisible: false,
+      priceLineVisible: false,
+    })
+    const closeLineSeries = chart.addSeries(HistogramSeries, {
+      priceScaleId: 'marker-lines',
+      base: 0,
+      lastValueVisible: false,
+      priceLineVisible: false,
+    })
     const skipSpikeLineSeries = chart.addSeries(HistogramSeries, {
       priceScaleId: 'marker-lines',
       base: 0,
@@ -313,6 +382,8 @@ function SymbolCandleChart({
     })
     spikeLineSeries.setData(markerBundle.spikeLineData)
     entryLineSeries.setData(markerBundle.entryLineData)
+    occurrenceLineSeries.setData(markerBundle.occurrenceLineData)
+    closeLineSeries.setData(markerBundle.closeLineData)
     skipSpikeLineSeries.setData(markerBundle.skipSpikeLineData)
     skipEntryLineSeries.setData(markerBundle.skipEntryLineData)
 
@@ -353,7 +424,9 @@ function SymbolCandleChart({
         <strong>{interval}</strong> ? <strong style={{ color: COL_EMA }}>EMA 96</strong> (5m close, mapped to
         chart times){' '}
         ? markers: <strong style={{ color: '#a855f7' }}>Spike</strong> /{' '}
-        <strong style={{ color: '#2563eb' }}>Entry</strong> (taken){' '}
+        <strong style={{ color: '#2563eb' }}>Entry</strong> (taken) /{' '}
+        <strong style={{ color: '#facc15' }}>Occurrence</strong> /{' '}
+        <strong style={{ color: '#22c55e' }}>Close</strong>{' '}
         ? <strong style={{ color: '#ca8a04' }}>Skip</strong> (EMA filter rejected)
       </p>
     </div>

@@ -344,6 +344,9 @@
 
 /* Small horizontal gutter for headings / status only; forms keep inner padding */
 .agent1-page > .agent1-risk-summary,
+.agent1-page > .agent1-account-tablet,
+.agent1-page > .agent1-sim-metrics-tablet,
+.agent1-page > .agent1-sim-result,
 .agent1-page > .agent1-section-title,
 .agent1-page > .hourly-spikes-hint,
 .agent1-page > .vol-screener-lead,
@@ -363,6 +366,9 @@
   }
 
   .agent1-page > .agent1-risk-summary,
+  .agent1-page > .agent1-account-tablet,
+  .agent1-page > .agent1-sim-metrics-tablet,
+  .agent1-page > .agent1-sim-result,
   .agent1-page > .agent1-section-title,
   .agent1-page > .hourly-spikes-hint,
   .agent1-page > .vol-screener-lead,
@@ -443,6 +449,141 @@
 
 .agent1-risk-summary .risk-chip {
   max-width: 100%;
+}
+
+.agent1-account-tablet {
+  margin-bottom: 1.1rem;
+  padding: 0.75rem 0.85rem;
+  border-radius: 10px;
+  border: 1px solid var(--menu-border);
+  background: var(--menu-surface);
+}
+
+.agent1-account-tablet__err {
+  margin: 0 0 0.5rem;
+  color: #b91c1c;
+  font-size: 0.85rem;
+}
+
+.agent1-account-tablet__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 0.65rem 1rem;
+}
+
+.agent1-account-tablet__cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.agent1-account-tablet__label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.agent1-account-tablet__value {
+  font-size: 1.05rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-heading);
+}
+
+.agent1-account-tablet__value--pos {
+  color: var(--pnl-pos);
+}
+
+.agent1-account-tablet__value--neg {
+  color: var(--pnl-neg);
+}
+
+.agent1-account-tablet__sub {
+  font-size: 0.78rem;
+  line-height: 1.25;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.agent1-account-tablet__hint {
+  margin: 0.55rem 0 0;
+}
+
+.agent1-sim-result {
+  margin-bottom: 1rem;
+}
+
+.agent1-sim-metrics-tablet {
+  margin-bottom: 0.85rem;
+  padding: 0.75rem 0.85rem;
+  border-radius: 10px;
+  border: 1px solid var(--menu-border);
+  background: var(--menu-surface);
+}
+
+.agent1-sim-metrics-tablet__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+  gap: 0.65rem 1rem;
+}
+
+.agent1-sim-chart-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-heading);
+  margin: 1rem 0 0.45rem;
+}
+
+.agent1-sim-result > .agent1-sim-chart-title:first-of-type {
+  margin-top: 0.2rem;
+}
+
+.agent1-sim-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.agent1-sim-modal {
+  width: min(100%, 32rem);
+  max-height: min(90vh, 40rem);
+  overflow: auto;
+  padding: 1rem 1.1rem 1.1rem;
+  border-radius: 12px;
+  border: 1px solid var(--menu-border);
+  background: var(--bg);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+
+.agent1-sim-modal__title {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+  color: var(--text-heading);
+}
+
+.agent1-sim-modal__form {
+  margin-top: 0.5rem !important;
+  padding: 0.5rem 0 !important;
+  border: none !important;
+}
+
+.agent1-sim-modal__err {
+  margin: 0.5rem 0 0;
+  color: #b91c1c;
+  font-size: 0.85rem;
+}
+
+.agent1-sim-modal__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  margin-top: 0.75rem;
 }
 
 @media (min-width: 520px) {

@@ -38,8 +38,8 @@ function maxSecondsBeforeCloseForInterval(interval) {
   return Math.min(299, Math.floor(ms / 1000) - 1)
 }
 
-async function fetchAgent1Settings() {
-  const res = await fetch('/api/agents/agent1/settings', { cache: 'no-store' })
+async function fetchAgent3Settings() {
+  const res = await fetch('/api/agents/agent3/settings', { cache: 'no-store' })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     throw new Error(data.error || `Request failed (${res.status})`)
@@ -47,8 +47,8 @@ async function fetchAgent1Settings() {
   return data.settings
 }
 
-async function saveAgent1Settings(payload) {
-  const res = await fetch('/api/agents/agent1/settings', {
+async function saveAgent3Settings(payload) {
+  const res = await fetch('/api/agents/agent3/settings', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -61,7 +61,7 @@ async function saveAgent1Settings(payload) {
 }
 
 async function fetchScanStatus() {
-  const res = await fetch('/api/agents/agent1/scan-status', { cache: 'no-store' })
+  const res = await fetch('/api/agents/agent3/scan-status', { cache: 'no-store' })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     throw new Error(data.error || `Request failed (${res.status})`)
@@ -69,8 +69,8 @@ async function fetchScanStatus() {
   return data
 }
 
-async function fetchAgent1Regime() {
-  const res = await fetch('/api/agents/agent1/regime', { cache: 'no-store' })
+async function fetchAgent3Execution() {
+  const res = await fetch('/api/agents/agent3/execution', { cache: 'no-store' })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     throw new Error(data.error || `Request failed (${res.status})`)
@@ -78,8 +78,8 @@ async function fetchAgent1Regime() {
   return data
 }
 
-async function fetchAgent1Execution() {
-  const res = await fetch('/api/agents/agent1/execution', { cache: 'no-store' })
+async function fetchAgent3AccountMetrics() {
+  const res = await fetch('/api/agents/agent3/account-metrics', { cache: 'no-store' })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     throw new Error(data.error || `Request failed (${res.status})`)
@@ -88,7 +88,7 @@ async function fetchAgent1Execution() {
 }
 
 async function fetchSpikes() {
-  const res = await fetch('/api/agents/agent1/spikes?limit=200', { cache: 'no-store' })
+  const res = await fetch('/api/agents/agent3/spikes?limit=200', { cache: 'no-store' })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     throw new Error(data.error || `Request failed (${res.status})`)
@@ -96,17 +96,8 @@ async function fetchSpikes() {
   return data.spikes ?? []
 }
 
-async function fetchAgent1AccountMetrics() {
-  const res = await fetch('/api/agents/agent1/account-metrics', { cache: 'no-store' })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) {
-    throw new Error(data.error || `Request failed (${res.status})`)
-  }
-  return data
-}
-
 async function patchSpikeTradeTaken(id, tradeTaken) {
-  const res = await fetch(`/api/agents/agent1/spikes/${encodeURIComponent(id)}`, {
+  const res = await fetch(`/api/agents/agent3/spikes/${encodeURIComponent(id)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tradeTaken }),
@@ -159,12 +150,12 @@ function fmtUsd2(v) {
   return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
-export function Agent1() {
+export function Agent3() {
   const [tradeSizeUsd, setTradeSizeUsd] = useState('1')
   const [tradeSizeWalletPct, setTradeSizeWalletPct] = useState('0')
   const [leverage, setLeverage] = useState('10')
   const [marginMode, setMarginMode] = useState('cross')
-  const [maxTpPct, setMaxTpPct] = useState('1.5')
+  const [maxTpPct, setMaxTpPct] = useState('2')
   const [maxSlPct, setMaxSlPct] = useState('1')
   const [maxOpenPositions, setMaxOpenPositions] = useState('30')
   const [scanInterval, setScanInterval] = useState('5m')
@@ -173,19 +164,16 @@ export function Agent1() {
   const [scanMinQuoteVolume, setScanMinQuoteVolume] = useState('0')
   const [scanMaxSymbols, setScanMaxSymbols] = useState('800')
   const [scanSpikeMetric, setScanSpikeMetric] = useState('body')
-  const [scanDirection, setScanDirection] = useState('both')
-  const [agentEnabled, setAgentEnabled] = useState(true)
-  const [emaGateEnabled, setEmaGateEnabled] = useState(true)
+  const [scanDirection, setScanDirection] = useState('down')
+  const [agentEnabled, setAgentEnabled] = useState(false)
   const [binanceAccount, setBinanceAccount] = useState('master')
 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
-  const [emaGateSaving, setEmaGateSaving] = useState(false)
   const [error, setError] = useState('')
   const [savedAt, setSavedAt] = useState('')
 
   const [scanStatus, setScanStatus] = useState(null)
-  const [regime, setRegime] = useState(null)
   const [execution, setExecution] = useState(null)
   const [spikes, setSpikes] = useState([])
   const [visibleSpikesCount, setVisibleSpikesCount] = useState(30)
@@ -236,15 +224,6 @@ export function Agent1() {
     () => logs.slice(0, Math.max(30, visibleLogCount)),
     [logs, visibleLogCount],
   )
-
-  /** Equity line only (no BTC overlay) — same Σ % as stacked trade candles below. */
-  const simEquityCurveNoBtc = useMemo(() => {
-    const pts = simResult?.equityCurve
-    if (!Array.isArray(pts) || pts.length === 0) return pts
-    return pts.map((p) =>
-      p && typeof p === 'object' ? { ...p, btcCloseUsd: undefined } : p,
-    )
-  }, [simResult?.equityCurve])
   const sectionTabs = useMemo(
     () => [
       { id: 'execution', label: 'Execution', ref: executionRef },
@@ -254,6 +233,14 @@ export function Agent1() {
     ],
     [],
   )
+
+  const simEquityCurveNoBtc = useMemo(() => {
+    const pts = simResult?.equityCurve
+    if (!Array.isArray(pts) || pts.length === 0) return pts
+    return pts.map((p) =>
+      p && typeof p === 'object' ? { ...p, btcCloseUsd: undefined } : p,
+    )
+  }, [simResult?.equityCurve])
 
   const loadSpikes = useCallback(async () => {
     setSpikesError('')
@@ -277,18 +264,9 @@ export function Agent1() {
     }
   }, [])
 
-  const loadRegime = useCallback(async () => {
-    try {
-      const data = await fetchAgent1Regime()
-      setRegime(data?.regime ?? null)
-    } catch {
-      setRegime(null)
-    }
-  }, [])
-
   const loadExecution = useCallback(async () => {
     try {
-      const data = await fetchAgent1Execution()
+      const data = await fetchAgent3Execution()
       setExecution(data)
     } catch {
       setExecution(null)
@@ -298,7 +276,7 @@ export function Agent1() {
   const loadAccountMetrics = useCallback(async () => {
     setAccountMetricsError('')
     try {
-      const data = await fetchAgent1AccountMetrics()
+      const data = await fetchAgent3AccountMetrics()
       setAccountMetrics(data)
     } catch (e) {
       setAccountMetrics(null)
@@ -310,7 +288,7 @@ export function Agent1() {
     setClosedPnlCurveLoading(true)
     setClosedPnlCurveError('')
     try {
-      const res = await fetch('/api/agents/agent1/closed-trades-pnl-curve?limit=1000', {
+      const res = await fetch('/api/agents/agent3/closed-trades-pnl-curve?limit=1000', {
         cache: 'no-store',
       })
       const data = await res.json().catch(() => ({}))
@@ -334,7 +312,7 @@ export function Agent1() {
     setSimModalOpen(true)
   }, [maxSlPct, scanInterval, scanThresholdPct])
 
-  const runAgent1Simulation = useCallback(async () => {
+  const runAgent3Simulation = useCallback(async () => {
     setSimRunLoading(true)
     setSimError('')
     try {
@@ -350,7 +328,7 @@ export function Agent1() {
         interval: simBtInterval,
         candleCount: String(n),
         thresholdPct: String(th),
-        strategy: 'long',
+        strategy: 'short_red_spike',
         includeChartCandles: 'false',
       })
       const maxSlN = Number.parseFloat(String(simMaxSlPct))
@@ -387,7 +365,7 @@ export function Agent1() {
       setLoading(true)
       setError('')
       try {
-        const s = await fetchAgent1Settings()
+        const s = await fetchAgent3Settings()
         if (off) return
         setTradeSizeUsd(String(s.tradeSizeUsd ?? '1'))
         setTradeSizeWalletPct(
@@ -399,7 +377,7 @@ export function Agent1() {
         )
         setLeverage(String(s.leverage ?? '10'))
         setMarginMode(String(s.marginMode ?? 'cross'))
-        setMaxTpPct(String(s.maxTpPct ?? '1.5'))
+        setMaxTpPct(String(s.maxTpPct ?? '2'))
         setMaxSlPct(String(s.maxSlPct ?? '1'))
         setMaxOpenPositions(String(s.maxOpenPositions ?? '30'))
         const loadedInterval = String(s.scanInterval ?? '5m').trim()
@@ -411,13 +389,12 @@ export function Agent1() {
         setScanMinQuoteVolume(String(s.scanMinQuoteVolume ?? '0'))
         setScanMaxSymbols(String(s.scanMaxSymbols ?? '800'))
         setScanSpikeMetric(String(s.scanSpikeMetric ?? 'body'))
-        setScanDirection(String(s.scanDirection ?? 'both'))
+        setScanDirection(String(s.scanDirection ?? 'down'))
         setAgentEnabled(s.agentEnabled !== false)
-        setEmaGateEnabled(s.emaGateEnabled !== false)
         setBinanceAccount(String(s.binanceAccount ?? 'master'))
         setSavedAt(String(s.updatedAt ?? ''))
       } catch (e) {
-        if (!off) setError(e instanceof Error ? e.message : 'Failed to load Agent 1 settings')
+        if (!off) setError(e instanceof Error ? e.message : 'Failed to load Agent 3 settings')
       } finally {
         if (!off) setLoading(false)
       }
@@ -425,13 +402,11 @@ export function Agent1() {
     load()
     loadSpikes()
     loadScanStatus()
-    loadRegime()
     loadExecution()
     loadAccountMetrics()
     const iv = setInterval(() => {
       loadScanStatus()
       loadSpikes()
-      loadRegime()
       loadExecution()
       loadAccountMetrics()
     }, 30_000)
@@ -439,33 +414,23 @@ export function Agent1() {
       off = true
       clearInterval(iv)
     }
-  }, [loadAccountMetrics, loadExecution, loadRegime, loadSpikes, loadScanStatus])
+  }, [loadAccountMetrics, loadExecution, loadSpikes, loadScanStatus])
 
   useEffect(() => {
     const onHeaderToggle = () => {
       loadScanStatus()
       ;(async () => {
         try {
-          const s = await fetchAgent1Settings()
+          const s = await fetchAgent3Settings()
           setAgentEnabled(s.agentEnabled !== false)
-          setEmaGateEnabled(s.emaGateEnabled !== false)
         } catch {
           /* keep previous */
         }
       })()
     }
-    window.addEventListener('agent1-enabled-changed', onHeaderToggle)
-    return () => window.removeEventListener('agent1-enabled-changed', onHeaderToggle)
+    window.addEventListener('agent3-enabled-changed', onHeaderToggle)
+    return () => window.removeEventListener('agent3-enabled-changed', onHeaderToggle)
   }, [loadScanStatus])
-
-  useEffect(() => {
-    if (!simModalOpen) return undefined
-    const onKey = (e) => {
-      if (e.key === 'Escape') setSimModalOpen(false)
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [simModalOpen])
 
   useEffect(() => {
     if (typeof window === 'undefined') return undefined
@@ -498,11 +463,20 @@ export function Agent1() {
     el.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }, [])
 
+  useEffect(() => {
+    if (!simModalOpen) return undefined
+    const onKey = (e) => {
+      if (e.key === 'Escape') setSimModalOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [simModalOpen])
+
   const onSave = async () => {
     setSaving(true)
     setError('')
     try {
-      const out = await saveAgent1Settings({
+      const out = await saveAgent3Settings({
         tradeSizeUsd: Number.parseFloat(tradeSizeUsd),
         tradeSizeWalletPct: Number.parseFloat(tradeSizeWalletPct),
         leverage: Number.parseInt(leverage, 10),
@@ -518,7 +492,6 @@ export function Agent1() {
         scanSpikeMetric,
         scanDirection,
         agentEnabled,
-        emaGateEnabled,
         binanceAccount,
       })
       setTradeSizeUsd(String(out.tradeSizeUsd))
@@ -545,12 +518,11 @@ export function Agent1() {
       setScanSpikeMetric(String(out.scanSpikeMetric))
       setScanDirection(String(out.scanDirection))
       setAgentEnabled(out.agentEnabled !== false)
-      setEmaGateEnabled(out.emaGateEnabled !== false)
       setBinanceAccount(String(out.binanceAccount ?? 'master'))
       setSavedAt(String(out.updatedAt ?? new Date().toISOString()))
       loadAccountMetrics()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to save Agent 1 settings')
+      setError(e instanceof Error ? e.message : 'Failed to save Agent 3 settings')
     } finally {
       setSaving(false)
     }
@@ -569,32 +541,9 @@ export function Agent1() {
     }
   }
 
-  const onToggleEmaGate = async () => {
-    if (loading || saving || emaGateSaving) return
-    const next = !emaGateEnabled
-    const ok = window.confirm(
-      next
-        ? 'Enable EMA gating for Agent 1 execution? Trades will be blocked when curve is below EMA.'
-        : 'Disable EMA gating for Agent 1 execution? Agent will bypass regime gate and execute by spikes only.',
-    )
-    if (!ok) return
-    setEmaGateSaving(true)
-    setError('')
-    try {
-      const out = await saveAgent1Settings({ emaGateEnabled: next })
-      setEmaGateEnabled(out.emaGateEnabled !== false)
-      setSavedAt(String(out.updatedAt ?? new Date().toISOString()))
-      loadExecution()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to update EMA gate setting')
-    } finally {
-      setEmaGateSaving(false)
-    }
-  }
-
   return (
     <div className="vol-screener agent1-page">
-      <nav className="agent1-tabs" aria-label="Agent 1 sections">
+      <nav className="agent1-tabs" aria-label="Agent 3 sections">
         {sectionTabs.map((tab) => (
           <button
             key={tab.id}
@@ -609,15 +558,14 @@ export function Agent1() {
       {scanStatus ? (
         <div className="risk-summary agent1-risk-summary">
           <div className="risk-chip">
-            Agent (master):{' '}
+            Agent 3 (header):{' '}
             <strong>{scanStatus.agentEnabled !== false ? 'ON' : 'OFF'}</strong>
-            <span className="hourly-spikes-hint"> (header)</span>
           </div>
           <div className="risk-chip">
             Scheduler:{' '}
             <strong>{scanStatus.schedulerEnabled ? 'enabled' : 'disabled'}</strong>
             {!scanStatus.schedulerEnabled ? (
-              <span className="hourly-spikes-hint"> (API has AGENT1_SCAN_SCHEDULER=false)</span>
+              <span className="hourly-spikes-hint"> (API has AGENT3_SCAN_SCHEDULER=false)</span>
             ) : null}
           </div>
           <div className="risk-chip">
@@ -628,21 +576,6 @@ export function Agent1() {
           </div>
           <div className="risk-chip">
             Last spikes written: <strong>{scanStatus.lastSpikeCount ?? '—'}</strong>
-          </div>
-          <div className="risk-chip">
-            Curve PnL: <strong>{Number.isFinite(Number(regime?.latestCumPnlPct)) ? `${Number(regime.latestCumPnlPct).toFixed(3)}%` : '—'}</strong>
-          </div>
-          <div className="risk-chip">
-            EMA50: <strong>{Number.isFinite(Number(regime?.emaValue)) ? `${Number(regime.emaValue).toFixed(3)}%` : '—'}</strong>
-          </div>
-          <div className="risk-chip">
-            Gate:{' '}
-            <strong>
-              {emaGateEnabled ? (regime?.gateAllowLong ? 'ALLOW LONG' : 'BLOCK LONG') : 'DISABLED (BYPASS)'}
-            </strong>
-          </div>
-          <div className="risk-chip">
-            EMA gate: <strong>{emaGateEnabled ? 'ON' : 'OFF'}</strong>
           </div>
           <div className="risk-chip">
             Exec loop: <strong>{execution?.state?.running ? 'running' : 'idle'}</strong>
@@ -779,7 +712,7 @@ export function Agent1() {
               </div>
             </div>
           </div>
-          <h3 className="agent1-sim-chart-title">Cumulative Σ price %</h3>
+          <h3 className="agent1-sim-chart-title">Cumulative Σ price % (short spike strategy)</h3>
           <SpikeTpSlEquityLightChart points={simEquityCurveNoBtc} showFootnote={false} />
           <h3 className="agent1-sim-chart-title">Cumulative Σ price % · per-trade candles</h3>
           <SpikeTpSlPerTradeCandleLightChart
@@ -807,15 +740,16 @@ export function Agent1() {
             className="agent1-sim-modal"
             role="dialog"
             aria-modal="true"
-            aria-labelledby="agent1-sim-modal-title"
+            aria-labelledby="agent3-sim-modal-title"
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 id="agent1-sim-modal-title" className="agent1-sim-modal__title">
-              Simulation parameters
+            <h3 id="agent3-sim-modal-title" className="agent1-sim-modal__title">
+              Simulation parameters (short on red spikes)
             </h3>
             <p className="hourly-spikes-hint">
-              Scans the market once and plots cumulative % (sum of per-trade entry→exit returns). Green-body spike long
-              strategy only.
+              Same engine as Agent 1, but <strong>strategy = short_red_spike</strong>: enter short at the next open after
+              a <strong>red-body</strong> spike (same threshold % as live down spikes). R = spike high − spike close; SL
+              and TP follow spike-tpsl shortRedSpike rules. Cumulative % = sum of per-trade price returns.
             </p>
             <div className="backtest1-form agent1-form agent1-sim-modal__form">
               <label className="backtest1-field">
@@ -910,7 +844,7 @@ export function Agent1() {
               >
                 Cancel
               </button>
-              <button type="button" className="backtest1-btn" onClick={runAgent1Simulation} disabled={simRunLoading}>
+              <button type="button" className="backtest1-btn" onClick={runAgent3Simulation} disabled={simRunLoading}>
                 {simRunLoading ? 'Running…' : 'Run simulation'}
               </button>
             </div>
@@ -921,19 +855,10 @@ export function Agent1() {
       <h2 ref={executionRef} className="vol-screener-title agent1-section-title agent1-anchor-target">
         Execution
       </h2>
+      <p className="hourly-spikes-hint" style={{ marginTop: 0, marginBottom: '0.65rem' }}>
+        Agent 3 shorts on <strong>down spikes</strong> only. Execution does not use Agent 1&apos;s EMA regime gate.
+      </p>
       <div className="backtest1-form agent1-form" aria-busy={loading}>
-        <div className="agent1-form-actions" style={{ gridColumn: '1 / -1', paddingTop: 0 }}>
-          <button
-            type="button"
-            className={`backtest1-btn ${emaGateEnabled ? 'backtest1-btn--secondary' : ''}`}
-            onClick={onToggleEmaGate}
-            disabled={loading || saving || emaGateSaving}
-          >
-            {emaGateSaving
-              ? 'Updating EMA gate…'
-              : `EMA gate: ${emaGateEnabled ? 'ON (click to disable)' : 'OFF (click to enable)'}`}
-          </button>
-        </div>
         <label className="backtest1-field">
           <span className="backtest1-label">Trade size (USDT margin)</span>
           <input
@@ -1145,7 +1070,7 @@ export function Agent1() {
         </label>
         <div className="agent1-form-actions">
           <button type="button" className="backtest1-btn" onClick={onSave} disabled={loading || saving}>
-            {saving ? 'Saving…' : 'Save Agent 1 Settings'}
+            {saving ? 'Saving…' : 'Save Agent 3 Settings'}
           </button>
           <button
             type="button"
@@ -1153,8 +1078,8 @@ export function Agent1() {
             onClick={() => {
               loadSpikes()
               loadScanStatus()
-              loadRegime()
               loadExecution()
+              loadAccountMetrics()
             }}
             disabled={spikesLoading}
           >
@@ -1175,7 +1100,7 @@ export function Agent1() {
         ref={tradesRef}
         className="vol-screener-title agent1-section-title agent1-section-title--table agent1-anchor-target"
       >
-        Ongoing trades by Agent 1
+        Ongoing trades (Agent 3 shorts)
       </h2>
       {ongoingTrades.length === 0 ? (
         <p className="hourly-spikes-hint">No ongoing agent trades.</p>
@@ -1244,10 +1169,10 @@ export function Agent1() {
         </>
       )}
 
-      <h3 className="vol-screener-title agent1-section-title">Cumulative net PnL (Agent 1 closes)</h3>
+      <h3 className="vol-screener-title agent1-section-title">Cumulative net PnL (Agent 3 closes)</h3>
       <p className="hourly-spikes-hint">
-        On demand: up to the last <strong>1000</strong> rows in <code>agent1_trades</code> with status closed.
-        Net USDT = realized + commission + funding (same as the table below). Not your full Binance account.
+        On demand: up to the last <strong>1000</strong> rows in <code>agent3_trades</code> with status closed. Net USDT
+        = realized + commission + funding. Not your full Binance account.
       </p>
       <div className="agent1-form-actions" style={{ marginBottom: '0.65rem', flexWrap: 'wrap', gap: '0.5rem' }}>
         <button
@@ -1282,7 +1207,7 @@ export function Agent1() {
       ) : null}
 
       <h2 className="vol-screener-title agent1-section-title agent1-section-title--table">
-        Closed trades by Agent 1
+        Closed trades (Agent 3)
       </h2>
       {closedTrades.length === 0 ? (
         <p className="hourly-spikes-hint">No closed agent trades yet.</p>
@@ -1402,6 +1327,7 @@ export function Agent1() {
                   <th>Symbol</th>
                   <th>Dir</th>
                   <th className="cell-right">Spike %</th>
+                  <th className="cell-right">Spike high</th>
                   <th>Trade taken</th>
                   <th>Execution</th>
                 </tr>
@@ -1417,6 +1343,9 @@ export function Agent1() {
                     <td>{r.direction}</td>
                     <td className="cell-mono cell-right">
                       {r.spike_pct != null ? `${Number(r.spike_pct).toFixed(3)}%` : '—'}
+                    </td>
+                    <td className="cell-mono cell-right">
+                      {r.spike_high != null ? Number(r.spike_high).toFixed(6) : '—'}
                     </td>
                     <td>
                       <label className="backtest1-field" style={{ margin: 0, flexDirection: 'row', gap: 8 }}>
@@ -1480,7 +1409,7 @@ export function Agent1() {
         ref={logsRef}
         className="vol-screener-title agent1-section-title agent1-section-title--table agent1-anchor-target"
       >
-        Agent 1 logs
+        Agent 3 logs
       </h2>
       {logs.length === 0 ? (
         <p className="hourly-spikes-hint">No logs yet.</p>

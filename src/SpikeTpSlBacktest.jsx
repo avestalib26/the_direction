@@ -177,6 +177,10 @@ export function SpikeTpSlBacktest() {
   const [includeOhlcCharts, setIncludeOhlcCharts] = useState(true)
   /** Long only: require next open > EMA(96) on 5m at spike bar (server aligns 5m to main window). */
   const [emaLongFilter96_5m, setEmaLongFilter96_5m] = useState(false)
+  /** Long (incl. retest): require EMA(96) on 5m rising at spike bar vs prior 5m EMA. */
+  const [emaLongSlopePositive96_5m, setEmaLongSlopePositive96_5m] = useState(false)
+  /** Short only: require next open < EMA(96) on 5m at spike bar (server aligns 5m to main window). */
+  const [emaShortFilter96_5m, setEmaShortFilter96_5m] = useState(false)
   /** Long only: allow another same-symbol spike trade even if a prior one is still open. */
   const [allowOverlap, setAllowOverlap] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -191,6 +195,13 @@ export function SpikeTpSlBacktest() {
   const [tpR, setTpR] = useState('2')
 
   const isLongStrategyFamily = strategy === 'long' || strategy === 'longRedSpikeTpHigh'
+  const isLongEmaSlopeStrategy =
+    strategy === 'long' || strategy === 'longRedSpikeTpHigh' || strategy === 'longGreenRetestLow'
+  const isShortStrategyFamily =
+    strategy === 'shortSpikeLow' ||
+    strategy === 'shortRedSpike' ||
+    strategy === 'shortGreenSpike2R' ||
+    strategy === 'shortGreenRetestLow'
   const isFixedTpStrategy =
     strategy === 'longRedSpikeTpHigh' ||
     strategy === 'shortGreenSpike2R' ||
@@ -238,6 +249,10 @@ export function SpikeTpSlBacktest() {
         ...(slAtSpikeOpen ? { slAtSpikeOpen: true } : {}),
         includeChartCandles: includeOhlcCharts,
         ...(emaLongFilter96_5m && isLongStrategyFamily ? { emaLongFilter96_5m: true } : {}),
+        ...(emaLongSlopePositive96_5m && isLongEmaSlopeStrategy
+          ? { emaLongSlopePositive96_5m: true }
+          : {}),
+        ...(emaShortFilter96_5m && isShortStrategyFamily ? { emaShortFilter96_5m: true } : {}),
         ...(allowOverlap && isLongStrategyFamily ? { allowOverlap: true } : {}),
         ...(strategy === 'longGreenRetestLow' && longRetestTpAtSpikeHigh
           ? { longRetestTpAtSpikeHigh: true }
@@ -270,10 +285,14 @@ export function SpikeTpSlBacktest() {
     slAtSpikeOpen,
     includeOhlcCharts,
     emaLongFilter96_5m,
+    emaLongSlopePositive96_5m,
+    emaShortFilter96_5m,
     allowOverlap,
     tpR,
     longRetestTpAtSpikeHigh,
     isLongStrategyFamily,
+    isLongEmaSlopeStrategy,
+    isShortStrategyFamily,
     isFixedTpStrategy,
   ])
 
@@ -283,7 +302,7 @@ export function SpikeTpSlBacktest() {
   }, [tpR])
 
   const s = data?.summary
-  const emaFilterCol = Boolean(data?.emaLongFilterApplied)
+  const emaFilterCol = Boolean(data?.emaFilterApplied ?? data?.emaLongFilterApplied)
 
   const { fast: equityEmaFastNum, slow: equityEmaSlowNum } = useMemo(
     () => normalizeEquityEmaPair(equityEmaFastPeriod, equityEmaSlowPeriod),
@@ -314,6 +333,8 @@ export function SpikeTpSlBacktest() {
   }, [data, equityEmaStatsFilterOn, equityEmaFastNum, equityEmaSlowNum])
   const tpLbl = data?.tpStatLabel ?? 'TP (2R)'
   const slLbl = data?.slStatLabel ?? 'SL (-1R)'
+  const longSide = s?.bySide?.long
+  const shortSide = s?.bySide?.short
 
   return (
     <div className="vol-screener spike-tpsl-bt">
@@ -338,7 +359,7 @@ export function SpikeTpSlBacktest() {
         ) : strategy === 'shortGreenRetestLow' ? (
           <>
             <strong>Green spike retest short</strong>: after a green spike, wait for price to <strong>touch that spike
-            low</strong>, then short at the touch. SL = <strong>spike high</strong>, TP = <strong>1R</strong> below
+            low</strong>, then short at the touch. SL = <strong>spike close</strong>, TP = <strong>1R</strong> below
             entry. If a newer green spike appears before touch, the older setup is dropped.{' '}
           </>
         ) : strategy === 'longGreenRetestLow' ? (
@@ -565,7 +586,7 @@ export function SpikeTpSlBacktest() {
               Short — TP −2R / SL +1R (green spike, fixed)
             </option>
             <option value="shortGreenRetestLow">
-              Short — wait touch spike low, SL spike high, TP 1R (latest spike wins)
+              Short — wait touch spike low, SL spike close, TP 1R (latest spike wins)
             </option>
             <option value="longGreenRetestLow">
               Long — wait touch spike low, SL −1R, TP +{tpRDisplay}R (latest spike wins)
@@ -672,7 +693,35 @@ export function SpikeTpSlBacktest() {
           <span>
             <strong>EMA 96 (5m) long filter</strong> — only take a <strong>long</strong> when the{' '}
             <strong>entry open</strong> is above <strong>EMA(96)</strong> on <strong>5m</strong> at the spike bar
-            (5m series is loaded for the same time window as your main interval). Ignored for short strategies.
+            (5m series is loaded for the same time window as your main interval). Ignored for non-long strategies.
+          </span>
+        </label>
+        <label className="vol-screener-field spike-tpsl-sl-open-toggle">
+          <input
+            type="checkbox"
+            checked={emaLongSlopePositive96_5m}
+            disabled={!isLongEmaSlopeStrategy}
+            onChange={(e) => setEmaLongSlopePositive96_5m(e.target.checked)}
+          />
+          <span>
+            <strong>EMA 96 (5m) long slope</strong> — only take a <strong>long</strong> when{' '}
+            <strong>EMA(96)</strong> on <strong>5m</strong> is <strong>rising</strong> at the spike bar (current 5m
+            EMA &gt; previous 5m EMA). Works with <strong>long</strong>, <strong>long red TP high</strong>, and{' '}
+            <strong>long green retest</strong> (retest uses the touch bar open for the level filter above, when that
+            filter is on).
+          </span>
+        </label>
+        <label className="vol-screener-field spike-tpsl-sl-open-toggle">
+          <input
+            type="checkbox"
+            checked={emaShortFilter96_5m}
+            disabled={!isShortStrategyFamily}
+            onChange={(e) => setEmaShortFilter96_5m(e.target.checked)}
+          />
+          <span>
+            <strong>EMA 96 (5m) short filter</strong> — only take a <strong>short</strong> when the{' '}
+            <strong>entry open</strong> is below <strong>EMA(96)</strong> on <strong>5m</strong> at the spike bar
+            (5m series is loaded for the same time window as your main interval). Ignored for non-short strategies.
           </span>
         </label>
         <label className="vol-screener-field spike-tpsl-sl-open-toggle">
@@ -746,12 +795,20 @@ export function SpikeTpSlBacktest() {
                 · <strong>SL at spike open</strong>
               </>
             ) : null}
-            {data.emaLongFilter96_5m ? (
+            {data.emaLongFilter96_5m || data.emaShortFilter96_5m || data.emaLongSlopePositive96_5m ? (
               <>
                 {' '}
                 ·{' '}
-                <strong>EMA 96 5m filter</strong>
-                {data.emaLongFilterApplied ? ' (on)' : ' (off for non-long)'}
+                <strong>EMA 96 5m</strong>
+                {data.emaFilterApplied
+                  ? (() => {
+                      const bits = []
+                      if (data.emaLongFilterApplied) bits.push('long level')
+                      if (data.emaLongSlopeApplied) bits.push('long slope')
+                      if (data.emaShortFilterApplied) bits.push('short level')
+                      return bits.length ? ` (${bits.join(', ')})` : ' (off for this strategy)'
+                    })()
+                  : ' (off for this strategy)'}
               </>
             ) : null}
             {data.tpR != null && Number.isFinite(data.tpR) ? (
@@ -794,7 +851,7 @@ export function SpikeTpSlBacktest() {
                 <span className="backtest1-stat-label">EOD (last close)</span>
                 <span className="backtest1-stat-value">{fmtInt(s.eodHits)}</span>
               </div>
-              {data.emaLongFilterApplied ? (
+              {data.emaFilterApplied ? (
                 <div className="backtest1-stat">
                   <span className="backtest1-stat-label">Skipped (EMA 96 5m)</span>
                   <span className="backtest1-stat-value">{fmtInt(s.emaFilterSkips ?? 0)}</span>
@@ -821,6 +878,30 @@ export function SpikeTpSlBacktest() {
                 <span className="backtest1-stat-value">
                   {s.winRateTpVsSlPct != null && Number.isFinite(s.winRateTpVsSlPct)
                     ? `${s.winRateTpVsSlPct.toFixed(1)}%`
+                    : '—'}
+                </span>
+              </div>
+              <div className="backtest1-stat">
+                <span className="backtest1-stat-label">Long trades</span>
+                <span className="backtest1-stat-value">{fmtInt(longSide?.totalTrades ?? 0)}</span>
+              </div>
+              <div className="backtest1-stat">
+                <span className="backtest1-stat-label">Long TP / (TP+SL)</span>
+                <span className="backtest1-stat-value">
+                  {longSide?.winRateTpVsSlPct != null && Number.isFinite(longSide.winRateTpVsSlPct)
+                    ? `${longSide.winRateTpVsSlPct.toFixed(1)}%`
+                    : '—'}
+                </span>
+              </div>
+              <div className="backtest1-stat">
+                <span className="backtest1-stat-label">Short trades</span>
+                <span className="backtest1-stat-value">{fmtInt(shortSide?.totalTrades ?? 0)}</span>
+              </div>
+              <div className="backtest1-stat">
+                <span className="backtest1-stat-label">Short TP / (TP+SL)</span>
+                <span className="backtest1-stat-value">
+                  {shortSide?.winRateTpVsSlPct != null && Number.isFinite(shortSide.winRateTpVsSlPct)
+                    ? `${shortSide.winRateTpVsSlPct.toFixed(1)}%`
                     : '—'}
                 </span>
               </div>

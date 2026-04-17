@@ -10,6 +10,7 @@ import { EmotionsErrorBoundary } from './EmotionsErrorBoundary'
 import { MlDatasetPrep } from './MlDatasetPrep'
 import { Agent1 } from './Agent1'
 import { Agent2 } from './Agent2'
+import { Agent3 } from './Agent3'
 import { LongSim5m } from './LongSim5m'
 import { TestPage } from './TestPage'
 import './App.css'
@@ -27,6 +28,7 @@ const APP_VIEWS = new Set([
   'spiketpslv3',
   'agent1',
   'agent2',
+  'agent3',
   'longsim5m',
   'testpage',
 ])
@@ -68,6 +70,8 @@ function App() {
   /** null = loading; master on/off persisted in Supabase (header toggle). */
   const [agent1MasterEnabled, setAgent1MasterEnabled] = useState(null)
   const [agent1MasterSaving, setAgent1MasterSaving] = useState(false)
+  const [agent3MasterEnabled, setAgent3MasterEnabled] = useState(null)
+  const [agent3MasterSaving, setAgent3MasterSaving] = useState(false)
   const [agent2MasterEnabled, setAgent2MasterEnabled] = useState(null)
   const [agent2MasterSaving, setAgent2MasterSaving] = useState(false)
   const [agent2TradingEnabled, setAgent2TradingEnabled] = useState(null)
@@ -133,7 +137,7 @@ function App() {
     if (isBacktestView) setBacktestMenuOpen(true)
   }, [view, isBacktestView])
 
-  const AGENTS_VIEWS = ['agent1', 'agent2', 'longsim5m']
+  const AGENTS_VIEWS = ['agent1', 'agent2', 'agent3', 'longsim5m']
   const isAgentsView = AGENTS_VIEWS.includes(view)
   const [agentsMenuOpen, setAgentsMenuOpen] = useState(isAgentsView)
 
@@ -153,7 +157,27 @@ function App() {
         if (!res.ok) throw new Error(data.error || String(res.status))
         setAgent1MasterEnabled(data.settings?.agentEnabled !== false)
       } catch {
-        if (!cancelled) setAgent1MasterEnabled(true)
+        if (!cancelled) setAgent1MasterEnabled(null)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [view])
+
+  useEffect(() => {
+    if (view !== 'agent3') return
+    let cancelled = false
+    setAgent3MasterEnabled(null)
+    ;(async () => {
+      try {
+        const res = await fetch('/api/agents/agent3/settings', { cache: 'no-store' })
+        const data = await res.json().catch(() => ({}))
+        if (cancelled) return
+        if (!res.ok) throw new Error(data.error || String(res.status))
+        setAgent3MasterEnabled(data.settings?.agentEnabled !== false)
+      } catch {
+        if (!cancelled) setAgent3MasterEnabled(null)
       }
     })()
     return () => {
@@ -227,6 +251,33 @@ function App() {
       setAgent1MasterSaving(false)
     }
   }, [agent1MasterEnabled, agent1MasterSaving])
+
+  const requestAgent3MasterToggle = useCallback(async () => {
+    if (agent3MasterEnabled == null || agent3MasterSaving) return
+    const next = !agent3MasterEnabled
+    const ok = window.confirm(
+      next
+        ? 'Turn Agent 3 ON? Down-spike scans and short execution run when server schedulers are enabled.'
+        : 'Turn Agent 3 OFF? Agent 3 scans and execution stop until you turn it on again.',
+    )
+    if (!ok) return
+    setAgent3MasterSaving(true)
+    try {
+      const res = await fetch('/api/agents/agent3/enabled', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+      setAgent3MasterEnabled(data.settings?.agentEnabled !== false)
+      window.dispatchEvent(new Event('agent3-enabled-changed'))
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'Failed to update Agent 3')
+    } finally {
+      setAgent3MasterSaving(false)
+    }
+  }, [agent3MasterEnabled, agent3MasterSaving])
 
   const requestAgent2MasterToggle = useCallback(async () => {
     if (agent2MasterEnabled == null || agent2MasterSaving) return
@@ -355,7 +406,7 @@ function App() {
   return (
     <div className="layout">
       <header
-        className={`top-bar ${view === 'agent1' || view === 'agent2' || view === 'longsim5m' ? 'top-bar--agent1' : ''}`}
+        className={`top-bar ${view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' ? 'top-bar--agent1' : ''}`}
       >
         <button
           type="button"
@@ -389,6 +440,31 @@ function App() {
                 <span className="agent1-master-toggle__thumb" aria-hidden />
                 <span className="agent1-master-toggle__text">
                   {agent1MasterSaving ? '…' : agent1MasterEnabled ? 'On' : 'Off'}
+                </span>
+              </button>
+            </div>
+          </>
+        )}
+        {view === 'agent3' && (
+          <>
+            <h1 className="top-bar-title">Agent 3</h1>
+            <div className="top-bar-agent1-actions">
+              <button
+                type="button"
+                className={`agent1-master-toggle ${agent3MasterEnabled ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
+                onClick={() => requestAgent3MasterToggle()}
+                disabled={agent3MasterEnabled == null || agent3MasterSaving}
+                aria-pressed={agent3MasterEnabled === true}
+                title={
+                  agent3MasterEnabled
+                    ? 'Agent 3 ON — click to turn OFF'
+                    : 'Agent 3 OFF — click to turn ON'
+                }
+              >
+                <span className="agent1-master-toggle__track" aria-hidden />
+                <span className="agent1-master-toggle__thumb" aria-hidden />
+                <span className="agent1-master-toggle__text">
+                  {agent3MasterSaving ? '…' : agent3MasterEnabled ? 'On' : 'Off'}
                 </span>
               </button>
             </div>
@@ -510,6 +586,18 @@ function App() {
                     }}
                   >
                     Agent 2
+                  </a>
+                </li>
+                <li>
+                  <a
+                    href="#"
+                    className={`menu-link menu-sublink ${view === 'agent3' ? 'menu-link--active' : ''}`}
+                    onClick={(e) => {
+                      e.preventDefault()
+                      go('agent3')
+                    }}
+                  >
+                    Agent 3 (short)
                   </a>
                 </li>
                 <li>
@@ -654,7 +742,7 @@ function App() {
       </nav>
 
       <main
-        className={`app ${view === 'breadth' || view === 'history' || view === 'emotions' || view === 'mldataset' || view === 'the100k' || view === 'gptbacktest' || view === 'spiketpsl' || view === 'spiketpslv3' || view === 'agent1' || view === 'agent2' || view === 'longsim5m' || view === 'testpage' ? 'app--breadth' : ''} ${view === 'agent1' || view === 'agent2' || view === 'longsim5m' ? 'app--agent1' : ''}`}
+        className={`app ${view === 'breadth' || view === 'history' || view === 'emotions' || view === 'mldataset' || view === 'the100k' || view === 'gptbacktest' || view === 'spiketpsl' || view === 'spiketpslv3' || view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' || view === 'testpage' ? 'app--breadth' : ''} ${view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' ? 'app--agent1' : ''}`}
         id="main"
       >
         {view === 'home' && (
@@ -841,6 +929,7 @@ function App() {
         {view === 'spiketpslv3' && <SpikeTpSlBacktestV3 />}
         {view === 'agent1' && <Agent1 />}
         {view === 'agent2' && <Agent2 />}
+        {view === 'agent3' && <Agent3 />}
         {view === 'longsim5m' && <LongSim5m />}
         {view === 'testpage' && <TestPage />}
       </main>

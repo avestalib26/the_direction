@@ -33,6 +33,11 @@ import {
   startAgent1ScanScheduler,
 } from './agent1ScanScheduler.js'
 import {
+  agent3SchedulerState,
+  startAgent3ScanScheduler,
+} from './agent3ScanScheduler.js'
+import { normalizeBinanceAccountId, resolveBinanceCredentials } from './binanceCredentials.js'
+import {
   getAgent1ShadowSimulationPaused,
   getAgent1ShadowSnapshot,
   setAgent1ShadowSimulationPaused,
@@ -90,6 +95,25 @@ const AGENT1_EXECUTION_LOCK_TTL_SEC = Math.min(
 const AGENT1_EXECUTION_WRITER_ID = String(
   process.env.AGENT1_EXECUTION_WRITER_ID ?? `${os.hostname?.() ?? 'host'}:${process.pid}`,
 ).replace(/[^a-zA-Z0-9._:-]/g, '_')
+const AGENT3_EXECUTION_ENABLED = process.env.AGENT3_EXECUTION_ENABLED !== 'false'
+const AGENT3_EXECUTION_POLL_MS = Math.min(
+  120_000,
+  Math.max(5_000, Number.parseInt(String(process.env.AGENT3_EXECUTION_POLL_MS ?? '15000'), 10) || 15_000),
+)
+const AGENT3_EXECUTION_MAX_SPIKES_PER_TICK = Math.min(
+  50,
+  Math.max(1, Number.parseInt(String(process.env.AGENT3_EXECUTION_MAX_SPIKES_PER_TICK ?? '8'), 10) || 8),
+)
+const AGENT3_EXECUTION_MAX_LOGS = 200
+const AGENT3_EXECUTION_SINGLE_WRITER = process.env.AGENT3_EXECUTION_SINGLE_WRITER !== 'false'
+const AGENT3_EXECUTION_LOCK_NAME = String(process.env.AGENT3_EXECUTION_LOCK_NAME ?? 'agent3_execution_main').trim()
+const AGENT3_EXECUTION_LOCK_TTL_SEC = Math.min(
+  600,
+  Math.max(15, Number.parseInt(String(process.env.AGENT3_EXECUTION_LOCK_TTL_SEC ?? '90'), 10) || 90),
+)
+const AGENT3_EXECUTION_WRITER_ID = String(
+  process.env.AGENT3_EXECUTION_WRITER_ID ?? `${os.hostname?.() ?? 'host'}:${process.pid}:a3`,
+).replace(/[^a-zA-Z0-9._:-]/g, '_')
 const AGENT2_EXECUTION_ENABLED = process.env.AGENT2_EXECUTION_ENABLED !== 'false'
 const AGENT2_EXECUTION_POLL_MS = Math.min(
   120_000,
@@ -109,6 +133,7 @@ const AGENT1_SHADOW_WRITER_ID = String(
 const AGENT1_DEFAULT_SETTINGS = Object.freeze({
   agentName: 'agent1',
   tradeSizeUsd: 1,
+  tradeSizeWalletPct: 0,
   leverage: 10,
   marginMode: 'cross',
   maxTpPct: 1.5,
@@ -123,6 +148,28 @@ const AGENT1_DEFAULT_SETTINGS = Object.freeze({
   scanInterval: '5m',
   agentEnabled: true,
   emaGateEnabled: true,
+  binanceAccount: 'master',
+})
+
+const AGENT3_DEFAULT_SETTINGS = Object.freeze({
+  agentName: 'agent3',
+  tradeSizeUsd: 1,
+  tradeSizeWalletPct: 0,
+  leverage: 10,
+  marginMode: 'cross',
+  maxTpPct: 2,
+  maxSlPct: 1.0,
+  maxOpenPositions: 30,
+  scanSecondsBeforeClose: 20,
+  scanThresholdPct: 3,
+  scanMinQuoteVolume: 0,
+  scanMaxSymbols: 800,
+  scanSpikeMetric: 'body',
+  scanDirection: 'down',
+  scanInterval: '5m',
+  agentEnabled: false,
+  emaGateEnabled: false,
+  binanceAccount: 'master',
 })
 
 class BinanceApiError extends Error {
@@ -688,6 +735,7 @@ async function supabaseRest(path, init = {}) {
 let agent1ShadowLeaseOwner = false
 let agent1ShadowLastDbHydrateAt = 0
 let agent1ExecutionLeaseOwner = false
+let agent3ExecutionLeaseOwner = false
 
 function canUseShadowDbCoordination() {
   return AGENT1_SHADOW_SINGLE_WRITER && Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
@@ -697,12 +745,16 @@ function canUseExecutionDbCoordination() {
   return AGENT1_EXECUTION_SINGLE_WRITER && Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
 }
 
-async function tryAcquireAgent1ExecutionLease() {
-  if (!canUseExecutionDbCoordination()) return true
+function canUseAgent3ExecutionDbCoordination() {
+  return AGENT3_EXECUTION_SINGLE_WRITER && Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
+}
+
+async function tryAcquireRuntimeExecutionLease(lockName, writerId, ttlSec, useCoordination) {
+  if (!useCoordination) return true
   const nowIso = new Date().toISOString()
-  const leaseIso = new Date(Date.now() + AGENT1_EXECUTION_LOCK_TTL_SEC * 1000).toISOString()
-  const lockNameEnc = encodeURIComponent(AGENT1_EXECUTION_LOCK_NAME)
-  const orExpr = `(owner_id.eq.${AGENT1_EXECUTION_WRITER_ID},lease_until.lt.${nowIso})`
+  const leaseIso = new Date(Date.now() + ttlSec * 1000).toISOString()
+  const lockNameEnc = encodeURIComponent(lockName)
+  const orExpr = `(owner_id.eq.${writerId},lease_until.lt.${nowIso})`
   const orEnc = encodeURIComponent(orExpr)
 
   const rows = await supabaseRest(
@@ -714,7 +766,7 @@ async function tryAcquireAgent1ExecutionLease() {
         Prefer: 'return=representation',
       },
       body: JSON.stringify({
-        owner_id: AGENT1_EXECUTION_WRITER_ID,
+        owner_id: writerId,
         lease_until: leaseIso,
       }),
     },
@@ -729,8 +781,8 @@ async function tryAcquireAgent1ExecutionLease() {
         Prefer: 'return=representation',
       },
       body: JSON.stringify({
-        lock_name: AGENT1_EXECUTION_LOCK_NAME,
-        owner_id: AGENT1_EXECUTION_WRITER_ID,
+        lock_name: lockName,
+        owner_id: writerId,
         lease_until: leaseIso,
       }),
     })
@@ -740,6 +792,24 @@ async function tryAcquireAgent1ExecutionLease() {
     if (msg.toLowerCase().includes('duplicate key')) return false
     throw e
   }
+}
+
+async function tryAcquireAgent1ExecutionLease() {
+  return tryAcquireRuntimeExecutionLease(
+    AGENT1_EXECUTION_LOCK_NAME,
+    AGENT1_EXECUTION_WRITER_ID,
+    AGENT1_EXECUTION_LOCK_TTL_SEC,
+    canUseExecutionDbCoordination(),
+  )
+}
+
+async function tryAcquireAgent3ExecutionLease() {
+  return tryAcquireRuntimeExecutionLease(
+    AGENT3_EXECUTION_LOCK_NAME,
+    AGENT3_EXECUTION_WRITER_ID,
+    AGENT3_EXECUTION_LOCK_TTL_SEC,
+    canUseAgent3ExecutionDbCoordination(),
+  )
 }
 
 async function tryAcquireAgent1ShadowLease() {
@@ -842,22 +912,23 @@ function parseAgent1Bool(v, defaultVal) {
   return defaultVal
 }
 
-function normalizeAgent1Settings(raw = {}) {
-  const tradeSizeUsd = Number.parseFloat(String(raw.tradeSizeUsd ?? raw.trade_size_usd ?? AGENT1_DEFAULT_SETTINGS.tradeSizeUsd))
-  const leverage = Number.parseInt(String(raw.leverage ?? AGENT1_DEFAULT_SETTINGS.leverage), 10)
-  const marginMode = String(raw.marginMode ?? raw.margin_mode ?? AGENT1_DEFAULT_SETTINGS.marginMode)
+function normalizeAgentSettingsWithDefaults(raw = {}, defaults) {
+  const tradeSizeUsd = Number.parseFloat(String(raw.tradeSizeUsd ?? raw.trade_size_usd ?? defaults.tradeSizeUsd))
+  const tradeSizeWalletPct = Number.parseFloat(
+    String(raw.tradeSizeWalletPct ?? raw.trade_size_wallet_pct ?? defaults.tradeSizeWalletPct),
+  )
+  const leverage = Number.parseInt(String(raw.leverage ?? defaults.leverage), 10)
+  const marginMode = String(raw.marginMode ?? raw.margin_mode ?? defaults.marginMode)
     .trim()
     .toLowerCase()
-  const maxTpPct = Number.parseFloat(String(raw.maxTpPct ?? raw.max_tp_pct ?? AGENT1_DEFAULT_SETTINGS.maxTpPct))
-  const maxSlPct = Number.parseFloat(String(raw.maxSlPct ?? raw.max_sl_pct ?? AGENT1_DEFAULT_SETTINGS.maxSlPct))
+  const maxTpPct = Number.parseFloat(String(raw.maxTpPct ?? raw.max_tp_pct ?? defaults.maxTpPct))
+  const maxSlPct = Number.parseFloat(String(raw.maxSlPct ?? raw.max_sl_pct ?? defaults.maxSlPct))
   const maxOpenPositions = Number.parseInt(
-    String(raw.maxOpenPositions ?? raw.max_open_positions ?? AGENT1_DEFAULT_SETTINGS.maxOpenPositions),
+    String(raw.maxOpenPositions ?? raw.max_open_positions ?? defaults.maxOpenPositions),
     10,
   )
 
-  const scanIntervalRaw = String(
-    raw.scanInterval ?? raw.scan_interval ?? AGENT1_DEFAULT_SETTINGS.scanInterval,
-  ).trim()
+  const scanIntervalRaw = String(raw.scanInterval ?? raw.scan_interval ?? defaults.scanInterval).trim()
   if (!AGENT1_SCAN_INTERVALS.has(scanIntervalRaw)) {
     throw new Error(
       `scanInterval must be one of: ${[...AGENT1_SCAN_INTERVALS].sort().join(', ')}`,
@@ -866,38 +937,37 @@ function normalizeAgent1Settings(raw = {}) {
   const scanInterval = scanIntervalRaw
   const intervalMs = AGENT1_INTERVAL_MS[scanInterval] ?? AGENT1_INTERVAL_MS['5m']
   const scanSecondsBeforeClose = clampScanSecondsBeforeClose(
-    raw.scanSecondsBeforeClose ?? raw.scan_seconds_before_close ?? AGENT1_DEFAULT_SETTINGS.scanSecondsBeforeClose,
+    raw.scanSecondsBeforeClose ?? raw.scan_seconds_before_close ?? defaults.scanSecondsBeforeClose,
     intervalMs,
   )
   const scanThresholdPct = Number.parseFloat(
-    String(raw.scanThresholdPct ?? raw.scan_threshold_pct ?? AGENT1_DEFAULT_SETTINGS.scanThresholdPct),
+    String(raw.scanThresholdPct ?? raw.scan_threshold_pct ?? defaults.scanThresholdPct),
   )
   const scanMinQuoteVolume = Number.parseFloat(
-    String(raw.scanMinQuoteVolume ?? raw.scan_min_quote_volume ?? AGENT1_DEFAULT_SETTINGS.scanMinQuoteVolume),
+    String(raw.scanMinQuoteVolume ?? raw.scan_min_quote_volume ?? defaults.scanMinQuoteVolume),
   )
   const scanMaxSymbols = Number.parseInt(
-    String(raw.scanMaxSymbols ?? raw.scan_max_symbols ?? AGENT1_DEFAULT_SETTINGS.scanMaxSymbols),
+    String(raw.scanMaxSymbols ?? raw.scan_max_symbols ?? defaults.scanMaxSymbols),
     10,
   )
-  const scanSpikeMetric = String(raw.scanSpikeMetric ?? raw.scan_spike_metric ?? AGENT1_DEFAULT_SETTINGS.scanSpikeMetric)
+  const scanSpikeMetric = String(raw.scanSpikeMetric ?? raw.scan_spike_metric ?? defaults.scanSpikeMetric)
     .trim()
     .toLowerCase()
-  const scanDirection = String(raw.scanDirection ?? raw.scan_direction ?? AGENT1_DEFAULT_SETTINGS.scanDirection)
+  const scanDirection = String(raw.scanDirection ?? raw.scan_direction ?? defaults.scanDirection)
     .trim()
     .toLowerCase()
   const agentEnabledRaw = raw.agentEnabled ?? raw.agent_enabled
-  const agentEnabled = parseAgent1Bool(
-    agentEnabledRaw,
-    AGENT1_DEFAULT_SETTINGS.agentEnabled,
-  )
+  const agentEnabled = parseAgent1Bool(agentEnabledRaw, defaults.agentEnabled)
   const emaGateEnabledRaw = raw.emaGateEnabled ?? raw.ema_gate_enabled
-  const emaGateEnabled = parseAgent1Bool(
-    emaGateEnabledRaw,
-    AGENT1_DEFAULT_SETTINGS.emaGateEnabled,
-  )
+  const emaGateEnabled = parseAgent1Bool(emaGateEnabledRaw, defaults.emaGateEnabled)
+  const binanceAccount =
+    normalizeBinanceAccountId(raw.binanceAccount ?? raw.binance_account ?? defaults.binanceAccount) ?? 'master'
 
   if (!Number.isFinite(tradeSizeUsd) || tradeSizeUsd <= 0) {
     throw new Error('tradeSizeUsd must be a positive number')
+  }
+  if (!Number.isFinite(tradeSizeWalletPct) || tradeSizeWalletPct < 0 || tradeSizeWalletPct > 100) {
+    throw new Error('tradeSizeWalletPct must be between 0 and 100')
   }
   if (!Number.isFinite(leverage) || leverage < 1 || leverage > 125) {
     throw new Error('leverage must be between 1 and 125')
@@ -931,8 +1001,9 @@ function normalizeAgent1Settings(raw = {}) {
   }
 
   return {
-    agentName: AGENT1_DEFAULT_SETTINGS.agentName,
+    agentName: defaults.agentName,
     tradeSizeUsd,
+    tradeSizeWalletPct,
     leverage,
     marginMode,
     maxTpPct,
@@ -947,32 +1018,58 @@ function normalizeAgent1Settings(raw = {}) {
     scanInterval,
     agentEnabled,
     emaGateEnabled,
+    binanceAccount,
   }
 }
 
+function normalizeAgent1Settings(raw = {}) {
+  return normalizeAgentSettingsWithDefaults(raw, AGENT1_DEFAULT_SETTINGS)
+}
+
+function normalizeAgent3Settings(raw = {}) {
+  return normalizeAgentSettingsWithDefaults(raw, AGENT3_DEFAULT_SETTINGS)
+}
+
 const AGENT1_SETTINGS_SELECT =
-  'agent_name,trade_size_usd,leverage,margin_mode,max_tp_pct,max_sl_pct,max_open_positions,updated_at,' +
-  'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled'
+  'agent_name,trade_size_usd,trade_size_wallet_pct,leverage,margin_mode,max_tp_pct,max_sl_pct,max_open_positions,updated_at,' +
+  'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled,binance_account'
 const AGENT1_SETTINGS_SELECT_LEGACY =
   'agent_name,trade_size_usd,leverage,margin_mode,max_tp_pct,max_sl_pct,updated_at,' +
   'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled'
 
+const AGENT3_SETTINGS_SELECT =
+  'agent_name,trade_size_usd,trade_size_wallet_pct,leverage,margin_mode,max_tp_pct,max_sl_pct,max_open_positions,updated_at,' +
+  'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled,binance_account'
+
 async function readAgent1Settings() {
-  const p =
-    `/rest/v1/agent_settings?select=${AGENT1_SETTINGS_SELECT}` +
-    '&agent_name=eq.agent1' +
-    '&limit=1'
+  let select = AGENT1_SETTINGS_SELECT
   let rows
-  try {
-    rows = await supabaseRest(p)
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    if (!/max_open_positions/i.test(msg)) throw e
-    const legacyPath =
-      `/rest/v1/agent_settings?select=${AGENT1_SETTINGS_SELECT_LEGACY}` +
-      '&agent_name=eq.agent1' +
-      '&limit=1'
-    rows = await supabaseRest(legacyPath)
+  for (;;) {
+    const p =
+      `/rest/v1/agent_settings?select=${select}` + '&agent_name=eq.agent1' + '&limit=1'
+    try {
+      rows = await supabaseRest(p)
+      break
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (/trade_size_wallet_pct/i.test(msg) && select.includes('trade_size_wallet_pct')) {
+        select = select.replace(',trade_size_wallet_pct', '')
+        continue
+      }
+      if (/binance_account/i.test(msg) && select.includes('binance_account')) {
+        select = select.replace(',binance_account', '')
+        continue
+      }
+      if (/max_open_positions/i.test(msg)) {
+        const legacyPath =
+          `/rest/v1/agent_settings?select=${AGENT1_SETTINGS_SELECT_LEGACY}` +
+          '&agent_name=eq.agent1' +
+          '&limit=1'
+        rows = await supabaseRest(legacyPath)
+        break
+      }
+      throw e
+    }
   }
   if (!Array.isArray(rows) || rows.length === 0) {
     return {
@@ -982,6 +1079,42 @@ async function readAgent1Settings() {
   }
   const row = rows[0]
   const s = normalizeAgent1Settings(row)
+  return {
+    ...s,
+    updatedAt: row.updated_at ?? null,
+  }
+}
+
+async function readAgent3Settings() {
+  let select = AGENT3_SETTINGS_SELECT
+  let rows
+  for (;;) {
+    const p =
+      `/rest/v1/agent_settings?select=${select}` + '&agent_name=eq.agent3' + '&limit=1'
+    try {
+      rows = await supabaseRest(p)
+      break
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (/trade_size_wallet_pct/i.test(msg) && select.includes('trade_size_wallet_pct')) {
+        select = select.replace(',trade_size_wallet_pct', '')
+        continue
+      }
+      if (/binance_account/i.test(msg) && select.includes('binance_account')) {
+        select = select.replace(',binance_account', '')
+        continue
+      }
+      throw e
+    }
+  }
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return {
+      ...AGENT3_DEFAULT_SETTINGS,
+      updatedAt: null,
+    }
+  }
+  const row = rows[0]
+  const s = normalizeAgent3Settings(row)
   return {
     ...s,
     updatedAt: row.updated_at ?? null,
@@ -1008,6 +1141,17 @@ function normalizePositionSideForKey(v) {
 
 function buildAgentTradePositionKey(symbol, positionSide) {
   return `${String(symbol ?? '').toUpperCase()}|${normalizePositionSideForKey(positionSide)}`
+}
+
+/** True if any tracked open position uses this symbol (any side). Fixes one-way vs hedge keys: DB/exchange use BOTH, old check used LONG only. */
+function agent1HasOpenPositionOnSymbol(openKeys, symbol) {
+  const sym = String(symbol ?? '').toUpperCase()
+  if (!sym || !(openKeys instanceof Set) || openKeys.size === 0) return false
+  const prefix = `${sym}|`
+  for (const k of openKeys) {
+    if (typeof k === 'string' && k.startsWith(prefix)) return true
+  }
+  return false
 }
 
 async function fetchAgent1OpenPositionKeys(apiKey, apiSecret) {
@@ -1063,12 +1207,62 @@ async function reconcileAgent1OpenTradesWithExchange(apiKey, apiSecret) {
   return { closedNow }
 }
 
+async function markAgent3TradeRecordClosed(id, closeReason, closeMeta = {}) {
+  const rid = String(id ?? '').trim()
+  if (!rid) return null
+  const rows = await supabaseRest(`/rest/v1/agent3_trades?id=eq.${encodeURIComponent(rid)}&status=eq.open&select=*`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify({
+      status: 'closed',
+      close_reason: String(closeReason ?? 'position_closed').slice(0, 80),
+      closed_at: new Date().toISOString(),
+      realized_pnl_usdt: Number.isFinite(Number(closeMeta?.realized_pnl_usdt))
+        ? Number(closeMeta.realized_pnl_usdt)
+        : null,
+      commission_usdt: Number.isFinite(Number(closeMeta?.commission_usdt))
+        ? Number(closeMeta.commission_usdt)
+        : null,
+      funding_fee_usdt: Number.isFinite(Number(closeMeta?.funding_fee_usdt))
+        ? Number(closeMeta.funding_fee_usdt)
+        : null,
+    }),
+  })
+  return Array.isArray(rows) && rows[0] ? rows[0] : null
+}
+
+async function reconcileAgent3OpenTradesWithExchange(apiKey, apiSecret) {
+  const openTrades = await listAgent3TradeRecords('open', 500)
+  if (openTrades.length === 0) return { closedNow: 0 }
+  const all = await fetchPositionRisk(apiKey, apiSecret)
+  const openRows = Array.isArray(all)
+    ? all.filter((p) => Math.abs(parseFloat(p?.positionAmt ?? '0')) > 0)
+    : []
+  const openKeys = new Set(
+    openRows.map((p) => buildAgentTradePositionKey(p.symbol, p.positionSide)),
+  )
+  let closedNow = 0
+  for (const tr of openTrades) {
+    const key = buildAgentTradePositionKey(tr.symbol, tr.position_side)
+    if (openKeys.has(key)) continue
+    let closeMeta = {}
+    try {
+      closeMeta = await fetchAgentTradeCloseAccounting(apiKey, apiSecret, tr)
+    } catch {
+      closeMeta = {}
+    }
+    const closed = await markAgent3TradeRecordClosed(tr.id, 'position_not_open', closeMeta)
+    if (closed) closedNow += 1
+  }
+  return { closedNow }
+}
+
 async function runAgent1ExecutionTick() {
   if (agent1ExecutionState.running) return
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return
-  const apiKey = process.env.BINANCE_API_KEY
-  const apiSecret = process.env.BINANCE_API_SECRET
-  if (!apiKey || !apiSecret) return
   if (canUseExecutionDbCoordination()) {
     try {
       const owner = await tryAcquireAgent1ExecutionLease()
@@ -1093,6 +1287,12 @@ async function runAgent1ExecutionTick() {
   let placed = 0
   try {
     const settings = await readAgent1Settings()
+    const { apiKey, apiSecret, accountId } = resolveBinanceCredentials(settings.binanceAccount)
+    if (!apiKey || !apiSecret) {
+      agent1ExecutionState.lastError = `Binance API keys missing for account "${accountId}"`
+      pushAgent1ExecutionLog('error', agent1ExecutionState.lastError)
+      return
+    }
     if (!settings.agentEnabled) return
     const fetchCap = Math.min(500, Math.max(50, AGENT1_EXECUTION_MAX_SPIKES_PER_TICK * 25))
     const pendingCandidates = await fetchPendingAgent1Spikes(fetchCap)
@@ -1175,6 +1375,16 @@ async function runAgent1ExecutionTick() {
       )
     }
 
+    let tradeMarginUsd = settings.tradeSizeUsd
+    if (pending.length > 0) {
+      tradeMarginUsd = await resolveAgentTradeMarginUsd(
+        settings,
+        apiKey,
+        apiSecret,
+        pushAgent1ExecutionLog,
+      )
+    }
+
     for (const spike of pending) {
       processed += 1
       const rawSymbol = String(spike?.symbol ?? '')
@@ -1197,8 +1407,7 @@ async function runAgent1ExecutionTick() {
         pushAgent1ExecutionLog('warn', `skip ${symbol}: missing spike_low`)
         continue
       }
-      const key = buildAgentTradePositionKey(symbol, 'LONG')
-      if (openKeys.has(key)) {
+      if (agent1HasOpenPositionOnSymbol(openKeys, symbol)) {
         await markAgent1SpikeSkipped(spike.id, 'long already open')
         pushAgent1ExecutionLog('info', `skip ${symbol}: long already open`)
         continue
@@ -1223,7 +1432,7 @@ async function runAgent1ExecutionTick() {
             apiSecret,
             symbolRaw: symbol,
             sideRaw: 'BUY',
-            tradeSizeUsdRaw: settings.tradeSizeUsd,
+            tradeSizeUsdRaw: tradeMarginUsd,
             leverageRaw: settings.leverage,
             marginModeRaw: settings.marginMode,
             tpPctRaw: settings.maxTpPct,
@@ -1327,11 +1536,244 @@ async function runAgent1ExecutionTick() {
   }
 }
 
+async function runAgent3ExecutionTick() {
+  if (agent3ExecutionState.running) return
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return
+  if (canUseAgent3ExecutionDbCoordination()) {
+    try {
+      const owner = await tryAcquireAgent3ExecutionLease()
+      agent3ExecutionLeaseOwner = owner
+      agent3ExecutionState.leaseOwner = owner
+      if (!owner) return
+    } catch (e) {
+      agent3ExecutionLeaseOwner = false
+      agent3ExecutionState.leaseOwner = false
+      const msg = e instanceof Error ? e.message : String(e)
+      agent3ExecutionState.lastError = `lease error: ${msg}`
+      pushAgent3ExecutionLog('error', `lease error: ${msg}`)
+      return
+    }
+  } else {
+    agent3ExecutionLeaseOwner = true
+    agent3ExecutionState.leaseOwner = true
+  }
+  agent3ExecutionState.running = true
+  agent3ExecutionState.lastError = null
+  let processed = 0
+  let placed = 0
+  try {
+    const settings = await readAgent3Settings()
+    const { apiKey, apiSecret, accountId } = resolveBinanceCredentials(settings.binanceAccount)
+    if (!apiKey || !apiSecret) {
+      agent3ExecutionState.lastError = `Binance API keys missing for account "${accountId}"`
+      pushAgent3ExecutionLog('error', agent3ExecutionState.lastError)
+      return
+    }
+    if (!settings.agentEnabled) return
+    const fetchCap = Math.min(500, Math.max(50, AGENT3_EXECUTION_MAX_SPIKES_PER_TICK * 25))
+    const pendingCandidates = await fetchPendingAgent3Spikes(fetchCap)
+    const pending = []
+    for (const spike of pendingCandidates) {
+      if (pending.length >= AGENT3_EXECUTION_MAX_SPIKES_PER_TICK) break
+      const symbol = String(spike?.symbol ?? '').toUpperCase()
+      if (isAgent3SpikeStale(spike, settings.scanInterval)) {
+        const spikeIdRaw = Number(spike?.id)
+        const logKey = Number.isFinite(spikeIdRaw)
+          ? `spike:${Math.trunc(spikeIdRaw)}`
+          : `${symbol}:${String(spike?.candle_open_time_ms ?? '')}`
+        if (!agent3StaleSpikeLogIds.has(logKey)) {
+          pushAgent3ExecutionLog('info', `skip ${symbol || 'UNKNOWN'}: stale spike`)
+          agent3StaleSpikeLogIds.add(logKey)
+          if (agent3StaleSpikeLogIds.size > 5000) {
+            agent3StaleSpikeLogIds.clear()
+          }
+        }
+        continue
+      }
+      pending.push(spike)
+    }
+
+    const openTrades = await listAgent3TradeRecords('open', 500)
+    const openKeys = new Set(
+      openTrades.map((t) => buildAgentTradePositionKey(t.symbol, t.position_side)),
+    )
+    try {
+      const exchangeOpenKeys = await fetchAgent1OpenPositionKeys(apiKey, apiSecret)
+      for (const k of exchangeOpenKeys) openKeys.add(k)
+    } catch (e) {
+      pushAgent3ExecutionLog(
+        'warn',
+        `open-position sync failed: ${e instanceof Error ? e.message : String(e)}`,
+      )
+    }
+
+    let tradeMarginUsd = settings.tradeSizeUsd
+    if (pending.length > 0) {
+      tradeMarginUsd = await resolveAgentTradeMarginUsd(
+        settings,
+        apiKey,
+        apiSecret,
+        pushAgent3ExecutionLog,
+      )
+    }
+
+    for (const spike of pending) {
+      processed += 1
+      const rawSymbol = String(spike?.symbol ?? '')
+      const symbol = normalizeUsdtFuturesSymbol(rawSymbol, { allowMissingSuffix: false })
+      const direction = String(spike?.direction ?? '').toLowerCase()
+      if (!symbol) {
+        const bad = String(rawSymbol ?? '').trim() || 'UNKNOWN'
+        await markAgent3SpikeSkipped(spike.id, 'invalid symbol format')
+        pushAgent3ExecutionLog('warn', `skip ${bad}: invalid symbol format`)
+        continue
+      }
+      if (direction !== 'down') {
+        await markAgent3SpikeSkipped(spike.id, `direction ${direction}`)
+        pushAgent3ExecutionLog('info', `skip ${symbol}: direction ${direction}`)
+        continue
+      }
+      const spikeHighRaw = Number.parseFloat(String(spike?.spike_high ?? ''))
+      if (!Number.isFinite(spikeHighRaw) || spikeHighRaw <= 0) {
+        await markAgent3SpikeSkipped(spike.id, 'missing spike_high')
+        pushAgent3ExecutionLog('warn', `skip ${symbol}: missing spike_high`)
+        continue
+      }
+      if (agent1HasOpenPositionOnSymbol(openKeys, symbol)) {
+        await markAgent3SpikeSkipped(spike.id, 'position already open on symbol')
+        pushAgent3ExecutionLog('info', `skip ${symbol}: position already open on symbol`)
+        continue
+      }
+      if (openKeys.size >= settings.maxOpenPositions) {
+        await markAgent3SpikeSkipped(spike.id, `max open positions reached (${settings.maxOpenPositions})`)
+        pushAgent3ExecutionLog(
+          'warn',
+          `skip ${symbol}: max open positions reached (${settings.maxOpenPositions})`,
+        )
+        continue
+      }
+      let placedOut = null
+      let lastErrMsg = ''
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          if (attempt === 2) {
+            pushAgent3ExecutionLog('warn', `retry ${symbol}: placement attempt 2/2`)
+          }
+          placedOut = await placeFuturesOrderWithProtection({
+            apiKey,
+            apiSecret,
+            symbolRaw: symbol,
+            sideRaw: 'SELL',
+            tradeSizeUsdRaw: tradeMarginUsd,
+            leverageRaw: settings.leverage,
+            marginModeRaw: settings.marginMode,
+            tpPctRaw: settings.maxTpPct,
+            slPctRaw: settings.maxSlPct,
+            spikeHighPriceRaw: spike?.spike_high,
+            debug: false,
+          })
+          break
+        } catch (e) {
+          lastErrMsg = e instanceof Error ? e.message : String(e)
+          const criticalProtectionFailure = /position should be flat/i.test(lastErrMsg)
+          if (criticalProtectionFailure) {
+            pushAgent3ExecutionLog(
+              'error',
+              `critical ${symbol}: ${lastErrMsg} (retry blocked to avoid stacked exposure)`,
+            )
+            try {
+              const exchangeOpenKeys = await fetchAgent1OpenPositionKeys(apiKey, apiSecret)
+              for (const k of exchangeOpenKeys) openKeys.add(k)
+            } catch {
+              // best-effort sync only
+            }
+            break
+          }
+          if (attempt === 1) {
+            pushAgent3ExecutionLog('warn', `failed ${symbol}: ${lastErrMsg} (retrying once now)`)
+          }
+        }
+      }
+      if (!placedOut) {
+        await markAgent3SpikeSkipped(
+          spike.id,
+          lastErrMsg ? `placement failed: ${lastErrMsg}` : 'placement failed after retry',
+        )
+        pushAgent3ExecutionLog('error', `failed ${symbol}: ${lastErrMsg} (skipped after retry)`)
+        continue
+      }
+      try {
+        const saved = await insertAgent3TradeRecord({
+          spike_id: spike.id,
+          symbol: placedOut.symbol,
+          side: placedOut.side,
+          position_side: placedOut.positionSide,
+          status: 'open',
+          requested_leverage: placedOut.requestedLeverage,
+          applied_leverage: placedOut.appliedLeverage,
+          trade_size_usd: placedOut.tradeSizeUsd,
+          quantity: Number(placedOut.quantity),
+          entry_order_id: placedOut.entryOrder?.orderId ?? null,
+          tp_algo_id: placedOut.tpOrder?.algoId ?? null,
+          sl_algo_id: placedOut.slOrder?.algoId ?? null,
+          entry_price: placedOut.entryPrice,
+          warnings: Array.isArray(placedOut.warnings)
+            ? placedOut.warnings.join(' | ').slice(0, 500)
+            : null,
+          opened_at: new Date().toISOString(),
+        })
+        if (!saved) {
+          await markAgent3SpikeTradeTaken(spike.id)
+          pushAgent3ExecutionLog(
+            'error',
+            `placed ${placedOut.symbol} but DB row missing — spike marked taken to avoid duplicate orders`,
+          )
+        } else {
+          await markAgent3SpikeTradeTaken(spike.id)
+          openKeys.add(buildAgentTradePositionKey(placedOut.symbol, placedOut.positionSide))
+          placed += 1
+          pushAgent3ExecutionLog(
+            'info',
+            `placed short ${placedOut.symbol} lev ${placedOut.appliedLeverage}x qty ${placedOut.quantity}`,
+          )
+          const caps = Array.isArray(placedOut.warnings)
+            ? placedOut.warnings.filter((w) => /capped by setting/i.test(String(w)))
+            : []
+          for (const msg of caps.slice(0, 2)) {
+            pushAgent3ExecutionLog('warn', `${placedOut.symbol}: ${msg}`)
+          }
+        }
+      } catch (e) {
+        await markAgent3SpikeTradeTaken(spike.id)
+        pushAgent3ExecutionLog(
+          'error',
+          `placed ${placedOut.symbol} but record save failed — spike marked taken to avoid duplicate: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        )
+      }
+    }
+    const rec = await reconcileAgent3OpenTradesWithExchange(apiKey, apiSecret)
+    if (rec.closedNow > 0) {
+      pushAgent3ExecutionLog('info', `closed detected: ${rec.closedNow}`)
+    }
+  } catch (e) {
+    agent3ExecutionState.lastError = e instanceof Error ? e.message : String(e)
+    pushAgent3ExecutionLog('error', `tick error: ${agent3ExecutionState.lastError}`)
+  } finally {
+    agent3ExecutionState.lastRunAt = Date.now()
+    agent3ExecutionState.lastProcessed = processed
+    agent3ExecutionState.lastPlaced = placed
+    agent3ExecutionState.running = false
+  }
+}
+
 async function upsertAgent1Settings(input) {
   const s = normalizeAgent1Settings(input)
   const body = {
     agent_name: s.agentName,
     trade_size_usd: s.tradeSizeUsd,
+    trade_size_wallet_pct: s.tradeSizeWalletPct,
     leverage: s.leverage,
     margin_mode: s.marginMode,
     max_tp_pct: s.maxTpPct,
@@ -1346,28 +1788,101 @@ async function upsertAgent1Settings(input) {
     scan_interval: s.scanInterval,
     agent_enabled: s.agentEnabled,
     ema_gate_enabled: s.emaGateEnabled,
+    binance_account: s.binanceAccount,
   }
+  let bodyToSend = { ...body }
   let rows
-  try {
-    rows = await supabaseRest('/rest/v1/agent_settings?on_conflict=agent_name&select=*', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Prefer: 'resolution=merge-duplicates,return=representation',
-      },
-      body: JSON.stringify(body),
-    })
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    if (/max_open_positions/i.test(msg)) {
-      throw new Error(
-        'maxOpenPositions requires DB migration. Run supabase/agent_settings_alter_agent1.sql (or supabase/agent_settings.sql) and retry.',
-      )
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      rows = await supabaseRest('/rest/v1/agent_settings?on_conflict=agent_name&select=*', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates,return=representation',
+        },
+        body: JSON.stringify(bodyToSend),
+      })
+      break
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (/max_open_positions/i.test(msg)) {
+        throw new Error(
+          'maxOpenPositions requires DB migration. Run supabase/agent_settings_alter_agent1.sql (or supabase/agent_settings.sql) and retry.',
+        )
+      }
+      if (/trade_size_wallet_pct/i.test(msg) && Object.hasOwn(bodyToSend, 'trade_size_wallet_pct')) {
+        const { trade_size_wallet_pct: _w, ...rest } = bodyToSend
+        bodyToSend = rest
+        continue
+      }
+      if (/binance_account/i.test(msg) && Object.hasOwn(bodyToSend, 'binance_account')) {
+        const { binance_account: _b, ...rest } = bodyToSend
+        bodyToSend = rest
+        continue
+      }
+      throw e
     }
-    throw e
   }
   const row = Array.isArray(rows) && rows[0] ? rows[0] : body
   const out = normalizeAgent1Settings(row)
+  return {
+    ...out,
+    updatedAt: row.updated_at ?? null,
+  }
+}
+
+async function upsertAgent3Settings(input) {
+  const s = normalizeAgent3Settings(input)
+  const body = {
+    agent_name: 'agent3',
+    trade_size_usd: s.tradeSizeUsd,
+    trade_size_wallet_pct: s.tradeSizeWalletPct,
+    leverage: s.leverage,
+    margin_mode: s.marginMode,
+    max_tp_pct: s.maxTpPct,
+    max_sl_pct: s.maxSlPct,
+    max_open_positions: s.maxOpenPositions,
+    scan_seconds_before_close: s.scanSecondsBeforeClose,
+    scan_threshold_pct: s.scanThresholdPct,
+    scan_min_quote_volume: s.scanMinQuoteVolume,
+    scan_max_symbols: s.scanMaxSymbols,
+    scan_spike_metric: s.scanSpikeMetric,
+    scan_direction: s.scanDirection,
+    scan_interval: s.scanInterval,
+    agent_enabled: s.agentEnabled,
+    ema_gate_enabled: s.emaGateEnabled,
+    binance_account: s.binanceAccount,
+  }
+  let bodyToSend = { ...body }
+  let rows
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      rows = await supabaseRest('/rest/v1/agent_settings?on_conflict=agent_name&select=*', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates,return=representation',
+        },
+        body: JSON.stringify(bodyToSend),
+      })
+      break
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (/trade_size_wallet_pct/i.test(msg) && Object.hasOwn(bodyToSend, 'trade_size_wallet_pct')) {
+        const { trade_size_wallet_pct: _w, ...rest } = bodyToSend
+        bodyToSend = rest
+        continue
+      }
+      if (/binance_account/i.test(msg) && Object.hasOwn(bodyToSend, 'binance_account')) {
+        const { binance_account: _b, ...rest } = bodyToSend
+        bodyToSend = rest
+        continue
+      }
+      throw e
+    }
+  }
+  const row = Array.isArray(rows) && rows[0] ? rows[0] : body
+  const out = normalizeAgent3Settings(row)
   return {
     ...out,
     updatedAt: row.updated_at ?? null,
@@ -1417,6 +1932,47 @@ async function persistAgent1ScanResult(scanResult) {
   return { spikeCount: rows.length }
 }
 
+async function persistAgent3ScanResult(scanResult) {
+  const events = (scanResult.spikeEventsChronological ?? []).filter((ev) => (ev?.direction ?? '') === 'down')
+  if (events.length === 0) {
+    return { spikeCount: 0 }
+  }
+  const scanRunAt = new Date().toISOString()
+  const volMap = new Map()
+  for (const r of scanResult.rows ?? []) {
+    if (r?.symbol != null && r.quoteVolume24h != null) {
+      volMap.set(r.symbol, r.quoteVolume24h)
+    }
+  }
+  const rows = []
+  for (const ev of events) {
+    const symbol = normalizeUsdtFuturesSymbol(ev?.symbol, { allowMissingSuffix: false })
+    if (!symbol) continue
+    rows.push({
+      candle_open_time_ms: ev.openTime,
+      symbol,
+      direction: 'down',
+      spike_pct: ev.spikePct,
+      spike_low: Number.isFinite(Number(ev?.spikeLow)) ? Number(ev.spikeLow) : null,
+      spike_high: Number.isFinite(Number(ev?.spikeHigh)) ? Number(ev.spikeHigh) : null,
+      quote_volume_24h: volMap.get(ev.symbol) ?? null,
+      scan_run_at: scanRunAt,
+    })
+  }
+  if (rows.length === 0) {
+    return { spikeCount: 0 }
+  }
+  await supabaseRest('/rest/v1/agent3_spikes?on_conflict=candle_open_time_ms,symbol,direction', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=merge-duplicates,return=minimal',
+    },
+    body: JSON.stringify(rows),
+  })
+  return { spikeCount: rows.length }
+}
+
 const agent1ExecutionState = {
   running: false,
   lastRunAt: null,
@@ -1426,13 +1982,26 @@ const agent1ExecutionState = {
   lastGateBlockAt: null,
   leaseOwner: false,
 }
+
+const agent3ExecutionState = {
+  running: false,
+  lastRunAt: null,
+  lastError: null,
+  lastProcessed: 0,
+  lastPlaced: 0,
+  leaseOwner: false,
+}
+
 let agent1LastGateState = 'unknown'
 const agent1BlockedRegimeSpikeLogIds = new Set()
 const agent1StaleSpikeLogIds = new Set()
+const agent3StaleSpikeLogIds = new Set()
 const agent1CloseAccountingCursorByKey = new Map()
 
 /** @type {Array<{at: string, level: 'info'|'warn'|'error', msg: string}>} */
 const agent1ExecutionLogs = []
+/** @type {Array<{at: string, level: 'info'|'warn'|'error', msg: string}>} */
+const agent3ExecutionLogs = []
 
 async function insertAgent1ExecutionLogRow(row) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return
@@ -1457,6 +2026,47 @@ async function listAgent1ExecutionLogRows(limit = 100) {
     `/rest/v1/agent1_execution_logs?select=*&order=logged_at.desc&limit=${n}`,
   )
   return Array.isArray(rows) ? rows : []
+}
+
+async function insertAgent3ExecutionLogRow(row) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null
+  const at = row?.at ? new Date(row.at) : new Date()
+  const payload = {
+    logged_at: at.toISOString(),
+    level: row?.level === 'error' || row?.level === 'warn' ? row.level : 'info',
+    message: String(row?.msg ?? '').slice(0, 240),
+  }
+  const rows = await supabaseRest('/rest/v1/agent3_execution_logs?select=*', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify(payload),
+  })
+  return Array.isArray(rows) && rows[0] ? rows[0] : null
+}
+
+async function listAgent3ExecutionLogRows(limit = 100) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return []
+  const n = Math.min(500, Math.max(1, Math.floor(limit) || 100))
+  const rows = await supabaseRest(
+    `/rest/v1/agent3_execution_logs?select=*&order=logged_at.desc&limit=${n}`,
+  )
+  return Array.isArray(rows) ? rows : []
+}
+
+function pushAgent3ExecutionLog(level, msg) {
+  const row = {
+    at: new Date().toISOString(),
+    level,
+    msg: String(msg ?? '').slice(0, 240),
+  }
+  agent3ExecutionLogs.push(row)
+  if (agent3ExecutionLogs.length > AGENT3_EXECUTION_MAX_LOGS) {
+    agent3ExecutionLogs.splice(0, agent3ExecutionLogs.length - AGENT3_EXECUTION_MAX_LOGS)
+  }
+  void insertAgent3ExecutionLogRow(row).catch(() => {})
 }
 
 function pushAgent1ExecutionLog(level, msg) {
@@ -1546,6 +2156,103 @@ async function listAgent1TradeRecords(status, limit = 100) {
   const statusPart = status ? `&status=eq.${encodeURIComponent(status)}` : ''
   const rows = await supabaseRest(
     `/rest/v1/agent1_trades?select=*&order=opened_at.desc&limit=${n}${statusPart}`,
+  )
+  return Array.isArray(rows) ? rows : []
+}
+
+/** Net USDT for one closed row — same formula as Agent1 closed-trades table. */
+function agent1ClosedTradeNetPnlUsdt(row) {
+  const r = Number(row?.realized_pnl_usdt)
+  const c = Number(row?.commission_usdt)
+  const f = Number(row?.funding_fee_usdt)
+  const realized = Number.isFinite(r) ? r : 0
+  const commission = Number.isFinite(c) ? c : 0
+  const funding = Number.isFinite(f) ? f : 0
+  return realized + commission + funding
+}
+
+/** Most recently closed rows first; caller sorts chronologically for cumulative curve. */
+async function listAgent1ClosedTradesForPnlCurve(limit = 1000) {
+  const n = Math.min(1000, Math.max(1, Math.floor(limit) || 1000))
+  const rows = await supabaseRest(
+    `/rest/v1/agent1_trades?select=id,symbol,opened_at,closed_at,realized_pnl_usdt,commission_usdt,funding_fee_usdt&status=eq.closed&order=closed_at.desc&limit=${n}`,
+  )
+  if (!Array.isArray(rows)) return []
+  return rows.filter((r) => r && r.closed_at)
+}
+
+async function fetchPendingAgent3Spikes(limit = AGENT3_EXECUTION_MAX_SPIKES_PER_TICK) {
+  const n = Math.min(500, Math.max(1, Math.floor(limit) || AGENT3_EXECUTION_MAX_SPIKES_PER_TICK))
+  const rows = await supabaseRest(
+    `/rest/v1/agent3_spikes?select=*&trade_taken=eq.false&execution_skipped=eq.false&order=created_at.desc&limit=${n}`,
+  )
+  return Array.isArray(rows) ? rows : []
+}
+
+function isAgent3SpikeStale(spike, scanInterval) {
+  const openMs = Number.parseInt(String(spike?.candle_open_time_ms ?? ''), 10)
+  if (!Number.isFinite(openMs) || openMs <= 0) return false
+  const intervalMs = AGENT1_INTERVAL_MS[scanInterval] ?? AGENT1_INTERVAL_MS['5m']
+  const envMaxAge = Number.parseInt(String(process.env.AGENT3_EXECUTION_MAX_SPIKE_AGE_MS ?? ''), 10)
+  const maxAgeMs = Number.isFinite(envMaxAge) && envMaxAge > 0
+    ? envMaxAge
+    : intervalMs + 120_000
+  const ageMs = Date.now() - openMs
+  return ageMs > maxAgeMs
+}
+
+async function markAgent3SpikeTradeTaken(spikeId) {
+  const id = String(spikeId ?? '').trim()
+  if (!SPIKE_ROW_UUID_RE.test(id)) return false
+  const rows = await supabaseRest(`/rest/v1/agent3_spikes?id=eq.${id}&trade_taken=eq.false&select=*`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify({ trade_taken: true, execution_skipped: false, skip_reason: null }),
+  })
+  return Array.isArray(rows) && rows.length > 0
+}
+
+async function markAgent3SpikeSkipped(spikeId, reason) {
+  const id = String(spikeId ?? '').trim()
+  if (!SPIKE_ROW_UUID_RE.test(id)) return false
+  const msg = String(reason ?? '').trim().slice(0, 480)
+  const rows = await supabaseRest(
+    `/rest/v1/agent3_spikes?id=eq.${id}&trade_taken=eq.false&execution_skipped=eq.false&select=*`,
+    {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify({
+        execution_skipped: true,
+        skip_reason: msg || 'skipped',
+      }),
+    },
+  )
+  return Array.isArray(rows) && rows.length > 0
+}
+
+async function insertAgent3TradeRecord(payload) {
+  const rows = await supabaseRest('/rest/v1/agent3_trades?select=*', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify(payload),
+  })
+  return Array.isArray(rows) && rows[0] ? rows[0] : null
+}
+
+async function listAgent3TradeRecords(status, limit = 100) {
+  const n = Math.min(500, Math.max(1, Math.floor(limit) || 100))
+  const statusPart = status ? `&status=eq.${encodeURIComponent(status)}` : ''
+  const rows = await supabaseRest(
+    `/rest/v1/agent3_trades?select=*&order=opened_at.desc&limit=${n}${statusPart}`,
   )
   return Array.isArray(rows) ? rows : []
 }
@@ -1755,6 +2462,7 @@ async function placeFuturesOrderWithProtection({
   tpPctRaw,
   slPctRaw,
   spikeLowPriceRaw,
+  spikeHighPriceRaw,
   debug = false,
 }) {
   const symbol = normalizeUsdtFuturesSymbol(symbolRaw, { allowMissingSuffix: true })
@@ -1784,6 +2492,7 @@ async function placeFuturesOrderWithProtection({
   if (!Number.isFinite(tpPct) || tpPct <= 0) throw new Error('tpPct must be a positive number')
   if (!Number.isFinite(slPct) || slPct <= 0) throw new Error('slPct must be a positive number')
   const spikeLowPrice = toNum(spikeLowPriceRaw)
+  const spikeHighPrice = toNum(spikeHighPriceRaw)
 
   const timeline = []
   const addDebug = (step, data = {}) => {
@@ -1858,6 +2567,15 @@ async function placeFuturesOrderWithProtection({
         `Invalid spike_low ${spikeLowPrice} for ${symbol}: must be below market ${markPrice.toFixed(8)} before entry`,
       )
     }
+  } else if (side === 'SELL') {
+    if (!Number.isFinite(spikeHighPrice) || spikeHighPrice <= 0) {
+      throw new Error('Missing spike_high for SELL trade')
+    }
+    if (spikeHighPrice <= markPrice) {
+      throw new Error(
+        `Invalid spike_high ${spikeHighPrice} for ${symbol}: must be above market ${markPrice.toFixed(8)} before entry`,
+      )
+    }
   }
 
   const effectiveNotionalUsd = tradeSizeUsd * appliedLeverage
@@ -1927,6 +2645,38 @@ async function placeFuturesOrderWithProtection({
       }
       throw new Error(
         `Spike low ${spikeLowPrice} is not below entry ${entryPrice} for ${symbol}; position flattened if possible.`,
+      )
+    }
+  }
+  if (side === 'SELL' && Number.isFinite(spikeHighPrice) && spikeHighPrice > 0) {
+    const calcSlPct = ((spikeHighPrice - entryPrice) / entryPrice) * 100
+    if (Number.isFinite(calcSlPct) && calcSlPct > 0) {
+      effectiveSlPct = Math.min(calcSlPct, slPct)
+      const rawTpPct = effectiveSlPct * 2
+      effectiveTpPct = Math.min(rawTpPct, tpPct)
+      if (calcSlPct > slPct) {
+        warnings.push(`SL capped by setting: calc ${calcSlPct.toFixed(3)}% -> max ${slPct.toFixed(3)}%`)
+      }
+      if (rawTpPct > tpPct) {
+        warnings.push(`TP capped by setting: calc ${rawTpPct.toFixed(3)}% -> max ${tpPct.toFixed(3)}%`)
+      }
+    } else {
+      try {
+        await closeFuturesMarketReduceOnlyBestEffort({
+          apiKey,
+          apiSecret,
+          symbol,
+          entrySide: side,
+          entryPositionSide,
+          isHedgeMode,
+          spec,
+          fallbackQuantityStr: quantity,
+        })
+      } catch (e) {
+        warnings.push(`Emergency flatten failed (spike_high not above entry): ${e instanceof Error ? e.message : String(e)}`)
+      }
+      throw new Error(
+        `Spike high ${spikeHighPrice} is not above entry ${entryPrice} for ${symbol}; position flattened if possible.`,
       )
     }
   }
@@ -2093,6 +2843,7 @@ async function placeFuturesOrderWithProtection({
     effectiveTpPct,
     effectiveSlPct,
     spikeLowPrice,
+    spikeHighPrice,
     tpPrice,
     slPrice,
     entryOrder,
@@ -2137,6 +2888,60 @@ async function getFuturesUsdtWalletTotal(apiKey, apiSecret) {
     }
   }
   return Number.isFinite(top) ? top : 0
+}
+
+/**
+ * Margin used per order: fixed tradeSizeUsd, or wallet × tradeSizeWalletPct/100 when pct > 0.
+ * @returns {{ marginUsd: number, usesPctSizing: boolean }}
+ */
+function computeAgentTradeMarginUsdFromWallet(settings, walletUsdt, pushLog) {
+  const fixed = Number(settings.tradeSizeUsd)
+  const pct = Number(settings.tradeSizeWalletPct)
+  const log = typeof pushLog === 'function' ? pushLog : () => {}
+  if (!Number.isFinite(fixed) || fixed <= 0) {
+    throw new Error('tradeSizeUsd must be a positive number')
+  }
+  if (!Number.isFinite(pct) || pct <= 0) {
+    return { marginUsd: fixed, usesPctSizing: false }
+  }
+  const wallet = Number(walletUsdt)
+  if (!Number.isFinite(wallet) || wallet <= 0) {
+    log('warn', 'Trade size %: futures USDT wallet unavailable; using fixed USDT margin')
+    return { marginUsd: fixed, usesPctSizing: false }
+  }
+  const fromPct = (wallet * pct) / 100
+  if (!Number.isFinite(fromPct) || fromPct < 0.01) {
+    log(
+      'warn',
+      `Trade size %: computed margin ${fromPct.toFixed(4)} USDT is below minimum; using fixed USDT margin`,
+    )
+    return { marginUsd: fixed, usesPctSizing: false }
+  }
+  log(
+    'info',
+    `Trade size %: using ${fromPct.toFixed(4)} USDT margin (${pct}% of ${wallet.toFixed(2)} USDT wallet)`,
+  )
+  return { marginUsd: fromPct, usesPctSizing: true }
+}
+
+/** When tradeSizeWalletPct > 0, margin = wallet × pct/100; otherwise fixed tradeSizeUsd. */
+async function resolveAgentTradeMarginUsd(settings, apiKey, apiSecret, pushLog) {
+  const fixed = Number(settings.tradeSizeUsd)
+  const pct = Number(settings.tradeSizeWalletPct)
+  if (!Number.isFinite(fixed) || fixed <= 0) {
+    throw new Error('tradeSizeUsd must be a positive number')
+  }
+  if (!Number.isFinite(pct) || pct <= 0) {
+    return fixed
+  }
+  try {
+    const wallet = await getFuturesUsdtWalletTotal(apiKey, apiSecret)
+    return computeAgentTradeMarginUsdFromWallet(settings, wallet, pushLog).marginUsd
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    pushLog?.('warn', `Trade size %: ${msg}; using fixed USDT margin`)
+    return fixed
+  }
 }
 
 /** Spot wallet USDT (free + locked), excluding futures & funding wallets. */
@@ -2390,6 +3195,55 @@ app.get('/api/agents/agent1/regime', async (_req, res) => {
   }
 })
 
+/**
+ * Cumulative net PnL (USDT) over the last N Agent 1 closed rows (DB only — not whole Binance account).
+ * Query: limit ≤ 1000 (default 1000). On-demand; not polled by the execution bundle.
+ */
+app.get('/api/agents/agent1/closed-trades-pnl-curve', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const limRaw = req.query?.limit
+    const limitRequested = Math.min(1000, Math.max(1, parseInt(String(limRaw ?? '1000'), 10) || 1000))
+    const raw = await listAgent1ClosedTradesForPnlCurve(limitRequested)
+    const chrono = [...raw].sort((a, b) => {
+      const da = new Date(a.closed_at).getTime()
+      const db = new Date(b.closed_at).getTime()
+      if (da !== db) return da - db
+      return String(a.id ?? '').localeCompare(String(b.id ?? ''))
+    })
+    let cum = 0
+    const points = []
+    for (const r of chrono) {
+      const net = agent1ClosedTradeNetPnlUsdt(r)
+      cum += net
+      points.push({
+        id: r.id,
+        symbol: r.symbol,
+        openedAt: r.opened_at ?? null,
+        closedAt: r.closed_at,
+        netPnlUsdt: net,
+        cumPnlUsdt: cum,
+      })
+    }
+    res.json({
+      tradesInCurve: chrono.length,
+      limitRequested,
+      points,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to load Agent 1 closed PnL curve',
+    })
+  }
+})
+
 app.get('/api/agents/agent1/execution', async (_req, res) => {
   try {
     const regimeSnap = getAgent1ShadowSnapshot()?.regime ?? null
@@ -2410,8 +3264,15 @@ app.get('/api/agents/agent1/execution', async (_req, res) => {
     }
 
     let openPositionMap = new Map()
-    const apiKey = process.env.BINANCE_API_KEY
-    const apiSecret = process.env.BINANCE_API_SECRET
+    let a1Settings = AGENT1_DEFAULT_SETTINGS
+    try {
+      if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+        a1Settings = await readAgent1Settings()
+      }
+    } catch {
+      a1Settings = AGENT1_DEFAULT_SETTINGS
+    }
+    const { apiKey, apiSecret } = resolveBinanceCredentials(a1Settings.binanceAccount)
     if (apiKey && apiSecret) {
       try {
         const all = await fetchPositionRisk(apiKey, apiSecret)
@@ -2446,6 +3307,394 @@ app.get('/api/agents/agent1/execution', async (_req, res) => {
   } catch (e) {
     res.status(500).json({
       error: e instanceof Error ? e.message : 'Failed to load agent1 execution state',
+    })
+  }
+})
+
+/** Futures wallet + open-position unrealized PnL for the Agent 1 `binance_account` setting. */
+app.get('/api/agents/agent1/account-metrics', async (_req, res) => {
+  try {
+    let settings = AGENT1_DEFAULT_SETTINGS
+    try {
+      settings = await readAgent1Settings()
+    } catch {
+      settings = AGENT1_DEFAULT_SETTINGS
+    }
+    const { apiKey, apiSecret, accountId } = resolveBinanceCredentials(settings.binanceAccount)
+    if (!apiKey || !apiSecret) {
+      return res.status(503).json({
+        error: `Binance API keys not configured for account "${accountId}"`,
+      })
+    }
+    const [futuresWalletUsdt, risk] = await Promise.all([
+      getFuturesUsdtWalletTotal(apiKey, apiSecret),
+      fetchPositionRisk(apiKey, apiSecret),
+    ])
+    const rows = Array.isArray(risk) ? risk : []
+    const open = rows.filter((p) => Math.abs(parseFloat(String(p?.positionAmt ?? '0'))) > 0)
+    let unrealizedPnlUsdt = 0
+    for (const p of open) {
+      const u = parseFloat(String(p?.unRealizedProfit ?? ''))
+      if (Number.isFinite(u)) unrealizedPnlUsdt += u
+    }
+    const { marginUsd: tradeMarginUsd, usesPctSizing: tradeMarginUsesPctSizing } =
+      computeAgentTradeMarginUsdFromWallet(settings, futuresWalletUsdt, () => {})
+    const pct = Number(settings.tradeSizeWalletPct)
+    const fixedUsd = Number(settings.tradeSizeUsd)
+    const tradeMarginDetail =
+      !Number.isFinite(pct) || pct <= 0
+        ? 'Fixed margin'
+        : tradeMarginUsesPctSizing
+          ? `${pct}% of USDT-M wallet`
+          : `Using fixed ${Number.isFinite(fixedUsd) ? fixedUsd.toFixed(2) : '—'} USDT (pct sizing unavailable)`
+    res.json({
+      binanceAccount: accountId,
+      futuresWalletUsdt,
+      openPositionCount: open.length,
+      unrealizedPnlUsdt,
+      tradeSizeUsd: settings.tradeSizeUsd,
+      tradeSizeWalletPct: settings.tradeSizeWalletPct,
+      tradeMarginUsd,
+      tradeMarginUsesPctSizing,
+      tradeMarginDetail,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to load futures account metrics',
+    })
+  }
+})
+
+/** Futures wallet + sizing preview for Agent 3 `binance_account` (same shape as Agent 1). */
+app.get('/api/agents/agent3/account-metrics', async (_req, res) => {
+  try {
+    let settings = AGENT3_DEFAULT_SETTINGS
+    try {
+      settings = await readAgent3Settings()
+    } catch {
+      settings = AGENT3_DEFAULT_SETTINGS
+    }
+    const { apiKey, apiSecret, accountId } = resolveBinanceCredentials(settings.binanceAccount)
+    if (!apiKey || !apiSecret) {
+      return res.status(503).json({
+        error: `Binance API keys not configured for account "${accountId}"`,
+      })
+    }
+    const [futuresWalletUsdt, risk] = await Promise.all([
+      getFuturesUsdtWalletTotal(apiKey, apiSecret),
+      fetchPositionRisk(apiKey, apiSecret),
+    ])
+    const rows = Array.isArray(risk) ? risk : []
+    const open = rows.filter((p) => Math.abs(parseFloat(String(p?.positionAmt ?? '0'))) > 0)
+    let unrealizedPnlUsdt = 0
+    for (const p of open) {
+      const u = parseFloat(String(p?.unRealizedProfit ?? ''))
+      if (Number.isFinite(u)) unrealizedPnlUsdt += u
+    }
+    const { marginUsd: tradeMarginUsd, usesPctSizing: tradeMarginUsesPctSizing } =
+      computeAgentTradeMarginUsdFromWallet(settings, futuresWalletUsdt, () => {})
+    const pct = Number(settings.tradeSizeWalletPct)
+    const fixedUsd = Number(settings.tradeSizeUsd)
+    const tradeMarginDetail =
+      !Number.isFinite(pct) || pct <= 0
+        ? 'Fixed margin'
+        : tradeMarginUsesPctSizing
+          ? `${pct}% of USDT-M wallet`
+          : `Using fixed ${Number.isFinite(fixedUsd) ? fixedUsd.toFixed(2) : '—'} USDT (pct sizing unavailable)`
+    res.json({
+      binanceAccount: accountId,
+      futuresWalletUsdt,
+      openPositionCount: open.length,
+      unrealizedPnlUsdt,
+      tradeSizeUsd: settings.tradeSizeUsd,
+      tradeSizeWalletPct: settings.tradeSizeWalletPct,
+      tradeMarginUsd,
+      tradeMarginUsesPctSizing,
+      tradeMarginDetail,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to load futures account metrics',
+    })
+  }
+})
+
+/**
+ * Cumulative net PnL (USDT) over the last N Agent 3 closed rows (`agent3_trades` only).
+ */
+app.get('/api/agents/agent3/closed-trades-pnl-curve', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const limRaw = req.query?.limit
+    const limitRequested = Math.min(1000, Math.max(1, parseInt(String(limRaw ?? '1000'), 10) || 1000))
+    const n = Math.min(1000, Math.max(1, Math.floor(limitRequested) || 1000))
+    const rows = await supabaseRest(
+      `/rest/v1/agent3_trades?select=id,symbol,opened_at,closed_at,realized_pnl_usdt,commission_usdt,funding_fee_usdt&status=eq.closed&order=closed_at.desc&limit=${n}`,
+    )
+    const raw = Array.isArray(rows) ? rows.filter((r) => r && r.closed_at) : []
+    const chrono = [...raw].sort((a, b) => {
+      const da = new Date(a.closed_at).getTime()
+      const db = new Date(b.closed_at).getTime()
+      if (da !== db) return da - db
+      return String(a.id ?? '').localeCompare(String(b.id ?? ''))
+    })
+    let cum = 0
+    const points = []
+    for (const r of chrono) {
+      const net = agent1ClosedTradeNetPnlUsdt(r)
+      cum += net
+      points.push({
+        id: r.id,
+        symbol: r.symbol,
+        openedAt: r.opened_at ?? null,
+        closedAt: r.closed_at,
+        netPnlUsdt: net,
+        cumPnlUsdt: cum,
+      })
+    }
+    res.json({
+      tradesInCurve: chrono.length,
+      limitRequested,
+      points,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to load Agent 3 closed PnL curve',
+    })
+  }
+})
+
+app.get('/api/agents/agent3/settings', async (_req, res) => {
+  try {
+    const settings = await readAgent3Settings()
+    return res.json({ settings, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to load Agent 3 settings',
+    })
+  }
+})
+
+app.put('/api/agents/agent3/settings', async (req, res) => {
+  try {
+    const body = req.body ?? {}
+    const current = await readAgent3Settings()
+    const merged = { ...current, ...body }
+    if (typeof body.agentEnabled !== 'boolean') {
+      merged.agentEnabled = current.agentEnabled
+    }
+    if (typeof body.scanInterval !== 'string' && typeof body.scan_interval !== 'string') {
+      merged.scanInterval = current.scanInterval
+    }
+    const { updatedAt: _u, ...forUpsert } = merged
+    const settings = await upsertAgent3Settings(forUpsert)
+    return res.json({ ok: true, settings, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    if (e instanceof Error && /must be/i.test(e.message)) {
+      return res.status(400).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to save Agent 3 settings',
+    })
+  }
+})
+
+app.patch('/api/agents/agent3/enabled', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    if (typeof req.body?.enabled !== 'boolean') {
+      return res.status(400).json({ error: 'JSON body must include enabled: boolean' })
+    }
+    const current = await readAgent3Settings()
+    const { updatedAt: _upd, ...rest } = current
+    const settings = await upsertAgent3Settings({
+      ...rest,
+      agentEnabled: req.body.enabled,
+    })
+    return res.json({ ok: true, settings, fetchedAt: new Date().toISOString() })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to update Agent 3 enabled flag',
+    })
+  }
+})
+
+app.get('/api/agents/agent3/scan-status', async (_req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const st = agent3SchedulerState
+    const settings = await readAgent3Settings()
+    const enabled =
+      Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) &&
+      process.env.AGENT3_SCAN_SCHEDULER !== 'false'
+    return res.json({
+      schedulerEnabled: enabled,
+      agentEnabled: settings.agentEnabled,
+      scanInterval: settings.scanInterval,
+      nextFireAt: st.nextFireAt,
+      nextFireAtIso: st.nextFireAt != null ? new Date(st.nextFireAt).toISOString() : null,
+      lastRunAt: st.lastRunAt,
+      lastRunAtIso: st.lastRunAt != null ? new Date(st.lastRunAt).toISOString() : null,
+      lastSpikeCount: st.lastSpikeCount,
+      lastError: st.lastError,
+      running: st.running,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    console.error(e)
+    return res.status(500).json({ error: 'agent3 scan-status failed' })
+  }
+})
+
+app.get('/api/agents/agent3/spikes', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const limitRaw = Number.parseInt(String(req.query.limit ?? '200'), 10)
+    const limit = Math.min(200, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 200))
+    const rows = await supabaseRest(
+      `/rest/v1/agent3_spikes?select=*&order=created_at.desc&limit=${limit}`,
+    )
+    return res.json({
+      spikes: Array.isArray(rows) ? rows : [],
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to load spikes',
+    })
+  }
+})
+
+app.patch('/api/agents/agent3/spikes/:id', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const id = String(req.params.id ?? '').trim()
+    if (!SPIKE_ROW_UUID_RE.test(id)) {
+      return res.status(400).json({ error: 'Invalid spike id' })
+    }
+    if (typeof req.body?.tradeTaken !== 'boolean') {
+      return res.status(400).json({ error: 'Body must include tradeTaken: boolean' })
+    }
+    const taken = req.body.tradeTaken === true
+    const patchBody = taken
+      ? { trade_taken: true, execution_skipped: false, skip_reason: null }
+      : { trade_taken: false, execution_skipped: false, skip_reason: null }
+    const rows = await supabaseRest(`/rest/v1/agent3_spikes?id=eq.${id}&select=*`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify(patchBody),
+    })
+    const row = Array.isArray(rows) && rows[0] ? rows[0] : null
+    if (!row) {
+      return res.status(404).json({ error: 'Spike not found' })
+    }
+    return res.json({ ok: true, spike: row })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to update spike',
+    })
+  }
+})
+
+app.get('/api/agents/agent3/execution', async (_req, res) => {
+  try {
+    let openTrades = []
+    let closedTrades = []
+    let logs = agent3ExecutionLogs.slice(-100).reverse()
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      openTrades = await listAgent3TradeRecords('open', 100)
+      closedTrades = await listAgent3TradeRecords('closed', 100)
+      const dbLogs = await listAgent3ExecutionLogRows(100)
+      if (dbLogs.length > 0) {
+        logs = dbLogs.map((r) => ({
+          at: r.logged_at ?? r.created_at ?? null,
+          level: r.level ?? 'info',
+          msg: r.message ?? '',
+        }))
+      }
+    }
+    let openPositionMap = new Map()
+    let a3Settings = AGENT3_DEFAULT_SETTINGS
+    try {
+      if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+        a3Settings = await readAgent3Settings()
+      }
+    } catch {
+      a3Settings = AGENT3_DEFAULT_SETTINGS
+    }
+    const { apiKey, apiSecret } = resolveBinanceCredentials(a3Settings.binanceAccount)
+    if (apiKey && apiSecret) {
+      try {
+        const all = await fetchPositionRisk(apiKey, apiSecret)
+        const openRows = Array.isArray(all)
+          ? all.filter((p) => Math.abs(parseFloat(p?.positionAmt ?? '0')) > 0)
+          : []
+        openPositionMap = new Map(
+          openRows.map((r) => [buildAgentTradePositionKey(r.symbol, r.positionSide), r]),
+        )
+      } catch {
+        // keep DB-only view if Binance call fails
+      }
+    }
+    const ongoing = openTrades.map((t) => {
+      const row = openPositionMap.get(buildAgentTradePositionKey(t.symbol, t.position_side))
+      return {
+        ...t,
+        positionAmt: row?.positionAmt ?? null,
+        markPrice: row?.markPrice ?? null,
+        unRealizedProfit: row?.unRealizedProfit ?? null,
+      }
+    })
+    res.json({
+      state: agent3ExecutionState,
+      logs,
+      ongoingTrades: ongoing,
+      closedTrades,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    res.status(500).json({
+      error: e instanceof Error ? e.message : 'Failed to load agent3 execution state',
     })
   }
 })
@@ -3171,7 +4420,7 @@ app.get('/api/binance/spike-filter', async (req, res) => {
   }
 })
 
-/** Public: volume-filtered universe, green-body spikes — long 2R/1R or short (TP spike low, SL 2R). */
+/** Public: volume-filtered universe — long 2R/1R on green spikes; short = red-body spike short (shortRedSpike); use short_spike_low for green-spike short (TP spike low). */
 app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
   const minQuoteVolume24h = Number.parseFloat(String(req.query.minQuoteVolume24h ?? '1000000'))
   if (!Number.isFinite(minQuoteVolume24h) || minQuoteVolume24h < 0) {
@@ -3199,7 +4448,8 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
   const s = strategyRaw.toLowerCase().replace(/-/g, '_')
   let strategy
   if (s === 'long') strategy = 'long'
-  else if (s === 'short' || s === 'short_spike_low' || s === 'shortspikelow') strategy = 'shortSpikeLow'
+  else if (s === 'short') strategy = 'shortRedSpike'
+  else if (s === 'short_spike_low' || s === 'shortspikelow') strategy = 'shortSpikeLow'
   else if (
     s === 'shortgreenspike2r' ||
     s === 'short_green_spike_2r' ||
@@ -3246,7 +4496,7 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
   } else {
     return res.status(400).json({
       error:
-        'strategy must be long, longRedSpikeTpHigh / long_red_spike_tp_high, longGreenRetestLow / long_green_retest_low, shortSpikeLow, shortGreenSpike2R / short_long_spike, shortGreenRetestLow / short_green_retest_low, shortRedSpike / negative_spike, or regimeFlipEma50',
+        'strategy must be long, longRedSpikeTpHigh / long_red_spike_tp_high, longGreenRetestLow / long_green_retest_low, short (red-body spike → shortRedSpike), short_spike_low (green spike TP spike low), shortGreenSpike2R / short_long_spike, shortGreenRetestLow / short_green_retest_low, shortRedSpike / negative_spike, or regimeFlipEma50',
     })
   }
 
@@ -3287,6 +4537,10 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
     String(req.query.includeChartCandles ?? 'true').toLowerCase() !== 'false'
   const emaLongFilter96_5m =
     String(req.query.emaLongFilter96_5m ?? '').toLowerCase() === 'true'
+  const emaLongSlopePositive96_5m =
+    String(req.query.emaLongSlopePositive96_5m ?? '').toLowerCase() === 'true'
+  const emaShortFilter96_5m =
+    String(req.query.emaShortFilter96_5m ?? '').toLowerCase() === 'true'
   const allowOverlap = String(req.query.allowOverlap ?? '').toLowerCase() === 'true'
 
   const tpRQ = req.query.tpR
@@ -3319,6 +4573,8 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
       allowOverlap,
       includeChartCandles,
       emaLongFilter96_5m,
+      emaLongSlopePositive96_5m,
+      emaShortFilter96_5m,
       ...(tpROpt != null ? { tpR: tpROpt } : {}),
       ...(longRetestTpAtSpikeHigh ? { longRetestTpAtSpikeHigh: true } : {}),
     })
@@ -3349,7 +4605,8 @@ app.get('/api/binance/spike-tpsl-backtest-v3', async (req, res) => {
   const s = strategyRaw.toLowerCase().replace(/-/g, '_')
   let strategy
   if (s === 'long') strategy = 'long'
-  else if (s === 'short' || s === 'short_spike_low' || s === 'shortspikelow') strategy = 'shortSpikeLow'
+  else if (s === 'short') strategy = 'shortRedSpike'
+  else if (s === 'short_spike_low' || s === 'shortspikelow') strategy = 'shortSpikeLow'
   else if (
     s === 'short_red_spike' ||
     s === 'shortredspike' ||
@@ -3360,7 +4617,7 @@ app.get('/api/binance/spike-tpsl-backtest-v3', async (req, res) => {
   } else {
     return res.status(400).json({
       error:
-        'strategy must be long, shortSpikeLow (green spike: TP spike low), or shortRedSpike / negative_spike (red spike: short 2R/1R)',
+        'strategy must be long, short (red-body spike → short 2R/1R), short_spike_low (green spike: TP spike low), or shortRedSpike / negative_spike (same as short)',
     })
   }
 
@@ -3509,6 +4766,16 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && process.env.AGENT1_SCAN_SCHEDUL
   })
 }
 
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && process.env.AGENT3_SCAN_SCHEDULER !== 'false') {
+  startAgent3ScanScheduler({
+    futuresBase: FUTURES_BASE,
+    isEnabled: () => true,
+    readSettings: readAgent3Settings,
+    persistScan: persistAgent3ScanResult,
+    logger: console,
+  })
+}
+
 if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && process.env.AGENT2_SCAN_SCHEDULER !== 'false') {
   startAgent2ScanScheduler({ futuresBase: FUTURES_BASE, logger: console })
 }
@@ -3531,6 +4798,14 @@ if (AGENT1_EXECUTION_ENABLED) {
   }, AGENT1_EXECUTION_POLL_MS)
   pushAgent1ExecutionLog('info', `execution loop started (${AGENT1_EXECUTION_POLL_MS}ms poll)`)
   void runAgent1ExecutionTick()
+}
+
+if (AGENT3_EXECUTION_ENABLED) {
+  setInterval(() => {
+    void runAgent3ExecutionTick()
+  }, AGENT3_EXECUTION_POLL_MS)
+  pushAgent3ExecutionLog('info', `execution loop started (${AGENT3_EXECUTION_POLL_MS}ms poll)`)
+  void runAgent3ExecutionTick()
 }
 
 if (process.env.AGENT1_SHADOW_SCHEDULER !== 'false') {

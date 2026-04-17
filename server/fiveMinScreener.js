@@ -236,6 +236,7 @@ export async function computeFiveMinScreener(futuresBase, {
               direction,
               spikePct: wickPct,
               spikeLow: Number.isFinite(c.low) ? c.low : null,
+              spikeHigh: Number.isFinite(c.high) ? c.high : null,
               nextCandlePct: nextPct,
             })
           }

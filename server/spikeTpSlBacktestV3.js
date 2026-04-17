@@ -634,6 +634,7 @@ export async function computeSpikeTpSlBacktestV3(futuresBase, opts) {
     .toLowerCase()
   let strat = 'long'
   if (sNorm === 'shortspikelow' || sNorm === 'short_spike_low') strat = 'shortSpikeLow'
+  else if (sNorm === 'short') strat = 'shortRedSpike'
   else if (
     sNorm === 'shortredspike' ||
     sNorm === 'short_red_spike' ||

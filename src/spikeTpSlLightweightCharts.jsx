@@ -116,7 +116,7 @@ const COL_BTC = '#f0b90b'
 const COL_EMA_FAST = '#38bdf8'
 const COL_EMA_SLOW = '#f59e0b'
 
-export function SpikeTpSlEquityLightChart({ points }) {
+export function SpikeTpSlEquityLightChart({ points, showFootnote = true }) {
   const containerRef = useRef(null)
   const lineData = useMemo(() => equityToLineData(points), [points])
   const btcData = useMemo(() => btcOverlayLineData(points), [points])
@@ -200,16 +200,18 @@ export function SpikeTpSlEquityLightChart({ points }) {
   return (
     <div className="spike-tpsl-lw-host">
       <div ref={containerRef} className="spike-tpsl-lw-chart" />
-      <p className="hourly-spikes-hint spike-tpsl-lw-axis-hint">
-        <strong>TradingView Lightweight Charts</strong> — time axis is synthetic (one step per trade #).
-        <strong> Right axis</strong>: cumulative Σ price %.
-        {btcData && btcData.length >= 2 ? (
-          <>
-            {' '}
-            <strong>Left axis</strong>: BTCUSDT close at each trade&apos;s entry bar (same interval as backtest).
-          </>
-        ) : null}
-      </p>
+      {showFootnote ? (
+        <p className="hourly-spikes-hint spike-tpsl-lw-axis-hint">
+          <strong>TradingView Lightweight Charts</strong> — time axis is synthetic (one step per trade #).
+          <strong> Right axis</strong>: cumulative Σ price %.
+          {btcData && btcData.length >= 2 ? (
+            <>
+              {' '}
+              <strong>Left axis</strong>: BTCUSDT close at each trade&apos;s entry bar (same interval as backtest).
+            </>
+          ) : null}
+        </p>
+      ) : null}
     </div>
   )
 }
@@ -323,6 +325,9 @@ export function SpikeTpSlPerTradeCandleLightChart({
   serverSubsampled,
   emaFastPeriod = 10,
   emaSlowPeriod = 50,
+  showFooterHint = true,
+  /** `pnlFromZero` = same cumulative Σ price % axis as the equity line chart; `stack100` = 100 + Σ (legacy). */
+  cumulativePnlScale = 'stack100',
 }) {
   const containerRef = useRef(null)
   const { fast: emaFastSafe, slow: emaSlowSafe } = normalizeEquityEmaPair(emaFastPeriod, emaSlowPeriod)
@@ -336,7 +341,8 @@ export function SpikeTpSlPerTradeCandleLightChart({
     if (!pack.rows.length) return null
     const used = new Set()
     const rows = []
-    let level = EQUITY_STACK_BASE
+    const base = cumulativePnlScale === 'pnlFromZero' ? 0 : EQUITY_STACK_BASE
+    let level = base
     for (let i = 0; i < pack.rows.length; i++) {
       const pct = Number(pack.rows[i].pct)
       const p = Number.isFinite(pct) ? pct : 0
@@ -356,7 +362,7 @@ export function SpikeTpSlPerTradeCandleLightChart({
       rows.push({ time: t, open, high, low, close })
     }
     return rows.length > 0 ? rows : null
-  }, [pack.rows])
+  }, [pack.rows, cumulativePnlScale])
 
   const emaFastData = useMemo(() => {
     if (!candleData) return null
@@ -412,7 +418,9 @@ export function SpikeTpSlPerTradeCandleLightChart({
       },
       localization: {
         priceFormatter: (p) =>
-          Number(p).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 }),
+          cumulativePnlScale === 'pnlFromZero'
+            ? `${Number(p).toFixed(2)}%`
+            : Number(p).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 }),
       },
     })
 
@@ -457,7 +465,7 @@ export function SpikeTpSlPerTradeCandleLightChart({
       ro.disconnect()
       chart.remove()
     }
-  }, [candleData, emaFastData, emaSlowData, emaFastSafe, emaSlowSafe])
+  }, [candleData, emaFastData, emaSlowData, emaFastSafe, emaSlowSafe, cumulativePnlScale])
 
   if (!candleData) {
     return (
@@ -483,14 +491,132 @@ export function SpikeTpSlPerTradeCandleLightChart({
         </p>
       )}
       <div ref={containerRef} className="spike-tpsl-lw-chart spike-tpsl-pertrade-candle-chart" />
-      <p className="hourly-spikes-hint spike-tpsl-lw-axis-hint">
-        <strong>TradingView Lightweight Charts</strong> — <strong>stacked equity</strong> (starts at{' '}
-        {EQUITY_STACK_BASE}): each candle body is that trade&apos;s P&amp;L % added to the running total (no
-        wicks). <strong style={{ color: COL_EMA_FAST }}>EMA {emaFastSafe}</strong> (fast) and{' '}
-        <strong style={{ color: COL_EMA_SLOW }}>EMA {emaSlowSafe}</strong> (slow) on cumulative close. Filtered
-        stats use <strong>fast &gt; slow</strong> before each trade. Time = trade order (synthetic). Full run:{' '}
-        <strong>{fmtInt(fullN)}</strong> trades.
-      </p>
+      {showFooterHint ? (
+        <p className="hourly-spikes-hint spike-tpsl-lw-axis-hint">
+          <strong>TradingView Lightweight Charts</strong> —{' '}
+          {cumulativePnlScale === 'pnlFromZero' ? (
+            <>
+              <strong>cumulative Σ price %</strong> (same scale as the equity line): each candle body is one
+              trade&apos;s return added to the running total (no wicks).
+            </>
+          ) : (
+            <>
+              <strong>stacked equity</strong> (starts at {EQUITY_STACK_BASE}): each candle body is that trade&apos;s
+              P&amp;L % added to the running total (no wicks).
+            </>
+          )}{' '}
+          <strong style={{ color: COL_EMA_FAST }}>EMA {emaFastSafe}</strong> (fast) and{' '}
+          <strong style={{ color: COL_EMA_SLOW }}>EMA {emaSlowSafe}</strong> (slow) on cumulative close. Filtered
+          stats use <strong>fast &gt; slow</strong> before each trade. Time = trade order (synthetic). Full run:{' '}
+          <strong>{fmtInt(fullN)}</strong> trades.
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+function candlestickRowsFromOpenTimeApi(candles) {
+  if (!Array.isArray(candles) || candles.length === 0) return null
+  const used = new Set()
+  return candles.map((c) => {
+    let t = Math.floor(Number(c.openTime) / 1000)
+    if (!Number.isFinite(t)) t = 0
+    while (used.has(t)) t += 1
+    used.add(t)
+    return {
+      time: t,
+      open: Number(c.open),
+      high: Number(c.high),
+      low: Number(c.low),
+      close: Number(c.close),
+    }
+  })
+}
+
+/**
+ * OHLC candlesticks + EMA on close (TradingView Lightweight Charts). `candles`: API rows with openTime ms.
+ */
+export function BtcOhlcEmaChart({ candles, emaPeriod = 50 }) {
+  const containerRef = useRef(null)
+  const candleData = useMemo(() => candlestickRowsFromOpenTimeApi(candles), [candles])
+  const emaLineData = useMemo(() => {
+    if (!candleData?.length || !Number.isFinite(emaPeriod) || emaPeriod < 2) return null
+    const closes = candleData.map((c) => c.close)
+    const emaArr = computeEmaOnSeries(closes, emaPeriod)
+    const out = []
+    for (let i = 0; i < candleData.length; i++) {
+      const v = emaArr[i]
+      if (v == null || !Number.isFinite(v)) continue
+      out.push({ time: candleData[i].time, value: v })
+    }
+    return out.length >= 2 ? out : null
+  }, [candleData, emaPeriod])
+
+  useLayoutEffect(() => {
+    const el = containerRef.current
+    if (!el || !candleData?.length) return undefined
+
+    const chart = createChart(el, {
+      layout: {
+        background: { type: ColorType.Solid, color: COL_BG },
+        textColor: COL_TEXT,
+        fontFamily: 'system-ui, Segoe UI, sans-serif',
+      },
+      grid: {
+        vertLines: { color: COL_GRID },
+        horzLines: { color: COL_GRID },
+      },
+      width: el.clientWidth,
+      height: 300,
+      timeScale: {
+        borderColor: COL_GRID,
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      rightPriceScale: {
+        borderColor: COL_GRID,
+        scaleMargins: { top: 0.08, bottom: 0.08 },
+      },
+    })
+
+    const candleSeries = chart.addSeries(CandlestickSeries, {
+      upColor: COL_POS,
+      downColor: COL_NEG,
+      borderVisible: false,
+      wickUpColor: COL_POS,
+      wickDownColor: COL_NEG,
+    })
+    candleSeries.setData(candleData)
+
+    if (emaLineData && emaLineData.length >= 2) {
+      const lineSeries = chart.addSeries(LineSeries, {
+        color: COL_EMA_SLOW,
+        lineWidth: 2,
+        priceLineVisible: false,
+        lastValueVisible: true,
+      })
+      lineSeries.setData(emaLineData)
+    }
+
+    chart.timeScale().fitContent()
+
+    const ro = new ResizeObserver(() => {
+      if (el.isConnected) chart.applyOptions({ width: el.clientWidth })
+    })
+    ro.observe(el)
+    return () => {
+      ro.disconnect()
+      chart.remove()
+    }
+  }, [candleData, emaLineData])
+
+  if (!candleData?.length) {
+    return <p className="hourly-spikes-hint">No OHLC series (enable chart candles on the run).</p>
+  }
+
+  return (
+    <div className="spike-tpsl-lw-host">
+      <div ref={containerRef} className="spike-tpsl-lw-chart" />
     </div>
   )
 }
