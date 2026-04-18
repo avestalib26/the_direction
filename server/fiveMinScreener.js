@@ -3,6 +3,7 @@ import {
   acquireFuturesRestWeight,
   futuresKlinesRequestWeight,
 } from './binanceFuturesRestThrottle.js'
+import { agent1IntervalMs, computeKlinesEndTimeMs } from './agent1ScanIntervals.js'
 
 async function fetchJson(url) {
   const res = await fetch(url)
@@ -46,13 +47,16 @@ function parseKlines(data) {
   }))
 }
 
-async function fetchKlines(futuresBase, symbol, interval, limit) {
+async function fetchKlines(futuresBase, symbol, interval, limit, endTimeMs = null) {
   await acquireFuturesRestWeight(futuresKlinesRequestWeight(limit))
   const q = new URLSearchParams({
     symbol,
     interval,
     limit: String(limit),
   })
+  if (endTimeMs != null && Number.isFinite(endTimeMs) && endTimeMs > 0) {
+    q.set('endTime', String(Math.floor(endTimeMs)))
+  }
   const data = await fetchJson(`${futuresBase}/fapi/v1/klines?${q}`)
   return parseKlines(data)
 }
@@ -151,6 +155,8 @@ export async function computeFiveMinScreener(futuresBase, {
   spikeDirections = 'up',
   spikeMetric = 'body',
   maxSymbols: maxSymbolsOpt,
+  /** Aligns klines `endTime` with scheduled scan (agent settings). Omit to use default 20s clamp. */
+  scanSecondsBeforeClose,
 }) {
   const dir =
     typeof spikeDirections === 'string' && SPIKE_DIRECTIONS.has(spikeDirections)
@@ -177,6 +183,12 @@ export async function computeFiveMinScreener(futuresBase, {
   const selected = filtered.slice(0, maxSymbols)
 
   const intervalMinutes = intervalToMinutes(interval)
+  const intervalMs = agent1IntervalMs(interval)
+  const scanT0 = Date.now()
+  const useKlinesEndTime = process.env.FIVEMIN_SCREENER_KLINES_ENDTIME !== 'false'
+  const klinesEndTimeMs = useKlinesEndTime
+    ? computeKlinesEndTimeMs(scanT0, intervalMs, scanSecondsBeforeClose)
+    : null
   const candlesPerSymbol = Math.max(1, Math.min(1500, Math.floor(candleCount)))
   const concRaw = Number.parseInt(process.env.FIVEMIN_SCREENER_CONCURRENCY ?? '18', 10)
   const CONCURRENCY = Math.min(
@@ -186,7 +198,13 @@ export async function computeFiveMinScreener(futuresBase, {
   const timelineMap = new Map()
   const raw = await mapPool(selected, CONCURRENCY, async (row) => {
     try {
-      const candles = await fetchKlines(futuresBase, row.symbol, interval, candlesPerSymbol)
+      const candles = await fetchKlines(
+        futuresBase,
+        row.symbol,
+        interval,
+        candlesPerSymbol,
+        klinesEndTimeMs,
+      )
       if (!candles.length) {
         return { symbol: row.symbol, quoteVolume24h: row.quoteVolume24h, error: 'no candles' }
       }

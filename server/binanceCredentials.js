@@ -25,7 +25,12 @@ export function normalizeBinanceAccountId(raw) {
 }
 
 export function resolveBinanceCredentials(accountIdRaw) {
-  const id = normalizeBinanceAccountId(accountIdRaw) ?? 'master'
+  const normalized = normalizeBinanceAccountId(accountIdRaw)
+  const rawTrim = String(accountIdRaw ?? '').trim()
+  if (normalized == null && rawTrim !== '') {
+    return { accountId: rawTrim, apiKey: null, apiSecret: null }
+  }
+  const id = normalized ?? 'master'
   let apiKey
   let apiSecret
   if (id === 'master') {

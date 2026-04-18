@@ -12,6 +12,18 @@ import {
   clampScanSecondsAfterClose,
   msUntilNextScanAfterBarClose,
 } from './agent1ScanIntervals.js'
+import { resolveBinanceCredentials } from './binanceCredentials.js'
+
+/** Same master/sub1/sub2 resolution as Agent 1/3; set AGENT2_BINANCE_ACCOUNT=sub1 etc. */
+function getAgent2BinanceCredentials() {
+  return resolveBinanceCredentials(process.env.AGENT2_BINANCE_ACCOUNT ?? 'master')
+}
+
+function pendingEntryOrderOnSymbol(pendingRows, symbol) {
+  const sym = String(symbol ?? '').toUpperCase()
+  if (!sym || !Array.isArray(pendingRows)) return false
+  return pendingRows.some((o) => String(o?.symbol ?? '').toUpperCase() === sym)
+}
 
 const SPIKE_ROW_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -80,7 +92,7 @@ let agent2Ctx = null
  * @property {(msg: string) => number | null} parseMaxLeverageFromBinanceError
  * @property {(o: object) => object} enforceExitBracketAgainstEntry
  * @property {(symbol: string, positionSide: string) => string} buildAgentTradePositionKey
- * @property {(apiKey: string, apiSecret: string, tradeRow: object) => Promise<object>} fetchTradeCloseAccounting
+ * @property {(apiKey: string, apiSecret: string, tradeRow: object, cursorScope?: string) => Promise<object>} fetchTradeCloseAccounting
  */
 
 export function initAgent2Context(ctx) {
@@ -857,8 +869,6 @@ export async function runAgent2ScanTick() {
   let spikeCount = 0
 
   const maxOpen = settings.maxOpenPositions
-  const openTrades = await listAgent2OpenTrades(500)
-  const openCount = openTrades.length
   const intervalMs = AGENT1_INTERVAL_MS[settings.scanInterval] ?? AGENT1_INTERVAL_MS['5m']
   const scanNowMs = Date.now()
 
@@ -911,12 +921,14 @@ export async function runAgent2ScanTick() {
 
     if (!settings.agentEnabled || !settings.tradingEnabled) continue
 
-    if (openCount >= maxOpen) {
+    const openTrades = await listAgent2OpenTrades(500)
+    const pendingOrders = await listActiveEntryOrders()
+    if (openTrades.length + pendingOrders.length >= maxOpen) {
       await patchSpike(spikeRow.id, { status: 'deferred', skip_reason: 'max_open_positions' })
       continue
     }
 
-    if (openTradeOnSymbol(openTrades, symbol)) {
+    if (openTradeOnSymbol(openTrades, symbol) || pendingEntryOrderOnSymbol(pendingOrders, symbol)) {
       await patchSpike(spikeRow.id, { status: 'deferred', skip_reason: 'already_open_symbol' })
       continue
     }
@@ -926,10 +938,12 @@ export async function runAgent2ScanTick() {
       continue
     }
 
-    const apiKey = process.env.BINANCE_API_KEY
-    const apiSecret = process.env.BINANCE_API_SECRET
+    const { apiKey, apiSecret, accountId } = getAgent2BinanceCredentials()
     if (!apiKey || !apiSecret) {
-      pushAgent2Log('warn', 'trading on but Binance keys missing')
+      pushAgent2Log(
+        'warn',
+        `trading on but Binance keys missing for account "${accountId}" (set env like BINANCE_SUB1_* or AGENT2_BINANCE_ACCOUNT)`,
+      )
       continue
     }
 
@@ -1017,15 +1031,17 @@ export async function runAgent2ExecutionTick() {
   agent2ExecutionState.lastError = null
   try {
     const settings = await readAgent2Settings()
-    const apiKey = process.env.BINANCE_API_KEY
-    const apiSecret = process.env.BINANCE_API_SECRET
+    const { apiKey, apiSecret, accountId } = getAgent2BinanceCredentials()
 
     if (!settings.agentEnabled || !settings.tradingEnabled) {
       const reason = !settings.agentEnabled ? 'agent_disabled' : 'trading_disabled'
       const pending = await listActiveEntryOrders()
       const haveKeys = Boolean(apiKey && apiSecret)
       if (!haveKeys && pending.length > 0) {
-        pushAgent2Log('warn', `${reason}: Binance keys missing — cancel entry orders on exchange manually`)
+        pushAgent2Log(
+          'warn',
+          `${reason}: Binance keys missing for "${accountId}" — cancel entry orders on exchange manually`,
+        )
       }
       for (const p of pending) {
         const oid = Number.parseInt(String(p.binance_order_id ?? ''), 10)

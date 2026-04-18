@@ -47,6 +47,36 @@ export function clampScanSecondsBeforeClose(rawSeconds, intervalMs) {
 }
 
 /**
+ * Binance klines `endTime`: last returned candle has openTime ≤ endTime.
+ * Using `targetBarOpen + intervalMs - 1` pins `limit=1` to bar `targetBarOpen` (final OHLC once closed,
+ * or still forming before close) and avoids slipping to the next bar if the HTTP request runs late.
+ *
+ * `rawSecondsBeforeClose` matches scan scheduling (see clampScanSecondsBeforeClose).
+ * First `headMs` of each bar map to the previous bar when the scan was meant for the bar that just ended.
+ */
+export function computeKlinesEndTimeMs(nowMs, intervalMs, rawSecondsBeforeClose) {
+  const offsetMs = clampScanSecondsBeforeClose(rawSecondsBeforeClose, intervalMs) * 1000
+  const floorRaw = Number.parseInt(String(process.env.FIVEMIN_KLINES_LATE_HEAD_MS ?? '90000'), 10)
+  const lateHeadFloor = Number.isFinite(floorRaw) && floorRaw > 0 ? floorRaw : 90_000
+  const headCap = Math.max(0, intervalMs - 1000)
+  /** ms into bar when the scan timer fires on schedule (= intervalMs − offsetMs). */
+  const onScheduleMsInto = Math.max(0, intervalMs - offsetMs)
+  const headMs = Math.min(
+    headCap,
+    Math.max(offsetMs, lateHeadFloor),
+    Math.max(offsetMs, onScheduleMsInto > 0 ? onScheduleMsInto - 1 : 0),
+  )
+  const currentOpen = Math.floor(nowMs / intervalMs) * intervalMs
+  const msInto = nowMs - currentOpen
+  let targetBarOpenMs = currentOpen
+  if (msInto < headMs && currentOpen >= intervalMs) {
+    targetBarOpenMs = currentOpen - intervalMs
+  }
+  if (targetBarOpenMs < 0) return null
+  return targetBarOpenMs + intervalMs - 1
+}
+
+/**
  * Next fire: start of current kline + interval − offset (aligned to Binance-style open times).
  */
 export function msUntilNextAgent1Scan(nowMs, secondsBeforeClose, intervalMs) {

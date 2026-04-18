@@ -248,10 +248,10 @@ async function signedFuturesUrl(path, apiSecret, params, forceTimeSync = false) 
   }
   const qs = Object.keys(merged)
     .sort()
-    .map((k) => `${k}=${merged[k]}`)
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(String(merged[k] ?? ''))}`)
     .join('&')
   const signature = signQuery(apiSecret, qs)
-  return `${FUTURES_BASE}${path}?${qs}&signature=${signature}`
+  return `${FUTURES_BASE}${path}?${qs}&signature=${encodeURIComponent(signature)}`
 }
 
 async function signedSpotUrl(path, apiSecret, params, forceTimeSync = false) {
@@ -267,10 +267,10 @@ async function signedSpotUrl(path, apiSecret, params, forceTimeSync = false) {
   }
   const qs = Object.keys(merged)
     .sort()
-    .map((k) => `${k}=${merged[k]}`)
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(String(merged[k] ?? ''))}`)
     .join('&')
   const signature = signQuery(apiSecret, qs)
-  return `${SPOT_BASE}${path}?${qs}&signature=${signature}`
+  return `${SPOT_BASE}${path}?${qs}&signature=${encodeURIComponent(signature)}`
 }
 
 async function signedSpotJson(apiKey, apiSecret, path, params) {
@@ -617,6 +617,9 @@ function fmtByStep(value, step, precisionCap = null) {
     use = Math.min(use, Math.floor(precisionCap))
   }
   if (use <= 0) {
+    if (precisionCap === 0) {
+      return value.toFixed(0)
+    }
     use = Math.min(12, 8)
   }
   return value.toFixed(Math.min(12, use))
@@ -730,6 +733,20 @@ function ensureSupabaseConfigured() {
   }
 }
 
+/**
+ * Detect PostgREST "column missing" errors so we do not strip fields on unrelated failures
+ * (e.g. check constraint messages still mention binance_account in the constraint name).
+ */
+function supabaseErrorIndicatesMissingColumn(message, columnSnippet) {
+  const m = String(message).toLowerCase()
+  const c = String(columnSnippet).toLowerCase()
+  if (!m.includes(c)) return false
+  if (m.includes('does not exist')) return true
+  if (m.includes('could not find') && m.includes('column')) return true
+  if (m.includes('unknown column')) return true
+  return false
+}
+
 async function supabaseRest(path, init = {}) {
   ensureSupabaseConfigured()
   const headers = {
@@ -761,6 +778,10 @@ let agent1ShadowLeaseOwner = false
 let agent1ShadowLastDbHydrateAt = 0
 let agent1ExecutionLeaseOwner = false
 let agent3ExecutionLeaseOwner = false
+/** Last successful Agent 3 settings read included `binance_account` in the SELECT (column exists in DB). */
+let agent3BinanceAccountColumnReadable = true
+/** Same for Agent 1 (see readAgent1Settings / upsertAgent1Settings). */
+let agent1BinanceAccountColumnReadable = true
 
 function canUseShadowDbCoordination() {
   return AGENT1_SHADOW_SINGLE_WRITER && Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
@@ -1074,6 +1095,7 @@ async function readAgent1Settings() {
       `/rest/v1/agent_settings?select=${select}` + '&agent_name=eq.agent1' + '&limit=1'
     try {
       rows = await supabaseRest(p)
+      agent1BinanceAccountColumnReadable = select.includes('binance_account')
       break
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -1081,7 +1103,10 @@ async function readAgent1Settings() {
         select = select.replace(',trade_size_wallet_pct', '')
         continue
       }
-      if (/binance_account/i.test(msg) && select.includes('binance_account')) {
+      if (
+        supabaseErrorIndicatesMissingColumn(msg, 'binance_account') &&
+        select.includes('binance_account')
+      ) {
         select = select.replace(',binance_account', '')
         continue
       }
@@ -1091,6 +1116,7 @@ async function readAgent1Settings() {
           '&agent_name=eq.agent1' +
           '&limit=1'
         rows = await supabaseRest(legacyPath)
+        agent1BinanceAccountColumnReadable = false
         break
       }
       throw e
@@ -1125,13 +1151,17 @@ async function readAgent3Settings() {
         select = select.replace(',trade_size_wallet_pct', '')
         continue
       }
-      if (/binance_account/i.test(msg) && select.includes('binance_account')) {
+      if (
+        supabaseErrorIndicatesMissingColumn(msg, 'binance_account') &&
+        select.includes('binance_account')
+      ) {
         select = select.replace(',binance_account', '')
         continue
       }
       throw e
     }
   }
+  agent3BinanceAccountColumnReadable = select.includes('binance_account')
   if (!Array.isArray(rows) || rows.length === 0) {
     return {
       ...AGENT3_DEFAULT_SETTINGS,
@@ -1168,6 +1198,34 @@ function buildAgentTradePositionKey(symbol, positionSide) {
   return `${String(symbol ?? '').toUpperCase()}|${normalizePositionSideForKey(positionSide)}`
 }
 
+/** Non-zero position rows from /fapi/v2/positionRisk → keys (same rules as fetchAgent1OpenPositionKeys). */
+function openPositionKeysFromRiskRows(rows) {
+  const out = new Set()
+  if (!Array.isArray(rows)) return out
+  for (const p of rows) {
+    const amt = Number.parseFloat(String(p?.positionAmt ?? '0'))
+    if (!Number.isFinite(amt) || Math.abs(amt) <= 0) continue
+    const symbol = normalizeUsdtFuturesSymbol(p?.symbol, { allowMissingSuffix: false })
+    if (!symbol) continue
+    out.add(buildAgentTradePositionKey(symbol, p?.positionSide))
+  }
+  return out
+}
+
+/** Map position key → risk row for UI / ongoing trade enrichment. */
+function openPositionRowMapFromRiskRows(rows) {
+  const map = new Map()
+  if (!Array.isArray(rows)) return map
+  for (const p of rows) {
+    const amt = Number.parseFloat(String(p?.positionAmt ?? '0'))
+    if (!Number.isFinite(amt) || Math.abs(amt) <= 0) continue
+    const symbol = normalizeUsdtFuturesSymbol(p?.symbol, { allowMissingSuffix: false })
+    if (!symbol) continue
+    map.set(buildAgentTradePositionKey(symbol, p?.positionSide), p)
+  }
+  return map
+}
+
 /** True if any tracked open position uses this symbol (any side). Fixes one-way vs hedge keys: DB/exchange use BOTH, old check used LONG only. */
 function agent1HasOpenPositionOnSymbol(openKeys, symbol) {
   const sym = String(symbol ?? '').toUpperCase()
@@ -1180,17 +1238,8 @@ function agent1HasOpenPositionOnSymbol(openKeys, symbol) {
 }
 
 async function fetchAgent1OpenPositionKeys(apiKey, apiSecret) {
-  const out = new Set()
   const rows = await fetchPositionRisk(apiKey, apiSecret)
-  if (!Array.isArray(rows)) return out
-  for (const p of rows) {
-    const amt = Number.parseFloat(String(p?.positionAmt ?? '0'))
-    if (!Number.isFinite(amt) || Math.abs(amt) <= 0) continue
-    const symbol = normalizeUsdtFuturesSymbol(p?.symbol, { allowMissingSuffix: false })
-    if (!symbol) continue
-    out.add(buildAgentTradePositionKey(symbol, p?.positionSide))
-  }
-  return out
+  return openPositionKeysFromRiskRows(rows)
 }
 
 /**
@@ -1210,19 +1259,14 @@ async function reconcileAgent1OpenTradesWithExchange(apiKey, apiSecret) {
   const openTrades = await listAgent1TradeRecords('open', 500)
   if (openTrades.length === 0) return { closedNow: 0 }
   const all = await fetchPositionRisk(apiKey, apiSecret)
-  const openRows = Array.isArray(all)
-    ? all.filter((p) => Math.abs(parseFloat(p?.positionAmt ?? '0')) > 0)
-    : []
-  const openKeys = new Set(
-    openRows.map((p) => buildAgentTradePositionKey(p.symbol, p.positionSide)),
-  )
+  const openKeys = openPositionKeysFromRiskRows(all)
   let closedNow = 0
   for (const tr of openTrades) {
     const key = buildAgentTradePositionKey(tr.symbol, tr.position_side)
     if (openKeys.has(key)) continue
     let closeMeta = {}
     try {
-      closeMeta = await fetchAgentTradeCloseAccounting(apiKey, apiSecret, tr)
+      closeMeta = await fetchAgentTradeCloseAccounting(apiKey, apiSecret, tr, 'agent1')
     } catch {
       closeMeta = {}
     }
@@ -1263,19 +1307,14 @@ async function reconcileAgent3OpenTradesWithExchange(apiKey, apiSecret) {
   const openTrades = await listAgent3TradeRecords('open', 500)
   if (openTrades.length === 0) return { closedNow: 0 }
   const all = await fetchPositionRisk(apiKey, apiSecret)
-  const openRows = Array.isArray(all)
-    ? all.filter((p) => Math.abs(parseFloat(p?.positionAmt ?? '0')) > 0)
-    : []
-  const openKeys = new Set(
-    openRows.map((p) => buildAgentTradePositionKey(p.symbol, p.positionSide)),
-  )
+  const openKeys = openPositionKeysFromRiskRows(all)
   let closedNow = 0
   for (const tr of openTrades) {
     const key = buildAgentTradePositionKey(tr.symbol, tr.position_side)
     if (openKeys.has(key)) continue
     let closeMeta = {}
     try {
-      closeMeta = await fetchAgentTradeCloseAccounting(apiKey, apiSecret, tr)
+      closeMeta = await fetchAgentTradeCloseAccounting(apiKey, apiSecret, tr, 'agent3')
     } catch {
       closeMeta = {}
     }
@@ -1312,13 +1351,40 @@ async function runAgent1ExecutionTick() {
   let placed = 0
   try {
     const settings = await readAgent1Settings()
+    if (settings.emaGateEnabled !== false) {
+      await maybeHydrateAgent1ShadowSnapshot()
+    }
     const { apiKey, apiSecret, accountId } = resolveBinanceCredentials(settings.binanceAccount)
     if (!apiKey || !apiSecret) {
       agent1ExecutionState.lastError = `Binance API keys missing for account "${accountId}"`
       pushAgent1ExecutionLog('error', agent1ExecutionState.lastError)
       return
     }
-    if (!settings.agentEnabled) return
+    if (!settings.agentEnabled) {
+      try {
+        const rec = await reconcileAgent1OpenTradesWithExchange(apiKey, apiSecret)
+        if (rec.closedNow > 0) {
+          pushAgent1ExecutionLog('info', `closed detected: ${rec.closedNow}`)
+        }
+      } catch (e) {
+        pushAgent1ExecutionLog(
+          'warn',
+          `reconcile (agent off): ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+      return
+    }
+    try {
+      const recStart = await reconcileAgent1OpenTradesWithExchange(apiKey, apiSecret)
+      if (recStart.closedNow > 0) {
+        pushAgent1ExecutionLog('info', `closed at tick start: ${recStart.closedNow}`)
+      }
+    } catch (e) {
+      pushAgent1ExecutionLog(
+        'warn',
+        `reconcile (tick start): ${e instanceof Error ? e.message : String(e)}`,
+      )
+    }
     const fetchCap = Math.min(500, Math.max(50, AGENT1_EXECUTION_MAX_SPIKES_PER_TICK * 25))
     const pendingCandidates = await fetchPendingAgent1Spikes(fetchCap)
     const pending = []
@@ -1326,10 +1392,15 @@ async function runAgent1ExecutionTick() {
       if (pending.length >= AGENT1_EXECUTION_MAX_SPIKES_PER_TICK) break
       const symbol = String(spike?.symbol ?? '').toUpperCase()
       if (isAgent1SpikeStale(spike, settings.scanInterval)) {
-        const spikeIdRaw = Number(spike?.id)
-        const logKey = Number.isFinite(spikeIdRaw)
-          ? `spike:${Math.trunc(spikeIdRaw)}`
-          : `${symbol}:${String(spike?.candle_open_time_ms ?? '')}`
+        try {
+          await markAgent1SpikeSkipped(spike.id, 'stale spike')
+        } catch (e) {
+          pushAgent1ExecutionLog(
+            'warn',
+            `stale spike DB skip failed ${symbol || 'UNKNOWN'}: ${e instanceof Error ? e.message : String(e)}`,
+          )
+        }
+        const logKey = spikeExecutionLogKey(spike, symbol)
         if (!agent1StaleSpikeLogIds.has(logKey)) {
           pushAgent1ExecutionLog('info', `skip ${symbol || 'UNKNOWN'}: stale spike`)
           agent1StaleSpikeLogIds.add(logKey)
@@ -1354,10 +1425,7 @@ async function runAgent1ExecutionTick() {
         for (const spike of pending) {
           processed += 1
           const symbol = String(spike?.symbol ?? '').toUpperCase()
-          const spikeIdRaw = Number(spike?.id)
-          const logKey = Number.isFinite(spikeIdRaw)
-            ? `spike:${Math.trunc(spikeIdRaw)}`
-            : `${symbol || 'UNKNOWN'}:${String(spike?.candle_open_time_ms ?? '')}`
+          const logKey = spikeExecutionLogKey(spike, symbol || 'UNKNOWN')
           if (!agent1BlockedRegimeSpikeLogIds.has(logKey)) {
             pushAgent1ExecutionLog('info', `skip ${symbol || 'UNKNOWN'}: ${reason}`)
             agent1BlockedRegimeSpikeLogIds.add(logKey)
@@ -1368,6 +1436,17 @@ async function runAgent1ExecutionTick() {
         }
       }
       agent1LastGateState = nextGateState
+      try {
+        const rec = await reconcileAgent1OpenTradesWithExchange(apiKey, apiSecret)
+        if (rec.closedNow > 0) {
+          pushAgent1ExecutionLog('info', `closed detected: ${rec.closedNow}`)
+        }
+      } catch (e) {
+        pushAgent1ExecutionLog(
+          'warn',
+          `reconcile (gate blocked): ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
       return
     }
     if (!emaGateEnabled) {
@@ -1594,7 +1673,31 @@ async function runAgent3ExecutionTick() {
       pushAgent3ExecutionLog('error', agent3ExecutionState.lastError)
       return
     }
-    if (!settings.agentEnabled) return
+    if (!settings.agentEnabled) {
+      try {
+        const rec = await reconcileAgent3OpenTradesWithExchange(apiKey, apiSecret)
+        if (rec.closedNow > 0) {
+          pushAgent3ExecutionLog('info', `closed detected: ${rec.closedNow}`)
+        }
+      } catch (e) {
+        pushAgent3ExecutionLog(
+          'warn',
+          `reconcile (agent off): ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+      return
+    }
+    try {
+      const recStart = await reconcileAgent3OpenTradesWithExchange(apiKey, apiSecret)
+      if (recStart.closedNow > 0) {
+        pushAgent3ExecutionLog('info', `closed at tick start: ${recStart.closedNow}`)
+      }
+    } catch (e) {
+      pushAgent3ExecutionLog(
+        'warn',
+        `reconcile (tick start): ${e instanceof Error ? e.message : String(e)}`,
+      )
+    }
     const fetchCap = Math.min(500, Math.max(50, AGENT3_EXECUTION_MAX_SPIKES_PER_TICK * 25))
     const pendingCandidates = await fetchPendingAgent3Spikes(fetchCap)
     const pending = []
@@ -1602,10 +1705,15 @@ async function runAgent3ExecutionTick() {
       if (pending.length >= AGENT3_EXECUTION_MAX_SPIKES_PER_TICK) break
       const symbol = String(spike?.symbol ?? '').toUpperCase()
       if (isAgent3SpikeStale(spike, settings.scanInterval)) {
-        const spikeIdRaw = Number(spike?.id)
-        const logKey = Number.isFinite(spikeIdRaw)
-          ? `spike:${Math.trunc(spikeIdRaw)}`
-          : `${symbol}:${String(spike?.candle_open_time_ms ?? '')}`
+        try {
+          await markAgent3SpikeSkipped(spike.id, 'stale spike')
+        } catch (e) {
+          pushAgent3ExecutionLog(
+            'warn',
+            `stale spike DB skip failed ${symbol || 'UNKNOWN'}: ${e instanceof Error ? e.message : String(e)}`,
+          )
+        }
+        const logKey = spikeExecutionLogKey(spike, symbol)
         if (!agent3StaleSpikeLogIds.has(logKey)) {
           pushAgent3ExecutionLog('info', `skip ${symbol || 'UNKNOWN'}: stale spike`)
           agent3StaleSpikeLogIds.add(logKey)
@@ -1817,6 +1925,7 @@ async function upsertAgent1Settings(input) {
   }
   let bodyToSend = { ...body }
   let rows
+  let strippedBinanceAccountDueToMissingDbColumn = false
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
       rows = await supabaseRest('/rest/v1/agent_settings?on_conflict=agent_name&select=*', {
@@ -1840,14 +1949,24 @@ async function upsertAgent1Settings(input) {
         bodyToSend = rest
         continue
       }
-      if (/binance_account/i.test(msg) && Object.hasOwn(bodyToSend, 'binance_account')) {
+      if (
+        supabaseErrorIndicatesMissingColumn(msg, 'binance_account') &&
+        Object.hasOwn(bodyToSend, 'binance_account')
+      ) {
         const { binance_account: _b, ...rest } = bodyToSend
         bodyToSend = rest
+        strippedBinanceAccountDueToMissingDbColumn = true
         continue
       }
       throw e
     }
   }
+  if (strippedBinanceAccountDueToMissingDbColumn && s.binanceAccount !== 'master') {
+    throw new Error(
+      'Cannot save Agent 1 Binance sub-account: database table agent_settings is missing column binance_account (or it is unreadable). Run supabase/agent_settings_binance_account.sql in Supabase, restart the server, then save again. Until then the server uses the default account (master) for credentials.',
+    )
+  }
+  agent1BinanceAccountColumnReadable = !strippedBinanceAccountDueToMissingDbColumn
   const row = Array.isArray(rows) && rows[0] ? rows[0] : body
   const out = normalizeAgent1Settings(row)
   return {
@@ -1880,6 +1999,7 @@ async function upsertAgent3Settings(input) {
   }
   let bodyToSend = { ...body }
   let rows
+  let strippedBinanceAccountDueToMissingDbColumn = false
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
       rows = await supabaseRest('/rest/v1/agent_settings?on_conflict=agent_name&select=*', {
@@ -1898,14 +2018,24 @@ async function upsertAgent3Settings(input) {
         bodyToSend = rest
         continue
       }
-      if (/binance_account/i.test(msg) && Object.hasOwn(bodyToSend, 'binance_account')) {
+      if (
+        supabaseErrorIndicatesMissingColumn(msg, 'binance_account') &&
+        Object.hasOwn(bodyToSend, 'binance_account')
+      ) {
         const { binance_account: _b, ...rest } = bodyToSend
         bodyToSend = rest
+        strippedBinanceAccountDueToMissingDbColumn = true
         continue
       }
       throw e
     }
   }
+  if (strippedBinanceAccountDueToMissingDbColumn && s.binanceAccount !== 'master') {
+    throw new Error(
+      'Cannot save Agent 3 Binance sub-account: database table agent_settings is missing column binance_account (or it is unreadable). Run supabase/agent_settings_binance_account.sql in Supabase, restart the server, then save again. Until then the server uses the default account (master) for credentials.',
+    )
+  }
+  agent3BinanceAccountColumnReadable = !strippedBinanceAccountDueToMissingDbColumn
   const row = Array.isArray(rows) && rows[0] ? rows[0] : body
   const out = normalizeAgent3Settings(row)
   return {
@@ -1926,7 +2056,7 @@ async function persistAgent1ScanResult(scanResult) {
   const volMap = new Map()
   for (const r of scanResult.rows ?? []) {
     if (r?.symbol != null && r.quoteVolume24h != null) {
-      volMap.set(r.symbol, r.quoteVolume24h)
+      volMap.set(String(r.symbol).toUpperCase(), r.quoteVolume24h)
     }
   }
   const rows = []
@@ -1939,7 +2069,7 @@ async function persistAgent1ScanResult(scanResult) {
       direction: ev.direction,
       spike_pct: ev.spikePct,
       spike_low: Number.isFinite(Number(ev?.spikeLow)) ? Number(ev.spikeLow) : null,
-      quote_volume_24h: volMap.get(ev.symbol) ?? null,
+      quote_volume_24h: volMap.get(symbol) ?? volMap.get(String(ev?.symbol ?? '').toUpperCase()) ?? null,
       scan_run_at: scanRunAt,
     })
   }
@@ -1966,7 +2096,7 @@ async function persistAgent3ScanResult(scanResult) {
   const volMap = new Map()
   for (const r of scanResult.rows ?? []) {
     if (r?.symbol != null && r.quoteVolume24h != null) {
-      volMap.set(r.symbol, r.quoteVolume24h)
+      volMap.set(String(r.symbol).toUpperCase(), r.quoteVolume24h)
     }
   }
   const rows = []
@@ -1980,7 +2110,7 @@ async function persistAgent3ScanResult(scanResult) {
       spike_pct: ev.spikePct,
       spike_low: Number.isFinite(Number(ev?.spikeLow)) ? Number(ev.spikeLow) : null,
       spike_high: Number.isFinite(Number(ev?.spikeHigh)) ? Number(ev.spikeHigh) : null,
-      quote_volume_24h: volMap.get(ev.symbol) ?? null,
+      quote_volume_24h: volMap.get(symbol) ?? volMap.get(String(ev?.symbol ?? '').toUpperCase()) ?? null,
       scan_run_at: scanRunAt,
     })
   }
@@ -2021,6 +2151,7 @@ let agent1LastGateState = 'unknown'
 const agent1BlockedRegimeSpikeLogIds = new Set()
 const agent1StaleSpikeLogIds = new Set()
 const agent3StaleSpikeLogIds = new Set()
+/** userTrades pagination cursors: keys are `${scope}:${symbol}|${side}` so Agent 1 / 3 / 2 do not clobber each other in one-way (BOTH) mode. */
 const agent1CloseAccountingCursorByKey = new Map()
 
 /** @type {Array<{at: string, level: 'info'|'warn'|'error', msg: string}>} */
@@ -2115,6 +2246,21 @@ async function fetchPendingAgent1Spikes(limit = AGENT1_EXECUTION_MAX_SPIKES_PER_
     `/rest/v1/agent1_spikes?select=*&trade_taken=eq.false&execution_skipped=eq.false&order=created_at.desc&limit=${n}`,
   )
   return Array.isArray(rows) ? rows : []
+}
+
+/** Dedupe key for once-per-spike execution logs (numeric id, UUID string, or candle time fallback). */
+function spikeExecutionLogKey(spike, symbolUpper) {
+  const sym = String(symbolUpper ?? '').toUpperCase() || 'UNKNOWN'
+  const idRaw = spike?.id
+  if (typeof idRaw === 'number' && Number.isFinite(idRaw)) {
+    return `spike:${Math.trunc(idRaw)}`
+  }
+  const idStr = String(idRaw ?? '').trim()
+  if (idStr) {
+    if (/^\d+$/.test(idStr)) return `spike:${idStr}`
+    return `spike:${idStr.slice(0, 80)}`
+  }
+  return `${sym}:${String(spike?.candle_open_time_ms ?? '')}`
 }
 
 function isAgent1SpikeStale(spike, scanInterval) {
@@ -2305,13 +2451,14 @@ async function sumIncomeSince(apiKey, apiSecret, symbol, incomeType, sinceMs) {
   return hit ? sum : null
 }
 
-async function fetchAgentTradeCloseAccountingFromUserTrades(apiKey, apiSecret, tradeRow) {
+async function fetchAgentTradeCloseAccountingFromUserTrades(apiKey, apiSecret, tradeRow, cursorScope = 'agent2') {
   const symbol = String(tradeRow?.symbol ?? '').toUpperCase()
   if (!symbol) return null
   const openedMs = Date.parse(String(tradeRow?.opened_at ?? ''))
   if (!Number.isFinite(openedMs)) return null
   const posSideNorm = normalizePositionSideForKey(tradeRow?.position_side)
-  const cursorKey = buildAgentTradePositionKey(symbol, posSideNorm)
+  const scope = String(cursorScope ?? 'agent2').replace(/[^a-zA-Z0-9._-]/g, '_') || 'agent2'
+  const cursorKey = `${scope}:${buildAgentTradePositionKey(symbol, posSideNorm)}`
   const cursorMs = Number(agent1CloseAccountingCursorByKey.get(cursorKey))
   const lowerBoundMs = Number.isFinite(cursorMs) ? Math.max(openedMs, cursorMs + 1) : openedMs
   const startTime = Math.max(0, Math.floor(lowerBoundMs))
@@ -2382,7 +2529,7 @@ async function fetchAgentTradeCloseAccountingFromUserTrades(apiKey, apiSecret, t
   }
 }
 
-async function fetchAgentTradeCloseAccounting(apiKey, apiSecret, tradeRow) {
+async function fetchAgentTradeCloseAccounting(apiKey, apiSecret, tradeRow, cursorScope = 'agent2') {
   const symbol = String(tradeRow?.symbol ?? '').toUpperCase()
   if (!symbol) return {}
   const openedMs = Date.parse(String(tradeRow?.opened_at ?? ''))
@@ -2390,7 +2537,12 @@ async function fetchAgentTradeCloseAccounting(apiKey, apiSecret, tradeRow) {
   let realized = null
   let commission = null
   try {
-    const fromTrades = await fetchAgentTradeCloseAccountingFromUserTrades(apiKey, apiSecret, tradeRow)
+    const fromTrades = await fetchAgentTradeCloseAccountingFromUserTrades(
+      apiKey,
+      apiSecret,
+      tradeRow,
+      cursorScope,
+    )
     if (fromTrades) {
       realized = fromTrades.realized_pnl_usdt
       commission = fromTrades.commission_usdt
@@ -2610,9 +2762,40 @@ async function placeFuturesOrderWithProtection({
     )
   }
   const rawQty = effectiveNotionalUsd / markPrice
-  const qty = quantizeToStep(rawQty, spec.stepSize, 'floor')
+  let qty = quantizeToStep(rawQty, spec.stepSize, 'floor')
   if (!Number.isFinite(qty) || qty <= 0 || qty < spec.minQty) {
     throw new Error(`tradeSizeUsd × leverage is too small for ${symbol}. Minimum quantity is ${spec.minQty}.`)
+  }
+  const minN = spec.minNotional
+  if (minN > 0) {
+    const step = spec.stepSize
+    const estNotional = (q) => q * markPrice
+    let units = Math.floor(qty / step + 1e-10)
+    let bumpSteps = 0
+    const maxBumpSteps = 1_000_000
+    while (estNotional(units * step) < minN - 1e-10 && bumpSteps < maxBumpSteps) {
+      units += 1
+      bumpSteps += 1
+    }
+    qty = quantizeToStep(units * step, step, 'round')
+    if (!Number.isFinite(qty) || qty <= 0) {
+      throw new Error(`Could not size quantity for ${symbol} after min-notional adjustment.`)
+    }
+    if (minN > 0 && estNotional(qty) < minN - 1e-10) {
+      throw new Error(
+        `After lot-size rounding, notional ~${estNotional(qty).toFixed(4)} USDT is below Binance minimum ${minN} for ${symbol}. Increase margin × leverage.`,
+      )
+    }
+    if (qty < spec.minQty) {
+      throw new Error(
+        `Min-notional sizing for ${symbol} needs qty ${qty}, below exchange minQty ${spec.minQty}. Increase margin × leverage.`,
+      )
+    }
+    if (bumpSteps > 0) {
+      warnings.push(
+        `Raised quantity by ${bumpSteps} lot step(s) so notional meets exchange minimum ${minN} USDT (floor qty would have been below min notional).`,
+      )
+    }
   }
   const quantity = fmtByStep(qty, spec.stepSize, spec.quantityPrecision)
 
@@ -2630,7 +2813,12 @@ async function placeFuturesOrderWithProtection({
   if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
     const risk = await fetchPositionRisk(apiKey, apiSecret)
     const row = Array.isArray(risk)
-      ? risk.find((p) => String(p?.symbol ?? '') === symbol && Math.abs(parseFloat(p?.positionAmt ?? '0')) > 0)
+      ? risk.find((p) => {
+          if (String(p?.symbol ?? '') !== symbol) return false
+          if (Math.abs(parseFloat(String(p?.positionAmt ?? '0'))) <= 0) return false
+          if (isHedgeMode && String(p?.positionSide ?? '').toUpperCase() !== entryPositionSide) return false
+          return true
+        })
       : null
     const rp = Number.parseFloat(String(row?.entryPrice ?? ''))
     entryPrice = Number.isFinite(rp) && rp > 0 ? rp : markPrice
@@ -3039,7 +3227,11 @@ app.get('/api/ping', (_req, res) => {
 app.get('/api/agents/agent1/settings', async (_req, res) => {
   try {
     const settings = await readAgent1Settings()
-    return res.json({ settings, fetchedAt: new Date().toISOString() })
+    return res.json({
+      settings,
+      binanceAccountColumnReadable: agent1BinanceAccountColumnReadable,
+      fetchedAt: new Date().toISOString(),
+    })
   } catch (e) {
     if (e instanceof SupabaseConfigError) {
       return res.status(503).json({ error: e.message })
@@ -3064,7 +3256,12 @@ app.put('/api/agents/agent1/settings', async (req, res) => {
     }
     const { updatedAt: _u, ...forUpsert } = merged
     const settings = await upsertAgent1Settings(forUpsert)
-    return res.json({ ok: true, settings, fetchedAt: new Date().toISOString() })
+    return res.json({
+      ok: true,
+      settings,
+      binanceAccountColumnReadable: agent1BinanceAccountColumnReadable,
+      fetchedAt: new Date().toISOString(),
+    })
   } catch (e) {
     if (e instanceof SupabaseConfigError) {
       return res.status(503).json({ error: e.message })
@@ -3090,7 +3287,12 @@ app.patch('/api/agents/agent1/enabled', async (req, res) => {
       ...rest,
       agentEnabled: req.body.enabled,
     })
-    return res.json({ ok: true, settings, fetchedAt: new Date().toISOString() })
+    return res.json({
+      ok: true,
+      settings,
+      binanceAccountColumnReadable: agent1BinanceAccountColumnReadable,
+      fetchedAt: new Date().toISOString(),
+    })
   } catch (e) {
     if (e instanceof SupabaseConfigError) {
       return res.status(503).json({ error: e.message })
@@ -3301,12 +3503,7 @@ app.get('/api/agents/agent1/execution', async (_req, res) => {
     if (apiKey && apiSecret) {
       try {
         const all = await fetchPositionRisk(apiKey, apiSecret)
-        const openRows = Array.isArray(all)
-          ? all.filter((p) => Math.abs(parseFloat(p?.positionAmt ?? '0')) > 0)
-          : []
-        openPositionMap = new Map(
-          openRows.map((r) => [buildAgentTradePositionKey(r.symbol, r.positionSide), r]),
-        )
+        openPositionMap = openPositionRowMapFromRiskRows(Array.isArray(all) ? all : [])
       } catch {
         // keep DB-only view if Binance call fails
       }
@@ -3393,6 +3590,7 @@ app.get('/api/agents/agent1/account-metrics', async (_req, res) => {
 
 /** Futures wallet + sizing preview for Agent 3 `binance_account` (same shape as Agent 1). */
 app.get('/api/agents/agent3/account-metrics', async (_req, res) => {
+  let accountId = 'master'
   try {
     let settings = AGENT3_DEFAULT_SETTINGS
     try {
@@ -3400,10 +3598,13 @@ app.get('/api/agents/agent3/account-metrics', async (_req, res) => {
     } catch {
       settings = AGENT3_DEFAULT_SETTINGS
     }
-    const { apiKey, apiSecret, accountId } = resolveBinanceCredentials(settings.binanceAccount)
+    const creds = resolveBinanceCredentials(settings.binanceAccount)
+    accountId = creds.accountId
+    const { apiKey, apiSecret } = creds
     if (!apiKey || !apiSecret) {
       return res.status(503).json({
         error: `Binance API keys not configured for account "${accountId}"`,
+        binanceAccount: accountId,
       })
     }
     const [futuresWalletUsdt, risk] = await Promise.all([
@@ -3440,8 +3641,27 @@ app.get('/api/agents/agent3/account-metrics', async (_req, res) => {
       fetchedAt: new Date().toISOString(),
     })
   } catch (e) {
+    const errMsg = e instanceof Error ? e.message : 'Failed to load futures account metrics'
+    let hint = ''
+    if (/invalid api-key|-2015|401/i.test(errMsg)) {
+      if (accountId === 'sub1') {
+        hint =
+          ' For sub1, set BINANCE_SUB1_API_KEY and BINANCE_SUB1_API_SECRET in the server .env (not the browser), enable Futures on the key, match BINANCE_USE_TESTNET to the key type, and check IP restrictions.'
+      } else if (accountId === 'sub2') {
+        hint =
+          ' For sub2, set BINANCE_SUB2_API_KEY and BINANCE_SUB2_API_SECRET in the server .env, enable Futures on the key, match BINANCE_USE_TESTNET to the key type, and check IP restrictions.'
+      } else {
+        hint =
+          ' For master, set BINANCE_API_KEY / BINANCE_API_SECRET (or BINANCE_MASTER_*), enable Futures on the key, match BINANCE_USE_TESTNET to the key type, and check IP restrictions.'
+      }
+      if (!agent3BinanceAccountColumnReadable) {
+        hint +=
+          ' Also run supabase/agent_settings_binance_account.sql: without binance_account in the DB, Agent 3 may still be using master while the UI shows a sub-account.'
+      }
+    }
     res.status(502).json({
-      error: e instanceof Error ? e.message : 'Failed to load futures account metrics',
+      error: hint ? `${errMsg}${hint}` : errMsg,
+      binanceAccount: accountId,
     })
   }
 })
@@ -3501,7 +3721,11 @@ app.get('/api/agents/agent3/closed-trades-pnl-curve', async (req, res) => {
 app.get('/api/agents/agent3/settings', async (_req, res) => {
   try {
     const settings = await readAgent3Settings()
-    return res.json({ settings, fetchedAt: new Date().toISOString() })
+    return res.json({
+      settings,
+      binanceAccountColumnReadable: agent3BinanceAccountColumnReadable,
+      fetchedAt: new Date().toISOString(),
+    })
   } catch (e) {
     if (e instanceof SupabaseConfigError) {
       return res.status(503).json({ error: e.message })
@@ -3526,7 +3750,12 @@ app.put('/api/agents/agent3/settings', async (req, res) => {
     }
     const { updatedAt: _u, ...forUpsert } = merged
     const settings = await upsertAgent3Settings(forUpsert)
-    return res.json({ ok: true, settings, fetchedAt: new Date().toISOString() })
+    return res.json({
+      ok: true,
+      settings,
+      binanceAccountColumnReadable: agent3BinanceAccountColumnReadable,
+      fetchedAt: new Date().toISOString(),
+    })
   } catch (e) {
     if (e instanceof SupabaseConfigError) {
       return res.status(503).json({ error: e.message })
@@ -3555,7 +3784,12 @@ app.patch('/api/agents/agent3/enabled', async (req, res) => {
       ...rest,
       agentEnabled: req.body.enabled,
     })
-    return res.json({ ok: true, settings, fetchedAt: new Date().toISOString() })
+    return res.json({
+      ok: true,
+      settings,
+      binanceAccountColumnReadable: agent3BinanceAccountColumnReadable,
+      fetchedAt: new Date().toISOString(),
+    })
   } catch (e) {
     if (e instanceof SupabaseConfigError) {
       return res.status(503).json({ error: e.message })
@@ -3691,12 +3925,7 @@ app.get('/api/agents/agent3/execution', async (_req, res) => {
     if (apiKey && apiSecret) {
       try {
         const all = await fetchPositionRisk(apiKey, apiSecret)
-        const openRows = Array.isArray(all)
-          ? all.filter((p) => Math.abs(parseFloat(p?.positionAmt ?? '0')) > 0)
-          : []
-        openPositionMap = new Map(
-          openRows.map((r) => [buildAgentTradePositionKey(r.symbol, r.positionSide), r]),
-        )
+        openPositionMap = openPositionRowMapFromRiskRows(Array.isArray(all) ? all : [])
       } catch {
         // keep DB-only view if Binance call fails
       }
@@ -3956,17 +4185,11 @@ app.get('/api/agents/agent2/execution', async (_req, res) => {
       }
     }
     const openPositionMap = new Map()
-    const apiKey = process.env.BINANCE_API_KEY
-    const apiSecret = process.env.BINANCE_API_SECRET
-    if (apiKey && apiSecret) {
+    const a2Creds = resolveBinanceCredentials(process.env.AGENT2_BINANCE_ACCOUNT ?? 'master')
+    if (a2Creds.apiKey && a2Creds.apiSecret) {
       try {
-        const all = await fetchPositionRisk(apiKey, apiSecret)
-        const openRows = Array.isArray(all)
-          ? all.filter((p) => Math.abs(parseFloat(p?.positionAmt ?? '0')) > 0)
-          : []
-        for (const r of openRows) {
-          openPositionMap.set(buildAgentTradePositionKey(r.symbol, r.positionSide), r)
-        }
+        const all = await fetchPositionRisk(a2Creds.apiKey, a2Creds.apiSecret)
+        openPositionMap = openPositionRowMapFromRiskRows(Array.isArray(all) ? all : [])
       } catch {
         /* */
       }
@@ -4011,6 +4234,28 @@ app.get('/api/binance/futures-wallet', async (_req, res) => {
     )
     res.json({
       totalWalletBalance,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    return sendBinanceRouteError(res, e)
+  }
+})
+
+/** Dev check: USDT-M futures wallet using BINANCE_SUB1_* from env only (no Supabase). */
+app.get('/api/test/sub1-futures-balance', async (_req, res) => {
+  const { apiKey, apiSecret, accountId } = resolveBinanceCredentials('sub1')
+  if (!apiKey || !apiSecret) {
+    return res.status(503).json({
+      error:
+        'Set BINANCE_SUB1_API_KEY and BINANCE_SUB1_API_SECRET in the project root .env.',
+    })
+  }
+  try {
+    const totalWalletBalanceUsdt = await getFuturesUsdtWalletTotal(apiKey, apiSecret)
+    res.json({
+      binanceAccount: accountId,
+      totalWalletBalanceUsdt,
+      futuresBase: FUTURES_BASE,
       fetchedAt: new Date().toISOString(),
     })
   } catch (e) {
@@ -4733,6 +4978,12 @@ app.get('/api/binance/5m-screener', async (req, res) => {
       error: 'maxSymbols must be a positive integer (optional, cap 800)',
     })
   }
+  let scanSecondsBeforeClose
+  const sbcRaw = req.query.scanSecondsBeforeClose ?? req.query.scan_seconds_before_close
+  if (sbcRaw !== undefined && String(sbcRaw).trim() !== '') {
+    const sbc = Number.parseInt(String(sbcRaw), 10)
+    if (Number.isFinite(sbc)) scanSecondsBeforeClose = sbc
+  }
   try {
     const t0 = Date.now()
     const result = await computeFiveMinScreener(FUTURES_BASE, {
@@ -4743,6 +4994,7 @@ app.get('/api/binance/5m-screener', async (req, res) => {
       spikeDirections,
       spikeMetric,
       maxSymbols,
+      scanSecondsBeforeClose,
     })
     res.json({
       ...result,

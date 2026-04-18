@@ -44,7 +44,10 @@ async function fetchAgent3Settings() {
   if (!res.ok) {
     throw new Error(data.error || `Request failed (${res.status})`)
   }
-  return data.settings
+  return {
+    settings: data.settings,
+    binanceAccountColumnReadable: data.binanceAccountColumnReadable !== false,
+  }
 }
 
 async function saveAgent3Settings(payload) {
@@ -57,7 +60,10 @@ async function saveAgent3Settings(payload) {
   if (!res.ok) {
     throw new Error(data.error || `Request failed (${res.status})`)
   }
-  return data.settings
+  return {
+    settings: data.settings,
+    binanceAccountColumnReadable: data.binanceAccountColumnReadable !== false,
+  }
 }
 
 async function fetchScanStatus() {
@@ -167,6 +173,7 @@ export function Agent3() {
   const [scanDirection, setScanDirection] = useState('down')
   const [agentEnabled, setAgentEnabled] = useState(false)
   const [binanceAccount, setBinanceAccount] = useState('master')
+  const [binanceAccountColumnReadable, setBinanceAccountColumnReadable] = useState(true)
 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -365,8 +372,9 @@ export function Agent3() {
       setLoading(true)
       setError('')
       try {
-        const s = await fetchAgent3Settings()
+        const { settings: s, binanceAccountColumnReadable: colOk } = await fetchAgent3Settings()
         if (off) return
+        setBinanceAccountColumnReadable(colOk)
         setTradeSizeUsd(String(s.tradeSizeUsd ?? '1'))
         setTradeSizeWalletPct(
           String(
@@ -421,8 +429,9 @@ export function Agent3() {
       loadScanStatus()
       ;(async () => {
         try {
-          const s = await fetchAgent3Settings()
+          const { settings: s, binanceAccountColumnReadable: colOk } = await fetchAgent3Settings()
           setAgentEnabled(s.agentEnabled !== false)
+          setBinanceAccountColumnReadable(colOk)
         } catch {
           /* keep previous */
         }
@@ -476,7 +485,7 @@ export function Agent3() {
     setSaving(true)
     setError('')
     try {
-      const out = await saveAgent3Settings({
+      const { settings: out, binanceAccountColumnReadable: colOk } = await saveAgent3Settings({
         tradeSizeUsd: Number.parseFloat(tradeSizeUsd),
         tradeSizeWalletPct: Number.parseFloat(tradeSizeWalletPct),
         leverage: Number.parseInt(leverage, 10),
@@ -519,6 +528,7 @@ export function Agent3() {
       setScanDirection(String(out.scanDirection))
       setAgentEnabled(out.agentEnabled !== false)
       setBinanceAccount(String(out.binanceAccount ?? 'master'))
+      setBinanceAccountColumnReadable(colOk)
       setSavedAt(String(out.updatedAt ?? new Date().toISOString()))
       loadAccountMetrics()
     } catch (e) {
@@ -600,6 +610,14 @@ export function Agent3() {
       ) : null}
 
       <h2 className="vol-screener-title agent1-section-title">Futures account</h2>
+      {!binanceAccountColumnReadable ? (
+        <p className="hourly-spikes-hint" role="alert" style={{ margin: '0 0 12px', color: '#b45309' }}>
+          Database is missing <code>agent_settings.binance_account</code>. The server falls back to{' '}
+          <strong>master</strong> credentials until you run{' '}
+          <code>supabase/agent_settings_binance_account.sql</code> and restart. Sub-account env keys are ignored for
+          routing until then.
+        </p>
+      ) : null}
       <div className="agent1-account-tablet">
         {accountMetricsError ? (
           <p className="vol-screener-lead agent1-account-tablet__err" role="alert">

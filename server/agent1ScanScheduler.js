@@ -82,6 +82,7 @@ export function startAgent1ScanScheduler(deps) {
         spikeDirections: ['up', 'down', 'both'].includes(spikeDirections) ? spikeDirections : 'both',
         spikeMetric: spikeMetric === 'wick' ? 'wick' : 'body',
         maxSymbols: Number.isFinite(maxSymbols) && maxSymbols > 0 ? Math.min(800, maxSymbols) : undefined,
+        scanSecondsBeforeClose: s.scanSecondsBeforeClose,
       })
 
       const { spikeCount } = await persistScan(result)
