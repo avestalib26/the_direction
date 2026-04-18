@@ -963,6 +963,86 @@
   align-items: center;
 }
 
+.home-balance-breakdown {
+  width: 100%;
+  padding: 0.9rem 1rem;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--menu-border);
+  border-radius: 10px;
+  background: var(--menu-surface);
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.home-balance-breakdown__title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-heading);
+}
+
+.home-balance-breakdown__subtitle {
+  margin: 0 0 0.4rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text-heading);
+}
+
+.home-balance-breakdown__meta,
+.home-balance-breakdown__note,
+.home-balance-breakdown__footer {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.home-balance-breakdown__code {
+  font-size: 0.76em;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--menu-border);
+}
+
+.home-balance-breakdown__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 0.75rem;
+}
+
+.home-balance-breakdown__card {
+  min-width: 0;
+}
+
+.home-balance-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.home-balance-table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-muted);
+  padding: 0.28rem 0.5rem 0.28rem 0;
+  vertical-align: top;
+  border-bottom: 1px solid color-mix(in srgb, var(--menu-border) 80%, transparent);
+}
+
+.home-balance-table td {
+  text-align: right;
+  padding: 0.28rem 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--menu-border) 80%, transparent);
+  color: var(--text-heading);
+}
+
+.home-balance-table tr:last-child th,
+.home-balance-table tr:last-child td {
+  border-bottom: none;
+}
+
 .risk-panel {
   width: 100%;
   padding: 0.9rem 1rem;

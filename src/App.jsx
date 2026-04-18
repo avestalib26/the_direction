@@ -51,6 +51,34 @@ async function fetchFuturesWallet() {
   return data
 }
 
+/** Labels for `/api/binance/futures-balance-breakdown` fields (Binance USDT-M account). */
+const FUTURES_BREAKDOWN_ACCOUNT_LABELS = [
+  ['totalWalletBalance', 'Total wallet balance'],
+  ['totalUnrealizedProfit', 'Total unrealized PnL'],
+  ['totalMarginBalance', 'Total margin balance'],
+  ['totalCrossWalletBalance', 'Total cross wallet balance'],
+  ['totalCrossUnPnl', 'Total cross unrealized PnL'],
+  ['availableBalance', 'Available balance'],
+  ['maxWithdrawAmount', 'Max withdraw amount'],
+  ['totalInitialMargin', 'Total initial margin'],
+  ['totalMaintMargin', 'Total maintenance margin'],
+  ['totalPositionInitialMargin', 'Position initial margin'],
+  ['totalOpenOrderInitialMargin', 'Open order initial margin'],
+]
+
+const FUTURES_BREAKDOWN_USDT_LABELS = [
+  ['walletBalance', 'USDT wallet balance'],
+  ['unrealizedProfit', 'USDT unrealized PnL'],
+  ['marginBalance', 'USDT margin balance'],
+  ['crossWalletBalance', 'USDT cross wallet balance'],
+  ['crossUnPnl', 'USDT cross unrealized PnL'],
+  ['availableBalance', 'USDT available balance'],
+  ['maxWithdrawAmount', 'USDT max withdraw'],
+  ['positionInitialMargin', 'USDT position initial margin'],
+  ['openOrderInitialMargin', 'USDT open order initial margin'],
+  ['initialMargin', 'USDT initial margin'],
+]
+
 function App() {
   const [view, setView] = useState(() => {
     if (typeof window === 'undefined') return 'home'
@@ -61,6 +89,8 @@ function App() {
   const menuId = useId()
   const [positions, setPositions] = useState(null)
   const [walletBalance, setWalletBalance] = useState(null)
+  /** @type {null | { account: Record<string, number | null>, usdtAsset: Record<string, number | null> | null, sizingWalletUsd: number, sizingNote: string, fetchedAt: string }} */
+  const [futuresBreakdown, setFuturesBreakdown] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [maxTradeSizePct, setMaxTradeSizePct] = useState('4')
@@ -81,15 +111,26 @@ function App() {
     setLoading(true)
     setError(null)
     try {
-      const [data, wallet] = await Promise.all([
+      const breakdownPromise = fetch('/api/binance/futures-balance-breakdown')
+        .then(async (res) => {
+          const j = await res.json().catch(() => ({}))
+          if (!res.ok) throw new Error(j.error || `Request failed (${res.status})`)
+          return j
+        })
+        .catch(() => null)
+
+      const [data, wallet, breakdown] = await Promise.all([
         fetchOpenPositions(),
         fetchFuturesWallet().catch(() => null),
+        breakdownPromise,
       ])
       setPositions(data.positions ?? [])
       const wb = parseFloat(wallet?.totalWalletBalance)
       setWalletBalance(Number.isFinite(wb) ? wb : null)
+      setFuturesBreakdown(breakdown)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load positions')
+      setFuturesBreakdown(null)
     } finally {
       setLoading(false)
     }
@@ -757,6 +798,71 @@ function App() {
                 {loading ? 'Refreshing…' : 'Refresh'}
               </button>
             </div>
+
+            {futuresBreakdown && (
+              <section
+                className="home-balance-breakdown"
+                aria-label="USDT-M futures balance breakdown"
+              >
+                <h2 className="home-balance-breakdown__title">
+                  USDT-M balances (master keys)
+                </h2>
+                <p className="home-balance-breakdown__meta">
+                  Fetched {futuresBreakdown.fetchedAt ?? '—'} · Same account as{' '}
+                  <code className="home-balance-breakdown__code">BINANCE_API_KEY</code>
+                </p>
+                <p className="home-balance-breakdown__note">
+                  {futuresBreakdown.sizingNote}
+                </p>
+                <div className="home-balance-breakdown__grid">
+                  <div className="home-balance-breakdown__card">
+                    <h3 className="home-balance-breakdown__subtitle">Account summary</h3>
+                    <table className="home-balance-table">
+                      <tbody>
+                        {FUTURES_BREAKDOWN_ACCOUNT_LABELS.map(([key, label]) => (
+                          <tr key={key}>
+                            <th scope="row">{label}</th>
+                            <td className="cell-mono">
+                              {formatUsdt(futuresBreakdown.account?.[key])}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {futuresBreakdown.usdtAsset && (
+                    <div className="home-balance-breakdown__card">
+                      <h3 className="home-balance-breakdown__subtitle">
+                        USDT asset row
+                      </h3>
+                      <table className="home-balance-table">
+                        <tbody>
+                          {FUTURES_BREAKDOWN_USDT_LABELS.map(([key, label]) => (
+                            <tr key={key}>
+                              <th scope="row">{label}</th>
+                              <td className="cell-mono">
+                                {formatUsdt(futuresBreakdown.usdtAsset?.[key])}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+                <p className="home-balance-breakdown__footer">
+                  Value used today for % trade sizing:{' '}
+                  <strong className="cell-mono">
+                    {formatUsdt(futuresBreakdown.sizingWalletUsd)}
+                  </strong>{' '}
+                  USDT (
+                  <code className="home-balance-breakdown__code">
+                    getFuturesUsdtWalletTotal
+                  </code>
+                  )
+                </p>
+              </section>
+            )}
 
             <section className="risk-panel" aria-label="Risk controls">
               <div className="risk-form">

@@ -159,6 +159,7 @@ function fmtUsd2(v) {
 export function Agent3() {
   const [tradeSizeUsd, setTradeSizeUsd] = useState('1')
   const [tradeSizeWalletPct, setTradeSizeWalletPct] = useState('0')
+  const [minAvailableWalletPct, setMinAvailableWalletPct] = useState('30')
   const [leverage, setLeverage] = useState('10')
   const [marginMode, setMarginMode] = useState('cross')
   const [maxTpPct, setMaxTpPct] = useState('2')
@@ -383,6 +384,13 @@ export function Agent3() {
               : '0',
           ),
         )
+        setMinAvailableWalletPct(
+          String(
+            s.minAvailableWalletPct != null && Number.isFinite(Number(s.minAvailableWalletPct))
+              ? s.minAvailableWalletPct
+              : '30',
+          ),
+        )
         setLeverage(String(s.leverage ?? '10'))
         setMarginMode(String(s.marginMode ?? 'cross'))
         setMaxTpPct(String(s.maxTpPct ?? '2'))
@@ -488,6 +496,7 @@ export function Agent3() {
       const { settings: out, binanceAccountColumnReadable: colOk } = await saveAgent3Settings({
         tradeSizeUsd: Number.parseFloat(tradeSizeUsd),
         tradeSizeWalletPct: Number.parseFloat(tradeSizeWalletPct),
+        minAvailableWalletPct: Number.parseInt(minAvailableWalletPct, 10),
         leverage: Number.parseInt(leverage, 10),
         marginMode,
         maxTpPct: Number.parseFloat(maxTpPct),
@@ -509,6 +518,13 @@ export function Agent3() {
           out.tradeSizeWalletPct != null && Number.isFinite(Number(out.tradeSizeWalletPct))
             ? out.tradeSizeWalletPct
             : '0',
+        ),
+      )
+      setMinAvailableWalletPct(
+        String(
+          out.minAvailableWalletPct != null && Number.isFinite(Number(out.minAvailableWalletPct))
+            ? out.minAvailableWalletPct
+            : '30',
         ),
       )
       setLeverage(String(out.leverage))
@@ -904,6 +920,24 @@ export function Agent3() {
           <span className="backtest1-footnote" style={{ gridColumn: '1 / -1', marginTop: 4 }}>
             0 = use fixed USDT margin only. If &gt; 0, each order uses that % of USDT-M wallet balance as margin
             (falls back to fixed margin if the wallet cannot be read).
+          </span>
+        </label>
+        <label className="backtest1-field">
+          <span className="backtest1-label">Min available balance (% of wallet)</span>
+          <input
+            type="number"
+            className="backtest1-input"
+            min={0}
+            max={100}
+            step={1}
+            value={minAvailableWalletPct}
+            onChange={(e) => setMinAvailableWalletPct(e.target.value)}
+            disabled={loading || saving}
+          />
+          <span className="backtest1-footnote" style={{ gridColumn: '1 / -1', marginTop: 4 }}>
+            Block new entries when Binance <code>availableBalance</code> / <code>totalWalletBalance</code> is at or below
+            this percent. Use 0 to disable. Uses server env default until you run{' '}
+            <code>supabase/agent_settings_min_available_wallet_pct.sql</code> and save.
           </span>
         </label>
         <label className="backtest1-field">

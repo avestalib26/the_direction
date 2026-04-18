@@ -119,6 +119,11 @@ const AGENT2_EXECUTION_POLL_MS = Math.min(
   120_000,
   Math.max(5_000, Number.parseInt(String(process.env.AGENT2_EXECUTION_POLL_MS ?? '15000'), 10) || 15_000),
 )
+/** Max ms after a scan completes to open a trade; stale cutoff uses interval + (this − scanSecondsBeforeClose). */
+const SPIKE_EXECUTION_TRADE_WINDOW_MS = Math.max(
+  5_000,
+  Number.parseInt(String(process.env.SPIKE_EXECUTION_TRADE_WINDOW_MS ?? '60000'), 10) || 60_000,
+)
 const AGENT1_SHADOW_SINGLE_WRITER = process.env.AGENT1_SHADOW_SINGLE_WRITER !== 'false'
 const AGENT1_SHADOW_LOCK_NAME = String(process.env.AGENT1_SHADOW_LOCK_NAME ?? 'agent1_shadow_main').trim()
 const AGENT1_SHADOW_SNAPSHOT_KEY = 'main'
@@ -129,6 +134,11 @@ const AGENT1_SHADOW_LOCK_TTL_SEC = Math.min(
 const AGENT1_SHADOW_WRITER_ID = String(
   process.env.AGENT1_SHADOW_WRITER_ID ?? `${os.hostname?.() ?? 'host'}:${process.pid}`,
 ).replace(/[^a-zA-Z0-9._:-]/g, '_')
+
+function envFallbackMinAvailableWalletPct() {
+  const p = Number.parseInt(String(process.env.FUTURES_MIN_AVAILABLE_WALLET_PCT ?? '30').trim(), 10)
+  return Number.isFinite(p) && p >= 0 && p <= 100 ? p : 30
+}
 
 const AGENT1_DEFAULT_SETTINGS = Object.freeze({
   agentName: 'agent1',
@@ -149,6 +159,7 @@ const AGENT1_DEFAULT_SETTINGS = Object.freeze({
   agentEnabled: true,
   emaGateEnabled: true,
   binanceAccount: 'master',
+  minAvailableWalletPct: envFallbackMinAvailableWalletPct(),
 })
 
 const AGENT3_DEFAULT_SETTINGS = Object.freeze({
@@ -170,6 +181,7 @@ const AGENT3_DEFAULT_SETTINGS = Object.freeze({
   agentEnabled: false,
   emaGateEnabled: false,
   binanceAccount: 'master',
+  minAvailableWalletPct: envFallbackMinAvailableWalletPct(),
 })
 
 class BinanceApiError extends Error {
@@ -1009,6 +1021,17 @@ function normalizeAgentSettingsWithDefaults(raw = {}, defaults) {
   const binanceAccount =
     normalizeBinanceAccountId(raw.binanceAccount ?? raw.binance_account ?? defaults.binanceAccount) ?? 'master'
 
+  const rawMinWalletPct = raw.min_available_wallet_pct ?? raw.minAvailableWalletPct
+  let minAvailableWalletPct
+  if (rawMinWalletPct === null || rawMinWalletPct === undefined || rawMinWalletPct === '') {
+    minAvailableWalletPct = envFallbackMinAvailableWalletPct()
+  } else {
+    minAvailableWalletPct = Number.parseInt(String(rawMinWalletPct), 10)
+  }
+  if (!Number.isFinite(minAvailableWalletPct) || minAvailableWalletPct < 0 || minAvailableWalletPct > 100) {
+    throw new Error('minAvailableWalletPct must be an integer from 0 to 100 (0 disables the wallet headroom check)')
+  }
+
   if (!Number.isFinite(tradeSizeUsd) || tradeSizeUsd <= 0) {
     throw new Error('tradeSizeUsd must be a positive number')
   }
@@ -1065,6 +1088,7 @@ function normalizeAgentSettingsWithDefaults(raw = {}, defaults) {
     agentEnabled,
     emaGateEnabled,
     binanceAccount,
+    minAvailableWalletPct,
   }
 }
 
@@ -1078,14 +1102,14 @@ function normalizeAgent3Settings(raw = {}) {
 
 const AGENT1_SETTINGS_SELECT =
   'agent_name,trade_size_usd,trade_size_wallet_pct,leverage,margin_mode,max_tp_pct,max_sl_pct,max_open_positions,updated_at,' +
-  'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled,binance_account'
+  'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled,binance_account,min_available_wallet_pct'
 const AGENT1_SETTINGS_SELECT_LEGACY =
   'agent_name,trade_size_usd,leverage,margin_mode,max_tp_pct,max_sl_pct,updated_at,' +
   'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled'
 
 const AGENT3_SETTINGS_SELECT =
   'agent_name,trade_size_usd,trade_size_wallet_pct,leverage,margin_mode,max_tp_pct,max_sl_pct,max_open_positions,updated_at,' +
-  'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled,binance_account'
+  'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled,binance_account,min_available_wallet_pct'
 
 async function readAgent1Settings() {
   let select = AGENT1_SETTINGS_SELECT
@@ -1108,6 +1132,13 @@ async function readAgent1Settings() {
         select.includes('binance_account')
       ) {
         select = select.replace(',binance_account', '')
+        continue
+      }
+      if (
+        supabaseErrorIndicatesMissingColumn(msg, 'min_available_wallet_pct') &&
+        select.includes('min_available_wallet_pct')
+      ) {
+        select = select.replace(',min_available_wallet_pct', '')
         continue
       }
       if (/max_open_positions/i.test(msg)) {
@@ -1156,6 +1187,13 @@ async function readAgent3Settings() {
         select.includes('binance_account')
       ) {
         select = select.replace(',binance_account', '')
+        continue
+      }
+      if (
+        supabaseErrorIndicatesMissingColumn(msg, 'min_available_wallet_pct') &&
+        select.includes('min_available_wallet_pct')
+      ) {
+        select = select.replace(',min_available_wallet_pct', '')
         continue
       }
       throw e
@@ -1391,7 +1429,7 @@ async function runAgent1ExecutionTick() {
     for (const spike of pendingCandidates) {
       if (pending.length >= AGENT1_EXECUTION_MAX_SPIKES_PER_TICK) break
       const symbol = String(spike?.symbol ?? '').toUpperCase()
-      if (isAgent1SpikeStale(spike, settings.scanInterval)) {
+      if (isAgent1SpikeStale(spike, settings.scanInterval, settings.scanSecondsBeforeClose)) {
         try {
           await markAgent1SpikeSkipped(spike.id, 'stale spike')
         } catch (e) {
@@ -1487,6 +1525,43 @@ async function runAgent1ExecutionTick() {
         apiSecret,
         pushAgent1ExecutionLog,
       )
+      const headroom = await checkFuturesWalletHeadroomForNewTrades(
+        apiKey,
+        apiSecret,
+        pushAgent1ExecutionLog,
+        'agent1',
+        settings.minAvailableWalletPct,
+      )
+      if (!headroom.allow) {
+        try {
+          const rec = await reconcileAgent1OpenTradesWithExchange(apiKey, apiSecret)
+          if (rec.closedNow > 0) {
+            pushAgent1ExecutionLog('info', `closed detected: ${rec.closedNow}`)
+          }
+        } catch (e) {
+          pushAgent1ExecutionLog(
+            'warn',
+            `reconcile (wallet headroom): ${e instanceof Error ? e.message : String(e)}`,
+          )
+        }
+        // Wallet headroom policy: pending spikes are skipped (logged + skip_reason) instead of retrying until stale.
+        const marginSkipReason = 'skipped due to insufficient margin'
+        for (const s of pending) {
+          const sym = String(s?.symbol ?? '').toUpperCase() || 'UNKNOWN'
+          try {
+            await markAgent1SpikeSkipped(s.id, marginSkipReason)
+            pushAgent1ExecutionLog('info', `skip ${sym}: ${marginSkipReason}`)
+          } catch (e) {
+            pushAgent1ExecutionLog(
+              'warn',
+              `skip ${sym}: ${marginSkipReason} (DB update failed: ${
+                e instanceof Error ? e.message : String(e)
+              })`,
+            )
+          }
+        }
+        return
+      }
     }
 
     for (const spike of pending) {
@@ -1704,7 +1779,7 @@ async function runAgent3ExecutionTick() {
     for (const spike of pendingCandidates) {
       if (pending.length >= AGENT3_EXECUTION_MAX_SPIKES_PER_TICK) break
       const symbol = String(spike?.symbol ?? '').toUpperCase()
-      if (isAgent3SpikeStale(spike, settings.scanInterval)) {
+      if (isAgent3SpikeStale(spike, settings.scanInterval, settings.scanSecondsBeforeClose)) {
         try {
           await markAgent3SpikeSkipped(spike.id, 'stale spike')
         } catch (e) {
@@ -1748,6 +1823,43 @@ async function runAgent3ExecutionTick() {
         apiSecret,
         pushAgent3ExecutionLog,
       )
+      const headroom = await checkFuturesWalletHeadroomForNewTrades(
+        apiKey,
+        apiSecret,
+        pushAgent3ExecutionLog,
+        'agent3',
+        settings.minAvailableWalletPct,
+      )
+      if (!headroom.allow) {
+        try {
+          const rec = await reconcileAgent3OpenTradesWithExchange(apiKey, apiSecret)
+          if (rec.closedNow > 0) {
+            pushAgent3ExecutionLog('info', `closed detected: ${rec.closedNow}`)
+          }
+        } catch (e) {
+          pushAgent3ExecutionLog(
+            'warn',
+            `reconcile (wallet headroom): ${e instanceof Error ? e.message : String(e)}`,
+          )
+        }
+        // Wallet headroom policy: pending spikes are skipped (logged + skip_reason) instead of retrying until stale.
+        const marginSkipReason = 'skipped due to insufficient margin'
+        for (const s of pending) {
+          const sym = String(s?.symbol ?? '').toUpperCase() || 'UNKNOWN'
+          try {
+            await markAgent3SpikeSkipped(s.id, marginSkipReason)
+            pushAgent3ExecutionLog('info', `skip ${sym}: ${marginSkipReason}`)
+          } catch (e) {
+            pushAgent3ExecutionLog(
+              'warn',
+              `skip ${sym}: ${marginSkipReason} (DB update failed: ${
+                e instanceof Error ? e.message : String(e)
+              })`,
+            )
+          }
+        }
+        return
+      }
     }
 
     for (const spike of pending) {
@@ -1922,10 +2034,12 @@ async function upsertAgent1Settings(input) {
     agent_enabled: s.agentEnabled,
     ema_gate_enabled: s.emaGateEnabled,
     binance_account: s.binanceAccount,
+    min_available_wallet_pct: s.minAvailableWalletPct,
   }
   let bodyToSend = { ...body }
   let rows
   let strippedBinanceAccountDueToMissingDbColumn = false
+  let strippedMinAvailableWalletPctDueToMissingDbColumn = false
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
       rows = await supabaseRest('/rest/v1/agent_settings?on_conflict=agent_name&select=*', {
@@ -1950,6 +2064,15 @@ async function upsertAgent1Settings(input) {
         continue
       }
       if (
+        supabaseErrorIndicatesMissingColumn(msg, 'min_available_wallet_pct') &&
+        Object.hasOwn(bodyToSend, 'min_available_wallet_pct')
+      ) {
+        const { min_available_wallet_pct: _m, ...rest } = bodyToSend
+        bodyToSend = rest
+        strippedMinAvailableWalletPctDueToMissingDbColumn = true
+        continue
+      }
+      if (
         supabaseErrorIndicatesMissingColumn(msg, 'binance_account') &&
         Object.hasOwn(bodyToSend, 'binance_account')
       ) {
@@ -1960,6 +2083,11 @@ async function upsertAgent1Settings(input) {
       }
       throw e
     }
+  }
+  if (strippedMinAvailableWalletPctDueToMissingDbColumn) {
+    throw new Error(
+      'Cannot save min available wallet %: agent_settings is missing column min_available_wallet_pct. Run supabase/agent_settings_min_available_wallet_pct.sql in Supabase, then save again.',
+    )
   }
   if (strippedBinanceAccountDueToMissingDbColumn && s.binanceAccount !== 'master') {
     throw new Error(
@@ -1996,10 +2124,12 @@ async function upsertAgent3Settings(input) {
     agent_enabled: s.agentEnabled,
     ema_gate_enabled: s.emaGateEnabled,
     binance_account: s.binanceAccount,
+    min_available_wallet_pct: s.minAvailableWalletPct,
   }
   let bodyToSend = { ...body }
   let rows
   let strippedBinanceAccountDueToMissingDbColumn = false
+  let strippedMinAvailableWalletPctDueToMissingDbColumn = false
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
       rows = await supabaseRest('/rest/v1/agent_settings?on_conflict=agent_name&select=*', {
@@ -2019,6 +2149,15 @@ async function upsertAgent3Settings(input) {
         continue
       }
       if (
+        supabaseErrorIndicatesMissingColumn(msg, 'min_available_wallet_pct') &&
+        Object.hasOwn(bodyToSend, 'min_available_wallet_pct')
+      ) {
+        const { min_available_wallet_pct: _m, ...rest } = bodyToSend
+        bodyToSend = rest
+        strippedMinAvailableWalletPctDueToMissingDbColumn = true
+        continue
+      }
+      if (
         supabaseErrorIndicatesMissingColumn(msg, 'binance_account') &&
         Object.hasOwn(bodyToSend, 'binance_account')
       ) {
@@ -2029,6 +2168,11 @@ async function upsertAgent3Settings(input) {
       }
       throw e
     }
+  }
+  if (strippedMinAvailableWalletPctDueToMissingDbColumn) {
+    throw new Error(
+      'Cannot save min available wallet %: agent_settings is missing column min_available_wallet_pct. Run supabase/agent_settings_min_available_wallet_pct.sql in Supabase, then save again.',
+    )
   }
   if (strippedBinanceAccountDueToMissingDbColumn && s.binanceAccount !== 'master') {
     throw new Error(
@@ -2263,14 +2407,21 @@ function spikeExecutionLogKey(spike, symbolUpper) {
   return `${sym}:${String(spike?.candle_open_time_ms ?? '')}`
 }
 
-function isAgent1SpikeStale(spike, scanInterval) {
+/** Age from candle open at which a spike is too old to trade (env overrides fully replace this). */
+function defaultMaxSpikeAgeMs(intervalMs, scanSecondsBeforeClose) {
+  const scanBeforeMs = Math.max(0, Math.floor(Number(scanSecondsBeforeClose) || 0) * 1000)
+  const slackAfterCloseMs = Math.max(0, SPIKE_EXECUTION_TRADE_WINDOW_MS - scanBeforeMs)
+  return intervalMs + slackAfterCloseMs
+}
+
+function isAgent1SpikeStale(spike, scanInterval, scanSecondsBeforeClose) {
   const openMs = Number.parseInt(String(spike?.candle_open_time_ms ?? ''), 10)
   if (!Number.isFinite(openMs) || openMs <= 0) return false
   const intervalMs = AGENT1_INTERVAL_MS[scanInterval] ?? AGENT1_INTERVAL_MS['5m']
   const envMaxAge = Number.parseInt(String(process.env.AGENT1_EXECUTION_MAX_SPIKE_AGE_MS ?? ''), 10)
   const maxAgeMs = Number.isFinite(envMaxAge) && envMaxAge > 0
     ? envMaxAge
-    : intervalMs + 120_000
+    : defaultMaxSpikeAgeMs(intervalMs, scanSecondsBeforeClose)
   const ageMs = Date.now() - openMs
   return ageMs > maxAgeMs
 }
@@ -2360,14 +2511,14 @@ async function fetchPendingAgent3Spikes(limit = AGENT3_EXECUTION_MAX_SPIKES_PER_
   return Array.isArray(rows) ? rows : []
 }
 
-function isAgent3SpikeStale(spike, scanInterval) {
+function isAgent3SpikeStale(spike, scanInterval, scanSecondsBeforeClose) {
   const openMs = Number.parseInt(String(spike?.candle_open_time_ms ?? ''), 10)
   if (!Number.isFinite(openMs) || openMs <= 0) return false
   const intervalMs = AGENT1_INTERVAL_MS[scanInterval] ?? AGENT1_INTERVAL_MS['5m']
   const envMaxAge = Number.parseInt(String(process.env.AGENT3_EXECUTION_MAX_SPIKE_AGE_MS ?? ''), 10)
   const maxAgeMs = Number.isFinite(envMaxAge) && envMaxAge > 0
     ? envMaxAge
-    : intervalMs + 120_000
+    : defaultMaxSpikeAgeMs(intervalMs, scanSecondsBeforeClose)
   const ageMs = Date.now() - openMs
   return ageMs > maxAgeMs
 }
@@ -3070,12 +3221,21 @@ async function placeFuturesOrderWithProtection({
   }
 }
 
+function parseBinanceDecimal(v) {
+  const n = Number.parseFloat(String(v ?? ''))
+  return Number.isFinite(n) ? n : null
+}
+
 /**
  * USDT-M futures wallet (USDT) — Binance sometimes omits or zeros
  * totalWalletBalance; fall back to assets[] then /fapi/v2/balance.
+ * @param {object | null} [preloadedAccount] — optional `/fapi/v2/account` JSON to avoid a duplicate request.
  */
-async function getFuturesUsdtWalletTotal(apiKey, apiSecret) {
-  const acc = await signedFuturesJson(apiKey, apiSecret, '/fapi/v2/account', {})
+async function getFuturesUsdtWalletTotal(apiKey, apiSecret, preloadedAccount = null) {
+  const acc =
+    preloadedAccount && typeof preloadedAccount === 'object'
+      ? preloadedAccount
+      : await signedFuturesJson(apiKey, apiSecret, '/fapi/v2/account', {})
   const top = parseFloat(acc.totalWalletBalance ?? '')
   if (Number.isFinite(top) && top !== 0) {
     return top
@@ -3101,6 +3261,103 @@ async function getFuturesUsdtWalletTotal(apiKey, apiSecret) {
     }
   }
   return Number.isFinite(top) ? top : 0
+}
+
+/** One `/fapi/v2/account` pull: account-level + USDT asset fields used to compare wallet vs margin vs uPnL. */
+async function fetchFuturesBalanceBreakdown(apiKey, apiSecret) {
+  const acc = await signedFuturesJson(apiKey, apiSecret, '/fapi/v2/account', {})
+  const sizingWalletUsd = await getFuturesUsdtWalletTotal(apiKey, apiSecret, acc)
+  const ACCOUNT_FIELDS = [
+    'totalWalletBalance',
+    'totalUnrealizedProfit',
+    'totalMarginBalance',
+    'totalCrossWalletBalance',
+    'totalCrossUnPnl',
+    'availableBalance',
+    'maxWithdrawAmount',
+    'totalInitialMargin',
+    'totalMaintMargin',
+    'totalPositionInitialMargin',
+    'totalOpenOrderInitialMargin',
+  ]
+  const account = {}
+  for (const k of ACCOUNT_FIELDS) {
+    account[k] = parseBinanceDecimal(acc[k])
+  }
+  let usdtAsset = null
+  const usdt = Array.isArray(acc.assets) ? acc.assets.find((a) => a.asset === 'USDT') : null
+  if (usdt) {
+    const USDT_FIELDS = [
+      'walletBalance',
+      'unrealizedProfit',
+      'marginBalance',
+      'crossWalletBalance',
+      'crossUnPnl',
+      'availableBalance',
+      'maxWithdrawAmount',
+      'positionInitialMargin',
+      'openOrderInitialMargin',
+      'initialMargin',
+    ]
+    usdtAsset = {}
+    for (const k of USDT_FIELDS) {
+      usdtAsset[k] = parseBinanceDecimal(usdt[k])
+    }
+  }
+  return {
+    account,
+    usdtAsset,
+    sizingWalletUsd,
+    sizingNote:
+      'Agent % sizing uses getFuturesUsdtWalletTotal: totalWalletBalance when non-zero, else USDT asset walletBalance → crossWalletBalance → marginBalance, else /fapi/v2/balance.',
+    fetchedAt: new Date().toISOString(),
+  }
+}
+
+/**
+ * Policy: do not open new trades when free margin is tight vs wallet.
+ * Blocks when `availableBalance / totalWalletBalance` ≤ threshold.
+ * Uses `minAvailableWalletPct` from agent settings (0–100; 0 disables). When the DB value is null
+ * before migration, normalization falls back to `FUTURES_MIN_AVAILABLE_WALLET_PCT` (default 30).
+ */
+async function checkFuturesWalletHeadroomForNewTrades(
+  apiKey,
+  apiSecret,
+  pushLog,
+  agentLabel,
+  minAvailableWalletPct,
+) {
+  const minPct = Number.isFinite(Number(minAvailableWalletPct))
+    ? Math.min(100, Math.max(0, Math.floor(Number(minAvailableWalletPct))))
+    : envFallbackMinAvailableWalletPct()
+  if (minPct === 0) return { allow: true }
+
+  const acc = await signedFuturesJson(apiKey, apiSecret, '/fapi/v2/account', {})
+  const totalWallet = parseBinanceDecimal(acc.totalWalletBalance)
+  const available = parseBinanceDecimal(acc.availableBalance)
+  if (!Number.isFinite(totalWallet) || totalWallet <= 0) {
+    pushLog?.(
+      'warn',
+      `${agentLabel}: wallet headroom skipped — invalid totalWalletBalance (fail-open)`,
+    )
+    return { allow: true }
+  }
+  if (!Number.isFinite(available)) {
+    pushLog?.(
+      'warn',
+      `${agentLabel}: wallet headroom skipped — invalid availableBalance (fail-open)`,
+    )
+    return { allow: true }
+  }
+  const ratioPct = (available / totalWallet) * 100
+  if (ratioPct <= minPct + 1e-9) {
+    pushLog?.(
+      'warn',
+      `${agentLabel}: skip new trades — available ${ratioPct.toFixed(2)}% of wallet (≤ ${minPct}% policy; available ${available.toFixed(4)} / wallet ${totalWallet.toFixed(4)} USDT)`,
+    )
+    return { allow: false, available, totalWallet, ratioPct, minPct }
+  }
+  return { allow: true, available, totalWallet, ratioPct, minPct }
 }
 
 /**
@@ -4236,6 +4493,24 @@ app.get('/api/binance/futures-wallet', async (_req, res) => {
       totalWalletBalance,
       fetchedAt: new Date().toISOString(),
     })
+  } catch (e) {
+    return sendBinanceRouteError(res, e)
+  }
+})
+
+/** Home / debug: full USDT-M balance breakdown (master keys) for comparing wallet vs margin vs uPnL. */
+app.get('/api/binance/futures-balance-breakdown', async (_req, res) => {
+  const apiKey = process.env.BINANCE_API_KEY
+  const apiSecret = process.env.BINANCE_API_SECRET
+  if (!apiKey || !apiSecret) {
+    return res.status(503).json({
+      error:
+        'Set BINANCE_API_KEY and BINANCE_API_SECRET in a .env file in the project root.',
+    })
+  }
+  try {
+    const breakdown = await fetchFuturesBalanceBreakdown(apiKey, apiSecret)
+    res.json(breakdown)
   } catch (e) {
     return sendBinanceRouteError(res, e)
   }
