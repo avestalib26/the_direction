@@ -4,6 +4,7 @@ import { GptBacktest } from './GptBacktest'
 import { SpikeTpSlBacktest } from './SpikeTpSlBacktest'
 import { SpikeTpSlBacktestV3 } from './SpikeTpSlBacktestV3'
 import { AgentStrategiesQuickBacktest } from './AgentStrategiesQuickBacktest.jsx'
+import { AgentLongShortCompareBacktest } from './AgentLongShortCompareBacktest.jsx'
 import { The100k } from './The100k'
 import { TradeHistory } from './TradeHistory'
 import { Emotions } from './Emotions'
@@ -27,6 +28,7 @@ const APP_VIEWS = new Set([
   'gptbacktest',
   'spiketpsl',
   'spiketpslquick',
+  'longshortsim',
   'spiketpslv3',
   'agent1',
   'agent2',
@@ -172,6 +174,7 @@ function App() {
     'gptbacktest',
     'spiketpsl',
     'spiketpslquick',
+    'longshortsim',
     'spiketpslv3',
   ]
   const isBacktestView = BACKTEST_VIEWS.includes(view)
@@ -791,6 +794,18 @@ function App() {
                     Agent quick backtest
                   </a>
                 </li>
+                <li>
+                  <a
+                    href="#"
+                    className={`menu-link menu-sublink ${view === 'longshortsim' ? 'menu-link--active' : ''}`}
+                    onClick={(e) => {
+                      e.preventDefault()
+                      go('longshortsim')
+                    }}
+                  >
+                    Long / short simulation
+                  </a>
+                </li>
               </ul>
             </details>
           </li>
@@ -798,7 +813,7 @@ function App() {
       </nav>
 
       <main
-        className={`app ${view === 'breadth' || view === 'history' || view === 'emotions' || view === 'mldataset' || view === 'the100k' || view === 'gptbacktest' || view === 'spiketpsl' || view === 'spiketpslquick' || view === 'spiketpslv3' || view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' || view === 'testpage' ? 'app--breadth' : ''} ${view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' ? 'app--agent1' : ''}`}
+        className={`app ${view === 'breadth' || view === 'history' || view === 'emotions' || view === 'mldataset' || view === 'the100k' || view === 'gptbacktest' || view === 'spiketpsl' || view === 'spiketpslquick' || view === 'longshortsim' || view === 'spiketpslv3' || view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' || view === 'testpage' ? 'app--breadth' : ''} ${view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' ? 'app--agent1' : ''}`}
         id="main"
       >
         {view === 'home' && (
@@ -1048,6 +1063,7 @@ function App() {
         {view === 'gptbacktest' && <GptBacktest />}
         {view === 'spiketpsl' && <SpikeTpSlBacktest />}
         {view === 'spiketpslquick' && <AgentStrategiesQuickBacktest />}
+        {view === 'longshortsim' && <AgentLongShortCompareBacktest />}
         {view === 'spiketpslv3' && <SpikeTpSlBacktestV3 />}
         {view === 'agent1' && <Agent1 />}
         {view === 'agent2' && <Agent2 />}

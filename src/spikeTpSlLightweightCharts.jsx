@@ -2,7 +2,7 @@
  * TradingView Lightweight Charts (canvas) — avoids huge SVG DOM that can blank the page.
  * X-axis uses synthetic UTC timestamps (1 minute per trade index) so every bar is unique.
  */
-import { useLayoutEffect, useMemo, useRef } from 'react'
+import { useLayoutEffect, useMemo, useRef, useEffect, useState } from 'react'
 import {
   CandlestickSeries,
   ColorType,
@@ -18,6 +18,16 @@ const SYNTH_BASE = 1577836800 // 2020-01-01 00:00 UTC (seconds)
 
 export function synthTradeTime(tradeIndex) {
   return SYNTH_BASE + Math.max(0, tradeIndex) * 60
+}
+
+/** X-time for long/short compare mode: `pointIndex` is 0…totalPoints−1 on the equity curve (matches line chart). */
+export function compareProgressSynthTimeFromPointIndex(pointIndex, totalPoints) {
+  const n = totalPoints
+  if (!Number.isFinite(n) || n < 2) return synthTradeTime(0)
+  const pi = Math.max(0, Math.min(n - 1, Math.floor(pointIndex)))
+  const progress = pi / (n - 1)
+  const tIdx = Math.round(progress * 200000)
+  return synthTradeTime(tIdx)
 }
 
 function tradePriceReturnPctFromRow(t) {
@@ -41,6 +51,34 @@ function computeEmaOnSeries(closes, period) {
     out[i] = ema
   }
   return out
+}
+
+/** Bollinger on `closes`: SMA(period) ± mult × population stdev over the window. */
+function computeBollingerBands(closes, period, mult) {
+  const n = closes.length
+  const middle = new Array(n).fill(null)
+  const upper = new Array(n).fill(null)
+  const lower = new Array(n).fill(null)
+  const p = Math.floor(period)
+  const m = Number(mult)
+  if (!Array.isArray(closes) || n < p || p < 2 || !Number.isFinite(m) || m <= 0) {
+    return { middle, upper, lower }
+  }
+  for (let i = p - 1; i < n; i++) {
+    let sum = 0
+    for (let j = 0; j < p; j++) sum += closes[i - p + 1 + j]
+    const sma = sum / p
+    let varSum = 0
+    for (let j = 0; j < p; j++) {
+      const d = closes[i - p + 1 + j] - sma
+      varSum += d * d
+    }
+    const stdev = Math.sqrt(varSum / p)
+    middle[i] = sma
+    upper[i] = sma + m * stdev
+    lower[i] = sma - m * stdev
+  }
+  return { middle, upper, lower }
 }
 
 function buildPerTradeRows(perTradePricePctChron, tradesFallback) {
@@ -90,6 +128,20 @@ function equityToLineData(points) {
   return data.length >= 2 ? data : null
 }
 
+/** Same run progress (0→last trade) on x for both series so different trade counts are comparable. */
+function equityToCompareProgressLineData(points) {
+  if (!Array.isArray(points) || points.length < 2) return null
+  const n = points.length
+  const data = []
+  for (let i = 0; i < n; i++) {
+    const p = points[i]
+    const v = Number(p.pnlPctFromStart)
+    if (!Number.isFinite(v)) continue
+    data.push({ time: compareProgressSynthTimeFromPointIndex(i, n), value: v })
+  }
+  return data.length >= 2 ? data : null
+}
+
 function btcOverlayLineData(points) {
   if (!Array.isArray(points) || points.length < 2) return null
   const data = []
@@ -114,6 +166,130 @@ const COL_POS = '#0ecb81'
 const COL_NEG = '#f6465d'
 const COL_BTC = '#f0b90b'
 const COL_EMA_SLOW = '#f59e0b'
+const COL_COMPARE_LONG = '#22c55e'
+const COL_COMPARE_SHORT = '#ea580c'
+const COL_BB_BAND = 'rgba(96, 165, 250, 0.55)'
+const COL_BB_MID = 'rgba(147, 197, 253, 0.45)'
+
+/**
+ * Two cumulative Σ price % curves: Agent 1 long vs Agent 3 short, same y-scale.
+ * X-axis = normalized progress through each run (start → end), not wall-clock time.
+ */
+export function SpikeTpSlCompareEquityChart({
+  longPoints,
+  shortPoints,
+  showFootnote = true,
+  /** Called with chart after mount; `null` on cleanup — used to sync time scale with other panels. */
+  onChartReady = null,
+}) {
+  const containerRef = useRef(null)
+  const onChartReadyRef = useRef(onChartReady)
+  useEffect(() => {
+    onChartReadyRef.current = onChartReady
+  }, [onChartReady])
+  const longData = useMemo(() => equityToCompareProgressLineData(longPoints), [longPoints])
+  const shortData = useMemo(() => equityToCompareProgressLineData(shortPoints), [shortPoints])
+
+  useLayoutEffect(() => {
+    const el = containerRef.current
+    if (!el) return undefined
+    if ((!longData || longData.length < 2) && (!shortData || shortData.length < 2)) {
+      onChartReadyRef.current?.(null)
+      return undefined
+    }
+
+    const chart = createChart(el, {
+      layout: {
+        background: { type: ColorType.Solid, color: COL_BG },
+        textColor: COL_TEXT,
+        fontFamily: 'system-ui, Segoe UI, sans-serif',
+      },
+      grid: {
+        vertLines: { color: COL_GRID },
+        horzLines: { color: COL_GRID },
+      },
+      crosshair: { mode: CrosshairMode.Normal },
+      width: el.clientWidth,
+      height: 300,
+      timeScale: {
+        borderColor: COL_GRID,
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      rightPriceScale: {
+        visible: true,
+        borderColor: COL_GRID,
+        scaleMargins: { top: 0.08, bottom: 0.08 },
+      },
+    })
+
+    const fmtPct = {
+      type: 'custom',
+      minMove: 0.01,
+      formatter: (p) => `${Number(p).toFixed(2)}%`,
+    }
+
+    if (shortData && shortData.length >= 2) {
+      const lastS = shortData[shortData.length - 1]?.value ?? 0
+      chart.addSeries(LineSeries, {
+        color: lastS >= 0 ? COL_COMPARE_SHORT : COL_NEG,
+        lineWidth: 2,
+        priceScaleId: 'right',
+        priceFormat: fmtPct,
+      }).setData(shortData)
+    }
+
+    if (longData && longData.length >= 2) {
+      const lastL = longData[longData.length - 1]?.value ?? 0
+      chart.addSeries(LineSeries, {
+        color: lastL >= 0 ? COL_COMPARE_LONG : COL_NEG,
+        lineWidth: 2,
+        priceScaleId: 'right',
+        priceFormat: fmtPct,
+      }).setData(longData)
+    }
+
+    chart.timeScale().fitContent()
+    onChartReadyRef.current?.(chart)
+
+    const ro = new ResizeObserver(() => {
+      if (el.isConnected) chart.applyOptions({ width: el.clientWidth })
+    })
+    ro.observe(el)
+    return () => {
+      onChartReadyRef.current?.(null)
+      ro.disconnect()
+      chart.remove()
+    }
+  }, [longData, shortData])
+
+  if ((!longData || longData.length < 2) && (!shortData || shortData.length < 2)) {
+    return (
+      <p className="hourly-spikes-hint">Run both backtests with at least one trade each to plot the comparison.</p>
+    )
+  }
+
+  return (
+    <div className="spike-tpsl-lw-host">
+      <div className="spike-tpsl-compare-legend" aria-hidden="false">
+        <span className="spike-tpsl-compare-legend__item spike-tpsl-compare-legend__item--long">
+          <span className="spike-tpsl-compare-legend__swatch" /> Agent 1 (long / green spike)
+        </span>
+        <span className="spike-tpsl-compare-legend__item spike-tpsl-compare-legend__item--short">
+          <span className="spike-tpsl-compare-legend__swatch" /> Agent 3 (short / red spike)
+        </span>
+      </div>
+      <div ref={containerRef} className="spike-tpsl-lw-chart" />
+      {showFootnote ? (
+        <p className="hourly-spikes-hint spike-tpsl-lw-axis-hint">
+          <strong>Compare mode</strong>: horizontal axis is <strong>progress through each run</strong> (0% → 100% of
+          trades), not calendar time, so different trade counts align for shape comparison. <strong>Right axis</strong>:
+          cumulative Σ price % (same engine as quick backtest).
+        </p>
+      ) : null}
+    </div>
+  )
+}
 
 export function SpikeTpSlEquityLightChart({
   points,
@@ -354,9 +530,31 @@ export function SpikeTpSlPerTradeCandleLightChart({
   showFooterHint = true,
   /** `pnlFromZero` = same cumulative Σ price % axis as the equity line chart; `stack100` = 100 + Σ (legacy). */
   cumulativePnlScale = 'stack100',
+  /**
+   * `synthIndex` — one step per trade (default). `compareProgress` — x matches long/short compare line chart
+   * (requires `compareProgressEquityPointCount`).
+   */
+  chartTimeMode = 'synthIndex',
+  /** Length of `equityCurve` from the same backtest; candle *i* aligns with equity point index *i+1*. */
+  compareProgressEquityPointCount = null,
+  onChartReady = null,
+  /** When true, show a checkbox to overlay Bollinger bands (SMA ± σ) on cumulative closes. */
+  bollingerToggle = false,
+  /** SMA period for Bollinger middle (default 20). */
+  bollingerPeriod = 20,
+  /** Standard deviation multiplier (default 2). */
+  bollingerStdMult = 2,
 }) {
   const containerRef = useRef(null)
+  const onChartReadyRef = useRef(onChartReady)
+  useEffect(() => {
+    onChartReadyRef.current = onChartReady
+  }, [onChartReady])
+  const [bollingerVisible, setBollingerVisible] = useState(false)
   const emaPeriodSafe = normalizeEquityEmaPeriod(emaPeriod)
+  const bollingerPeriodSafe = Math.max(2, Math.min(500, Math.floor(Number(bollingerPeriod)) || 20))
+  const bollingerMultSafe =
+    Number.isFinite(Number(bollingerStdMult)) && Number(bollingerStdMult) > 0 ? Number(bollingerStdMult) : 2
 
   const pack = useMemo(
     () => buildPerTradeRows(perTradePricePctChron, tradesFallback),
@@ -369,6 +567,10 @@ export function SpikeTpSlPerTradeCandleLightChart({
     const rows = []
     const base = cumulativePnlScale === 'pnlFromZero' ? 0 : EQUITY_STACK_BASE
     let level = base
+    const nEq =
+      chartTimeMode === 'compareProgress' && Number.isFinite(Number(compareProgressEquityPointCount))
+        ? Math.max(2, Math.floor(Number(compareProgressEquityPointCount)))
+        : null
     for (let i = 0; i < pack.rows.length; i++) {
       const pct = Number(pack.rows[i].pct)
       const p = Number.isFinite(pct) ? pct : 0
@@ -382,13 +584,18 @@ export function SpikeTpSlPerTradeCandleLightChart({
         high = open + pad
         low = open - pad
       }
-      let t = synthTradeTime(i + 1)
+      let t
+      if (chartTimeMode === 'compareProgress' && nEq != null) {
+        t = compareProgressSynthTimeFromPointIndex(i + 1, nEq)
+      } else {
+        t = synthTradeTime(i + 1)
+      }
       while (used.has(t)) t += 1
       used.add(t)
       rows.push({ time: t, open, high, low, close })
     }
     return rows.length > 0 ? rows : null
-  }, [pack.rows, cumulativePnlScale])
+  }, [pack.rows, cumulativePnlScale, chartTimeMode, compareProgressEquityPointCount])
 
   const emaLineData = useMemo(() => {
     if (!candleData) return null
@@ -403,9 +610,34 @@ export function SpikeTpSlPerTradeCandleLightChart({
     return out.length >= 2 ? out : null
   }, [candleData, emaPeriodSafe])
 
+  const bollingerLinePack = useMemo(() => {
+    if (!candleData || candleData.length < bollingerPeriodSafe) return null
+    const closes = candleData.map((r) => r.close)
+    const { middle, upper, lower } = computeBollingerBands(closes, bollingerPeriodSafe, bollingerMultSafe)
+    const upperData = []
+    const middleData = []
+    const lowerData = []
+    for (let i = 0; i < candleData.length; i++) {
+      const t = candleData[i].time
+      const u = upper[i]
+      const mid = middle[i]
+      const lo = lower[i]
+      if (u != null && Number.isFinite(u)) upperData.push({ time: t, value: u })
+      if (mid != null && Number.isFinite(mid)) middleData.push({ time: t, value: mid })
+      if (lo != null && Number.isFinite(lo)) lowerData.push({ time: t, value: lo })
+    }
+    if (upperData.length < 2 || middleData.length < 2 || lowerData.length < 2) return null
+    return { upperData, middleData, lowerData }
+  }, [candleData, bollingerPeriodSafe, bollingerMultSafe])
+
+  const showBollingerOverlay = Boolean(bollingerToggle && bollingerVisible && bollingerLinePack)
+
   useLayoutEffect(() => {
     const el = containerRef.current
-    if (!el || !candleData || candleData.length === 0) return undefined
+    if (!el || !candleData || candleData.length === 0) {
+      onChartReadyRef.current?.(null)
+      return undefined
+    }
 
     const chart = createChart(el, {
       layout: {
@@ -437,6 +669,48 @@ export function SpikeTpSlPerTradeCandleLightChart({
       },
     })
 
+    const lineFmt =
+      cumulativePnlScale === 'pnlFromZero'
+        ? {
+            type: 'custom',
+            minMove: 0.01,
+            formatter: (p) => `${Number(p).toFixed(2)}%`,
+          }
+        : {
+            type: 'custom',
+            minMove: 0.01,
+            formatter: (p) =>
+              Number(p).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 }),
+          }
+
+    if (showBollingerOverlay && bollingerLinePack) {
+      const { upperData, middleData, lowerData } = bollingerLinePack
+      chart.addSeries(LineSeries, {
+        color: COL_BB_BAND,
+        lineWidth: 1,
+        crosshairMarkerVisible: false,
+        lastValueVisible: false,
+        priceLineVisible: false,
+        priceFormat: lineFmt,
+      }).setData(lowerData)
+      chart.addSeries(LineSeries, {
+        color: COL_BB_BAND,
+        lineWidth: 1,
+        crosshairMarkerVisible: false,
+        lastValueVisible: false,
+        priceLineVisible: false,
+        priceFormat: lineFmt,
+      }).setData(upperData)
+      chart.addSeries(LineSeries, {
+        color: COL_BB_MID,
+        lineWidth: 1,
+        crosshairMarkerVisible: false,
+        lastValueVisible: false,
+        priceLineVisible: false,
+        priceFormat: lineFmt,
+      }).setData(middleData)
+    }
+
     const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: COL_POS,
       downColor: COL_NEG,
@@ -454,21 +728,31 @@ export function SpikeTpSlPerTradeCandleLightChart({
         crosshairMarkerVisible: true,
         lastValueVisible: true,
         priceLineVisible: false,
+        priceFormat: lineFmt,
       })
       emaSeries.setData(emaLineData)
     }
 
     chart.timeScale().fitContent()
+    onChartReadyRef.current?.(chart)
 
     const ro = new ResizeObserver(() => {
       if (el.isConnected) chart.applyOptions({ width: el.clientWidth })
     })
     ro.observe(el)
     return () => {
+      onChartReadyRef.current?.(null)
       ro.disconnect()
       chart.remove()
     }
-  }, [candleData, emaLineData, emaPeriodSafe, cumulativePnlScale])
+  }, [
+    candleData,
+    emaLineData,
+    emaPeriodSafe,
+    cumulativePnlScale,
+    showBollingerOverlay,
+    bollingerLinePack,
+  ])
 
   if (!candleData) {
     return (
@@ -481,6 +765,32 @@ export function SpikeTpSlPerTradeCandleLightChart({
 
   return (
     <div className="spike-tpsl-lw-host spike-tpsl-pertrade-candle-host">
+      {bollingerToggle ? (
+        <label
+          className="spike-tpsl-bollinger-toggle"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            marginBottom: '0.5rem',
+            fontSize: '0.8125rem',
+            color: COL_TEXT,
+            cursor: 'pointer',
+            userSelect: 'none',
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={bollingerVisible}
+            onChange={(e) => setBollingerVisible(e.target.checked)}
+            disabled={!bollingerLinePack}
+          />
+          <span>
+            Bollinger bands (SMA {bollingerPeriodSafe}, {bollingerMultSafe}σ on cumulative close)
+            {!bollingerLinePack ? ' — need more trades' : ''}
+          </span>
+        </label>
+      ) : null}
       {serverSubsampled && (
         <p className="hourly-spikes-hint spike-tpsl-pertrade-sample-hint">
           API sent <strong>{candleData.length}</strong> stacked bars of <strong>{fmtInt(fullN)}</strong> total
@@ -619,6 +929,93 @@ export function BtcOhlcEmaChart({ candles, emaPeriod = 50 }) {
   return (
     <div className="spike-tpsl-lw-host">
       <div ref={containerRef} className="spike-tpsl-lw-chart" />
+    </div>
+  )
+}
+
+/**
+ * Simulated account balance (USDT). `points`: `{ time, value }` with synthetic times (e.g. compareProgress or synth index).
+ */
+export function SpikeTpSlAccountBalanceLightChart({ points, showFootnote = true }) {
+  const containerRef = useRef(null)
+  const lineData = useMemo(() => {
+    if (!Array.isArray(points) || points.length < 2) return null
+    const data = []
+    for (const p of points) {
+      const t = p.time
+      const v = Number(p.value)
+      if (!Number.isFinite(t) || !Number.isFinite(v)) continue
+      data.push({ time: t, value: v })
+    }
+    return data.length >= 2 ? data : null
+  }, [points])
+
+  useLayoutEffect(() => {
+    const el = containerRef.current
+    if (!el || !lineData) return undefined
+
+    const startVal = lineData[0]?.value ?? 0
+    const lastVal = lineData[lineData.length - 1]?.value ?? 0
+
+    const chart = createChart(el, {
+      layout: {
+        background: { type: ColorType.Solid, color: COL_BG },
+        textColor: COL_TEXT,
+        fontFamily: 'system-ui, Segoe UI, sans-serif',
+      },
+      grid: {
+        vertLines: { color: COL_GRID },
+        horzLines: { color: COL_GRID },
+      },
+      crosshair: { mode: CrosshairMode.Normal },
+      width: el.clientWidth,
+      height: 260,
+      timeScale: {
+        borderColor: COL_GRID,
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      rightPriceScale: {
+        borderColor: COL_GRID,
+        scaleMargins: { top: 0.08, bottom: 0.08 },
+      },
+    })
+
+    chart.addSeries(LineSeries, {
+      color: lastVal >= startVal ? COL_POS : COL_NEG,
+      lineWidth: 2,
+      priceFormat: {
+        type: 'custom',
+        minMove: 0.01,
+        formatter: (p) => `${Number(p).toFixed(2)} USDT`,
+      },
+    }).setData(lineData)
+
+    chart.timeScale().fitContent()
+
+    const ro = new ResizeObserver(() => {
+      if (el.isConnected) chart.applyOptions({ width: el.clientWidth })
+    })
+    ro.observe(el)
+    return () => {
+      ro.disconnect()
+      chart.remove()
+    }
+  }, [lineData])
+
+  if (!lineData) {
+    return <p className="hourly-spikes-hint">Not enough trades to plot account balance.</p>
+  }
+
+  return (
+    <div className="spike-tpsl-lw-host">
+      <div ref={containerRef} className="spike-tpsl-lw-chart" />
+      {showFootnote ? (
+        <p className="hourly-spikes-hint spike-tpsl-lw-axis-hint">
+          <strong>Right axis</strong>: simulated balance (USDT). X-axis matches the run&apos;s trade progress (same as
+          cumulative Σ chart when using compare mode).
+        </p>
+      ) : null}
     </div>
   )
 }

@@ -5,6 +5,7 @@ import {
   normalizeEquityEmaPeriod,
 } from './equityEmaInteractiveFilter.js'
 import { SpikeTpSlEquityLightChart } from './spikeTpSlLightweightCharts.jsx'
+import { consumeQuickBacktestStream, MAX_QUICK_BACKTEST_CANDLES } from './spikeQuickBacktestClient.js'
 
 const INTERVAL_OPTIONS = [
   { value: '1m', label: '1m' },
@@ -16,7 +17,7 @@ const INTERVAL_OPTIONS = [
   { value: '4h', label: '4h' },
 ]
 
-const MAX_CANDLES = 20000
+const MAX_CANDLES = MAX_QUICK_BACKTEST_CANDLES
 const PROGRESS_CAP = 48
 /** Fixed EMA period on stacked equity (matches API `equityEmaSlow: 50`). */
 const QUICK_EMA_PERIOD = 50
@@ -32,43 +33,6 @@ function pushProgress(setLog, line) {
   })
 }
 
-async function consumeQuickBacktestStream(query, onEvent) {
-  const res = await fetch(`/api/binance/spike-tpsl-quick-backtest/stream?${query}`, {
-    cache: 'no-store',
-    credentials: 'same-origin',
-  })
-  if (!res.ok) {
-    const t = await res.text().catch(() => '')
-    throw new Error(t || `HTTP ${res.status}`)
-  }
-  const reader = res.body?.getReader()
-  if (!reader) throw new Error('No response body')
-  const dec = new TextDecoder()
-  let buf = ''
-  let last = null
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += dec.decode(value, { stream: true })
-    for (;;) {
-      const sep = buf.indexOf('\n\n')
-      if (sep < 0) break
-      const block = buf.slice(0, sep).trim()
-      buf = buf.slice(sep + 2)
-      const dataLine = block
-        .split('\n')
-        .map((l) => l.trim())
-        .find((l) => l.startsWith('data:'))
-      if (!dataLine) continue
-      const json = dataLine.replace(/^data:\s?/, '')
-      const obj = JSON.parse(json)
-      last = obj
-      onEvent(obj)
-    }
-  }
-  return last
-}
-
 export function AgentStrategiesQuickBacktest() {
   const [minQuoteVolume24h, setMinQuoteVolume24h] = useState('1000000')
   const [interval, setInterval] = useState('5m')
@@ -76,7 +40,7 @@ export function AgentStrategiesQuickBacktest() {
   const [strategy, setStrategy] = useState('long')
   const [candleCount, setCandleCount] = useState('8000')
   const [tpR, setTpR] = useState('2')
-  const [maxSymbols, setMaxSymbols] = useState('120')
+  const [maxSymbols, setMaxSymbols] = useState('300')
   /** When on: EMA stats + filtered cumulative chart use cumulative &gt; EMA(50) at entry (server flags). */
   const [equityEmaStatsFilterOn, setEquityEmaStatsFilterOn] = useState(true)
 
