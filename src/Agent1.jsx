@@ -609,7 +609,7 @@ export function Agent1() {
   }
 
   return (
-    <div className="vol-screener agent1-page">
+    <div className="vol-screener agent1-page agent1-page--long">
       <nav className="agent1-tabs" aria-label="Agent 1 sections">
         {sectionTabs.map((tab) => (
           <button
@@ -622,67 +622,10 @@ export function Agent1() {
           </button>
         ))}
       </nav>
-      {scanStatus ? (
-        <div className="risk-summary agent1-risk-summary">
-          <div className="risk-chip">
-            Agent (master):{' '}
-            <strong>{scanStatus.agentEnabled !== false ? 'ON' : 'OFF'}</strong>
-            <span className="hourly-spikes-hint"> (header)</span>
-          </div>
-          <div className="risk-chip">
-            Scheduler:{' '}
-            <strong>{scanStatus.schedulerEnabled ? 'enabled' : 'disabled'}</strong>
-            {!scanStatus.schedulerEnabled ? (
-              <span className="hourly-spikes-hint"> (API has AGENT1_SCAN_SCHEDULER=false)</span>
-            ) : null}
-          </div>
-          <div className="risk-chip">
-            Next run: <strong>{fmtIst(scanStatus.nextFireAt)}</strong>
-          </div>
-          <div className="risk-chip">
-            Last run: <strong>{fmtIst(scanStatus.lastRunAt)}</strong>
-          </div>
-          <div className="risk-chip">
-            Last spikes written: <strong>{scanStatus.lastSpikeCount ?? '—'}</strong>
-          </div>
-          <div className="risk-chip">
-            Curve PnL: <strong>{Number.isFinite(Number(regime?.latestCumPnlPct)) ? `${Number(regime.latestCumPnlPct).toFixed(3)}%` : '—'}</strong>
-          </div>
-          <div className="risk-chip">
-            EMA50: <strong>{Number.isFinite(Number(regime?.emaValue)) ? `${Number(regime.emaValue).toFixed(3)}%` : '—'}</strong>
-          </div>
-          <div className="risk-chip">
-            Gate:{' '}
-            <strong>
-              {emaGateEnabled ? (regime?.gateAllowLong ? 'ALLOW LONG' : 'BLOCK LONG') : 'DISABLED (BYPASS)'}
-            </strong>
-          </div>
-          <div className="risk-chip">
-            EMA gate: <strong>{emaGateEnabled ? 'ON' : 'OFF'}</strong>
-          </div>
-          <div className="risk-chip">
-            Exec loop: <strong>{execution?.state?.running ? 'running' : 'idle'}</strong>
-          </div>
-          <div className="risk-chip">
-            Exec lease: <strong>{execution?.state?.leaseOwner ? 'owner' : 'standby'}</strong>
-          </div>
-          <div className="risk-chip">
-            Last placed: <strong>{execution?.state?.lastPlaced ?? 0}</strong>
-          </div>
-          {scanStatus.running ? (
-            <div className="risk-chip">
-              <strong>Scan in progress…</strong>
-            </div>
-          ) : null}
-          {scanStatus.lastError ? (
-            <div className="risk-chip" style={{ color: '#b91c1c' }}>
-              Error: {scanStatus.lastError}
-            </div>
-          ) : null}
-        </div>
-      ) : null}
-
-      <h2 className="vol-screener-title agent1-section-title">Futures account</h2>
+      <p className="agent1-page-lead">
+        <strong>Agent 1</strong> — long USDT-M perps on <strong>green-body</strong> spikes. Optional{' '}
+        <strong>EMA regime gate</strong> can block entries when the stacked curve is below its EMA.
+      </p>
       <div className="agent1-account-tablet">
         {accountMetricsError ? (
           <p className="vol-screener-lead agent1-account-tablet__err" role="alert">
@@ -694,6 +637,23 @@ export function Agent1() {
             <span className="agent1-account-tablet__label">Wallet (USDT-M)</span>
             <strong className="agent1-account-tablet__value">
               {accountMetrics ? `${fmtUsd2(accountMetrics.futuresWalletUsdt)} USDT` : '—'}
+            </strong>
+          </div>
+          <div className="agent1-account-tablet__cell">
+            <span className="agent1-account-tablet__label">Margin free (% of wallet)</span>
+            <strong
+              className="agent1-account-tablet__value"
+              title={
+                accountMetrics?.availableBalanceUsdt != null &&
+                accountMetrics?.marginAvailablePct != null &&
+                Number.isFinite(Number(accountMetrics.marginAvailablePct))
+                  ? `${fmtUsd2(accountMetrics.availableBalanceUsdt)} USDT available · Binance availableBalance ÷ totalWalletBalance`
+                  : 'Binance USDT-M: availableBalance as % of totalWalletBalance (same check as min-available guard)'
+              }
+            >
+              {accountMetrics?.marginAvailablePct != null && Number.isFinite(Number(accountMetrics.marginAvailablePct))
+                ? `${Number(accountMetrics.marginAvailablePct).toFixed(1)}%`
+                : '—'}
             </strong>
           </div>
           <div className="agent1-account-tablet__cell">
@@ -725,20 +685,8 @@ export function Agent1() {
                   ? `${fmtUsd2(Number.parseFloat(tradeSizeUsd))} USDT`
                   : '—'}
             </strong>
-            {accountMetrics && typeof accountMetrics.tradeMarginDetail === 'string' ? (
-              <span className="agent1-account-tablet__sub">{accountMetrics.tradeMarginDetail}</span>
-            ) : null}
           </div>
         </div>
-        <p className="hourly-spikes-hint agent1-account-tablet__hint">
-          Binance route: <strong>{accountMetrics?.binanceAccount ?? binanceAccount}</strong>
-          {accountMetrics?.fetchedAt ? (
-            <>
-              {' '}
-              · updated {fmtIst(accountMetrics.fetchedAt)}
-            </>
-          ) : null}
-        </p>
       </div>
 
       <div className="agent1-form-actions" style={{ marginBottom: '0.75rem' }}>
@@ -753,6 +701,69 @@ export function Agent1() {
           Refresh account metrics
         </button>
       </div>
+      {scanStatus ? (
+        <div className="risk-summary agent1-risk-summary">
+          <div className="risk-chip">
+            Header toggle:{' '}
+            <strong>{scanStatus.agentEnabled !== false ? 'ON' : 'OFF'}</strong>
+            <span className="hourly-spikes-hint"> (top bar)</span>
+          </div>
+          <div className="risk-chip">
+            Scheduler:{' '}
+            <strong>{scanStatus.schedulerEnabled ? 'enabled' : 'disabled'}</strong>
+            {!scanStatus.schedulerEnabled ? (
+              <span className="hourly-spikes-hint"> (API has AGENT1_SCAN_SCHEDULER=false)</span>
+            ) : null}
+          </div>
+          <div className="risk-chip">
+            Next run: <strong>{fmtIst(scanStatus.nextFireAt)}</strong>
+          </div>
+          <div className="risk-chip">
+            Last run: <strong>{fmtIst(scanStatus.lastRunAt)}</strong>
+          </div>
+          <div className="risk-chip">
+            Last spikes written: <strong>{scanStatus.lastSpikeCount ?? '—'}</strong>
+          </div>
+          <div className="risk-chip">
+            Curve PnL:{' '}
+            <strong>
+              {Number.isFinite(Number(regime?.latestCumPnlPct)) ? `${Number(regime.latestCumPnlPct).toFixed(3)}%` : '—'}
+            </strong>
+          </div>
+          <div className="risk-chip">
+            EMA50:{' '}
+            <strong>{Number.isFinite(Number(regime?.emaValue)) ? `${Number(regime.emaValue).toFixed(3)}%` : '—'}</strong>
+          </div>
+          <div className="risk-chip">
+            Gate:{' '}
+            <strong>
+              {emaGateEnabled ? (regime?.gateAllowLong ? 'ALLOW LONG' : 'BLOCK LONG') : 'DISABLED (BYPASS)'}
+            </strong>
+          </div>
+          <div className="risk-chip">
+            EMA gate: <strong>{emaGateEnabled ? 'ON' : 'OFF'}</strong>
+          </div>
+          <div className="risk-chip">
+            Exec loop: <strong>{execution?.state?.running ? 'running' : 'idle'}</strong>
+          </div>
+          <div className="risk-chip">
+            Exec lease: <strong>{execution?.state?.leaseOwner ? 'owner' : 'standby'}</strong>
+          </div>
+          <div className="risk-chip">
+            Last placed: <strong>{execution?.state?.lastPlaced ?? 0}</strong>
+          </div>
+          {scanStatus.running ? (
+            <div className="risk-chip">
+              <strong>Scan in progress…</strong>
+            </div>
+          ) : null}
+          {scanStatus.lastError ? (
+            <div className="risk-chip" style={{ color: '#b91c1c' }}>
+              Error: {scanStatus.lastError}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       {simResult ? (
         <div className="agent1-sim-result">
           <div className="agent1-sim-metrics-tablet">
@@ -803,8 +814,7 @@ export function Agent1() {
             tradesFallback={simResult.trades}
             totalTradeRows={simResult.totalTradeRows}
             serverSubsampled={Boolean(simResult.perTradePricePctSubsampled)}
-            emaFastPeriod={10}
-            emaSlowPeriod={50}
+            emaPeriod={50}
             cumulativePnlScale="pnlFromZero"
             showFooterHint={false}
           />
@@ -937,7 +947,11 @@ export function Agent1() {
       <h2 ref={executionRef} className="vol-screener-title agent1-section-title agent1-anchor-target">
         Execution
       </h2>
-      <div className="backtest1-form agent1-form" aria-busy={loading}>
+      <p className="hourly-spikes-hint agent1-section-hint">
+        EMA gate toggles regime filter for live entries. Below: sizing, scan cadence, and spike filters — same engine as
+        simulation above.
+      </p>
+      <div className="backtest1-form agent1-form agent1-form--compact-fields" aria-busy={loading}>
         <div className="agent1-form-actions" style={{ gridColumn: '1 / -1', paddingTop: 0 }}>
           <button
             type="button"
@@ -950,6 +964,19 @@ export function Agent1() {
               : `EMA gate: ${emaGateEnabled ? 'ON (click to disable)' : 'OFF (click to enable)'}`}
           </button>
         </div>
+        <label className="backtest1-field">
+          <span className="backtest1-label">Binance account</span>
+          <select
+            className="backtest1-input"
+            value={binanceAccount}
+            onChange={(e) => setBinanceAccount(e.target.value)}
+            disabled={loading || saving}
+          >
+            <option value="master">Master (or BINANCE_API_KEY)</option>
+            <option value="sub1">Sub 1</option>
+            <option value="sub2">Sub 2</option>
+          </select>
+        </label>
         <label className="backtest1-field">
           <span className="backtest1-label">Trade size (USDT margin)</span>
           <input
@@ -974,10 +1001,6 @@ export function Agent1() {
             onChange={(e) => setTradeSizeWalletPct(e.target.value)}
             disabled={loading || saving}
           />
-          <span className="backtest1-footnote" style={{ gridColumn: '1 / -1', marginTop: 4 }}>
-            0 = use fixed USDT margin only. If &gt; 0, each order uses that % of USDT-M wallet balance as margin
-            (falls back to fixed margin if the wallet cannot be read).
-          </span>
         </label>
         <label className="backtest1-field">
           <span className="backtest1-label">Min available balance (% of wallet)</span>
@@ -991,11 +1014,6 @@ export function Agent1() {
             onChange={(e) => setMinAvailableWalletPct(e.target.value)}
             disabled={loading || saving}
           />
-          <span className="backtest1-footnote" style={{ gridColumn: '1 / -1', marginTop: 4 }}>
-            Block new entries when Binance <code>availableBalance</code> / <code>totalWalletBalance</code> is at or below
-            this percent. Use 0 to disable. Uses server env default until you run{' '}
-            <code>supabase/agent_settings_min_available_wallet_pct.sql</code> and save.
-          </span>
         </label>
         <label className="backtest1-field">
           <span className="backtest1-label">Leverage</span>
@@ -1020,19 +1038,6 @@ export function Agent1() {
           >
             <option value="cross">Cross</option>
             <option value="isolated">Isolated</option>
-          </select>
-        </label>
-        <label className="backtest1-field">
-          <span className="backtest1-label">Binance account</span>
-          <select
-            className="backtest1-input"
-            value={binanceAccount}
-            onChange={(e) => setBinanceAccount(e.target.value)}
-            disabled={loading || saving}
-          >
-            <option value="master">Master (or BINANCE_API_KEY)</option>
-            <option value="sub1">Sub 1</option>
-            <option value="sub2">Sub 2</option>
           </select>
         </label>
         <label className="backtest1-field">
@@ -1177,7 +1182,7 @@ export function Agent1() {
             <option value="both">Both</option>
           </select>
         </label>
-        <div className="agent1-form-actions">
+        <div className="agent1-form-actions agent1-form-actions--footer">
           <button type="button" className="backtest1-btn" onClick={onSave} disabled={loading || saving}>
             {saving ? 'Saving…' : 'Save Agent 1 Settings'}
           </button>
@@ -1194,11 +1199,13 @@ export function Agent1() {
           >
             Refresh spikes / status
           </button>
+          {savedAt ? (
+            <span className="agent1-saved-meta" title="Settings write time (IST)">
+              Saved {fmtIst(savedAt)}
+            </span>
+          ) : null}
         </div>
       </div>
-      {savedAt ? (
-        <p className="hourly-spikes-hint">Last saved: {fmtIst(savedAt)}</p>
-      ) : null}
       {error ? (
         <p className="vol-screener-lead" role="alert" style={{ color: '#b91c1c' }}>
           {error}

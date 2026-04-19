@@ -197,6 +197,7 @@ export async function runAgent1ShadowTickOnce(deps) {
  * @param {{ log?: typeof console.log, error?: typeof console.error }} [deps.logger]
  * @param {() => Promise<boolean> | boolean} [deps.shouldRunTick] - return false to skip this tick (e.g. not lease owner).
  * @param {(snapshot: object) => Promise<void> | void} [deps.afterTick] - called after successful run.
+ * @param {() => Promise<void> | void} [deps.syncPausedFromDb] - when DB coordination is on, reload pause flag from shared snapshot before replay/mark (so any instance’s PATCH reaches the lease owner).
  * @param {() => Promise<boolean> | boolean} [deps.shouldMarkTick] - return false to skip mark-to-market updates.
  * @param {(snapshot: object) => Promise<void> | void} [deps.afterMarkTick] - called after successful mark update.
  */
@@ -207,6 +208,7 @@ export function startAgent1ShadowScheduler(deps) {
     logger = console,
     shouldRunTick = null,
     afterTick = null,
+    syncPausedFromDb = null,
     shouldMarkTick = null,
     afterMarkTick = null,
   } = deps
@@ -261,6 +263,13 @@ export function startAgent1ShadowScheduler(deps) {
 
   async function runMarkTick() {
     if (stopped) return
+    if (syncPausedFromDb) {
+      try {
+        await syncPausedFromDb()
+      } catch {
+        // ignore; keep last in-memory flag
+      }
+    }
     if (agent1ShadowSimulationPaused) return
     if (!latestOpenTradesRaw.length) return
     try {
@@ -325,6 +334,13 @@ export function startAgent1ShadowScheduler(deps) {
     agent1ShadowSchedulerState.running = true
     agent1ShadowSchedulerState.lastError = null
     try {
+      if (syncPausedFromDb) {
+        try {
+          await syncPausedFromDb()
+        } catch {
+          // ignore
+        }
+      }
       if (shouldRunTick) {
         const ok = await shouldRunTick()
         if (!ok) return

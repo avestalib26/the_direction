@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   computeEquityEmaFilterStats,
   computePerTradeSubsampleStats,
-  normalizeEquityEmaPair,
+  normalizeEquityEmaPeriod,
 } from './equityEmaInteractiveFilter.js'
 import {
   SpikeTpSlEquityLightChart,
@@ -81,31 +81,35 @@ function computeEmaSeries(closes, period) {
   return out
 }
 
-function buildInteractiveEmaCurvePoints(pcts, filterOn, emaFastPeriod, emaSlowPeriod) {
+function buildInteractiveEmaCurvePoints(pcts, filterOn, emaPeriod, entryOkByTrade = null) {
   if (!Array.isArray(pcts) || pcts.length === 0) return null
   const numeric = pcts.map((x) => (Number.isFinite(Number(x)) ? Number(x) : 0))
+  const n = numeric.length
+  const useEntryFlags = filterOn && Array.isArray(entryOkByTrade) && entryOkByTrade.length === n
   const closes = []
   let level = 100
   for (let i = 0; i < numeric.length; i++) {
     level += numeric[i]
     closes.push(level)
   }
-  const emaFast = computeEmaSeries(closes, emaFastPeriod)
-  const emaSlow = computeEmaSeries(closes, emaSlowPeriod)
+  const emaRow = computeEmaSeries(closes, emaPeriod)
 
   let keptCum = 0
   const points = [{ tradeIndex: 0, pnlPctFromStart: 0, entryOpenTime: null }]
   for (let i = 0; i < numeric.length; i++) {
     let keep = true
-    if (filterOn && i > 0) {
-      const ef = emaFast[i - 1]
-      const es = emaSlow[i - 1]
-      keep =
-        ef == null ||
-        es == null ||
-        !Number.isFinite(ef) ||
-        !Number.isFinite(es) ||
-        ef > es
+    if (filterOn) {
+      if (useEntryFlags) {
+        keep = entryOkByTrade[i] === true
+      } else if (i > 0) {
+        const c = closes[i - 1]
+        const e = emaRow[i - 1]
+        keep =
+          e == null ||
+          !Number.isFinite(c) ||
+          !Number.isFinite(e) ||
+          c > e
+      }
     }
     if (keep) keptCum += numeric[i]
     points.push({
@@ -186,10 +190,9 @@ export function SpikeTpSlBacktest() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [data, setData] = useState(null)
-  /** Fast / slow EMA periods on stacked equity (chart + filter); defaults 10 / 50. */
-  const [equityEmaFastPeriod, setEquityEmaFastPeriod] = useState('10')
-  const [equityEmaSlowPeriod, setEquityEmaSlowPeriod] = useState('50')
-  /** When true, stats count only trades where fast EMA &gt; slow EMA before entry; when false, all subsample trades. */
+  /** EMA period on stacked equity (chart + filter); default 50. */
+  const [equityEmaPeriod, setEquityEmaPeriod] = useState('50')
+  /** When true, stats count only trades where stacked cumulative &gt; EMA before entry; when false, all subsample trades. */
   const [equityEmaStatsFilterOn, setEquityEmaStatsFilterOn] = useState(true)
   /** Take-profit multiple vs 1R stop (long / red short); green short uses this for stop width (TP still spike low). */
   const [tpR, setTpR] = useState('2')
@@ -238,12 +241,14 @@ export function SpikeTpSlBacktest() {
       const td = String(toDate).trim()
       const maxSl = Number.parseFloat(String(maxSlPct).trim())
       const tpRVal = Number.parseFloat(String(tpR).replace(/,/g, '').trim())
+      const ep = Number.parseInt(String(equityEmaPeriod).trim(), 10)
       const out = await fetchBacktest({
         minQuoteVolume24h: Number.isFinite(mv) && mv >= 0 ? mv : DEFAULT_MIN_VOL,
         interval,
         candleCount: n,
         thresholdPct: th,
         strategy,
+        equityEmaSlow: Number.isFinite(ep) && ep >= 2 ? ep : 50,
         ...(fd && td ? { fromDate: fd, toDate: td } : {}),
         ...(Number.isFinite(maxSl) && maxSl > 0 ? { maxSlPct: maxSl } : {}),
         ...(slAtSpikeOpen ? { slAtSpikeOpen: true } : {}),
@@ -294,6 +299,7 @@ export function SpikeTpSlBacktest() {
     isLongEmaSlopeStrategy,
     isShortStrategyFamily,
     isFixedTpStrategy,
+    equityEmaPeriod,
   ])
 
   const tpRDisplay = useMemo(() => {
@@ -304,9 +310,9 @@ export function SpikeTpSlBacktest() {
   const s = data?.summary
   const emaFilterCol = Boolean(data?.emaFilterApplied ?? data?.emaLongFilterApplied)
 
-  const { fast: equityEmaFastNum, slow: equityEmaSlowNum } = useMemo(
-    () => normalizeEquityEmaPair(equityEmaFastPeriod, equityEmaSlowPeriod),
-    [equityEmaFastPeriod, equityEmaSlowPeriod],
+  const equityEmaPeriodNum = useMemo(
+    () => normalizeEquityEmaPeriod(equityEmaPeriod),
+    [equityEmaPeriod],
   )
 
   const equityEmaStats = useMemo(() => {
@@ -318,19 +324,43 @@ export function SpikeTpSlBacktest() {
     const oc = data?.perTradeOutcomeChron
     const outcomes = Array.isArray(oc) && oc.length === pcts.length ? oc : null
     if (equityEmaStatsFilterOn) {
-      return computeEquityEmaFilterStats(pcts, r, outcomes, equityEmaFastNum, equityEmaSlowNum)
+      const entryOk = data?.perTradeEquityEmaAtEntryOk
+      return computeEquityEmaFilterStats(
+        pcts,
+        r,
+        outcomes,
+        equityEmaPeriodNum,
+        Array.isArray(entryOk) && entryOk.length === pcts.length ? entryOk : null,
+      )
     }
     return computePerTradeSubsampleStats(pcts, r, outcomes)
-  }, [data, equityEmaFastNum, equityEmaSlowNum, equityEmaStatsFilterOn])
+  }, [data, equityEmaPeriodNum, equityEmaStatsFilterOn])
   const equityEmaInteractiveCurvePoints = useMemo(() => {
+    const serverFiltered = data?.equityEmaFilteredCurve
+    if (
+      equityEmaStatsFilterOn &&
+      Array.isArray(serverFiltered) &&
+      serverFiltered.length > 1
+    ) {
+      return serverFiltered
+    }
     const pcts = data?.perTradePricePctChron
+    const entryOk = data?.perTradeEquityEmaAtEntryOk
+    const n = Array.isArray(pcts) ? pcts.length : 0
+    const entryOkAligned =
+      Array.isArray(entryOk) && n > 0 && entryOk.length === n ? entryOk : null
     return buildInteractiveEmaCurvePoints(
       pcts,
       equityEmaStatsFilterOn,
-      equityEmaFastNum,
-      equityEmaSlowNum,
+      equityEmaPeriodNum,
+      entryOkAligned,
     )
-  }, [data, equityEmaStatsFilterOn, equityEmaFastNum, equityEmaSlowNum])
+  }, [data, equityEmaStatsFilterOn, equityEmaPeriodNum])
+  /** Same downsample as main equity chart — comparable to the bold filtered line from the API. */
+  const equityEmaInteractiveUnfilteredBaseline = useMemo(() => {
+    if (!equityEmaStatsFilterOn || !data?.equityCurve) return null
+    return data.equityCurve
+  }, [equityEmaStatsFilterOn, data?.equityCurve])
   const tpLbl = data?.tpStatLabel ?? 'TP (2R)'
   const slLbl = data?.slStatLabel ?? 'SL (-1R)'
   const longSide = s?.bySide?.long
@@ -948,49 +978,35 @@ export function SpikeTpSlBacktest() {
               <div className="spike-tpsl-pertrade-candle-toolbar">
                 <h3 className="hourly-spikes-h3 spike-tpsl-pertrade-candle-h3">Stacked equity candles + EMA</h3>
                 <label className="spike-tpsl-pertrade-ema-inline">
-                  <span className="spike-tpsl-pertrade-ema-inline-label">Fast EMA</span>
+                  <span className="spike-tpsl-pertrade-ema-inline-label">EMA period</span>
                   <input
                     className="vol-screener-input vol-screener-input--narrow"
                     type="text"
                     inputMode="numeric"
-                    aria-label="Stacked equity fast EMA period"
-                    placeholder="10"
-                    value={equityEmaFastPeriod}
-                    onChange={(e) => setEquityEmaFastPeriod(e.target.value)}
-                  />
-                </label>
-                <label className="spike-tpsl-pertrade-ema-inline">
-                  <span className="spike-tpsl-pertrade-ema-inline-label">Slow EMA</span>
-                  <input
-                    className="vol-screener-input vol-screener-input--narrow"
-                    type="text"
-                    inputMode="numeric"
-                    aria-label="Stacked equity slow EMA period"
+                    aria-label="Stacked equity EMA period"
                     placeholder="50"
-                    value={equityEmaSlowPeriod}
-                    onChange={(e) => setEquityEmaSlowPeriod(e.target.value)}
+                    value={equityEmaPeriod}
+                    onChange={(e) => setEquityEmaPeriod(e.target.value)}
                   />
                 </label>
               </div>
               <p className="hourly-spikes-hint">
                 Same order as the histogram: <strong>100 + cumulative Σ price %</strong> after each trade — bodies
-                only (no wicks). Two EMAs on the closes; if fast &gt; slow is wrong way round in the fields, periods
-                are auto-swapped. Chart updates live.
+                only (no wicks). One EMA on the cumulative close. Chart updates live.
               </p>
               <SpikeTpSlPerTradeCandleLightChart
                 perTradePricePctChron={data.perTradePricePctChron}
                 tradesFallback={data.trades}
                 totalTradeRows={data.totalTradeRows}
                 serverSubsampled={Boolean(data.perTradePricePctSubsampled)}
-                emaFastPeriod={equityEmaFastNum}
-                emaSlowPeriod={equityEmaSlowNum}
+                emaPeriod={equityEmaPeriodNum}
               />
               <div className="spike-tpsl-equity-ema-panel">
                 <h4 className="spike-tpsl-equity-ema-title">Equity EMA filter (interactive)</h4>
                 <p className="hourly-spikes-hint spike-tpsl-equity-ema-lead">
-                  When the filter is <strong>on</strong>, only trades where <strong>fast EMA &gt; slow EMA</strong> on
-                  the prior stacked-equity close are counted (same periods as the chart). When <strong>off</strong>,
-                  stats use every trade in the subsample. No re-fetch — subsampled runs are approximate.
+                  When the filter is <strong>on</strong>, trades are counted only when <strong>stacked cumulative &gt;
+                  EMA</strong> at entry (same series as the candle chart). Same EMA period as above; re-run the
+                  backtest after changing it. Subsampled runs are approximate.
                 </p>
                 <label className="vol-screener-field spike-tpsl-sl-open-toggle spike-tpsl-equity-ema-toggle">
                   <input
@@ -999,8 +1015,8 @@ export function SpikeTpSlBacktest() {
                     onChange={(e) => setEquityEmaStatsFilterOn(e.target.checked)}
                   />
                   <span>
-                    <strong>Equity EMA crossover filter</strong> — off = all trades; on = only when fast EMA is above
-                    slow EMA before entry.
+                    <strong>Equity EMA filter</strong> — off = all trades; on = only when cumulative stack is above
+                    EMA before entry (full TP/SL still counts for kept entries).
                   </span>
                 </label>
                 {!data.perTradeRChron?.length ? (
@@ -1013,14 +1029,14 @@ export function SpikeTpSlBacktest() {
                       <div className="backtest1-stat">
                         <span className="backtest1-stat-label">Stats mode</span>
                         <span className="backtest1-stat-value">
-                          {equityEmaStats.mode === 'filtered' ? 'Fast EMA > slow' : 'All (subsample)'}
+                          {equityEmaStats.mode === 'filtered' ? 'Cumulative > EMA' : 'All (subsample)'}
                         </span>
                       </div>
                       <div className="backtest1-stat">
-                        <span className="backtest1-stat-label">Fast / slow EMA</span>
+                        <span className="backtest1-stat-label">EMA period</span>
                         <span className="backtest1-stat-value">
-                          {equityEmaStats.emaFastPeriod != null && equityEmaStats.emaSlowPeriod != null
-                            ? `${fmtInt(equityEmaStats.emaFastPeriod)} / ${fmtInt(equityEmaStats.emaSlowPeriod)}`
+                          {equityEmaStats.emaPeriod != null && Number.isFinite(equityEmaStats.emaPeriod)
+                            ? fmtInt(equityEmaStats.emaPeriod)
                             : '—'}
                         </span>
                       </div>
@@ -1090,10 +1106,20 @@ export function SpikeTpSlBacktest() {
                         <h5 className="hourly-spikes-h3">Interactive EMA mode curve</h5>
                         <p className="hourly-spikes-hint">
                           Running Σ price % using current panel mode (
-                          <strong>{equityEmaStats.mode === 'filtered' ? 'fast EMA > slow' : 'all trades'}</strong>
-                          ).
+                          <strong>{equityEmaStats.mode === 'filtered' ? 'cumulative > EMA' : 'all trades'}</strong>
+                          ).{' '}
+                          {equityEmaStats.mode === 'filtered' ? (
+                            <>
+                              Bold line uses the <strong>full</strong> trade list on the server (same downsampling
+                              density as the cumulative chart below), so late rallies match the main equity shape when
+                              those trades pass the entry gate.
+                            </>
+                          ) : null}
                         </p>
-                        <SpikeTpSlEquityLightChart points={equityEmaInteractiveCurvePoints} />
+                        <SpikeTpSlEquityLightChart
+                          points={equityEmaInteractiveCurvePoints}
+                          baselinePoints={equityEmaInteractiveUnfilteredBaseline ?? undefined}
+                        />
                       </>
                     ) : null}
                   </>

@@ -948,6 +948,19 @@ async function loadAgent1ShadowSnapshotFromDb() {
   return payload
 }
 
+/** Applies `simulationPaused` from shared DB so every API instance matches the latest PATCH (lease owner included). */
+async function syncAgent1ShadowPausedFromDb() {
+  if (!canUseShadowDbCoordination()) return
+  try {
+    const snap = await loadAgent1ShadowSnapshotFromDb()
+    if (snap && typeof snap.simulationPaused === 'boolean') {
+      setAgent1ShadowSimulationPaused(snap.simulationPaused)
+    }
+  } catch {
+    // ignore
+  }
+}
+
 async function maybeHydrateAgent1ShadowSnapshot(force = false) {
   if (!canUseShadowDbCoordination()) return
   const now = Date.now()
@@ -955,7 +968,12 @@ async function maybeHydrateAgent1ShadowSnapshot(force = false) {
   agent1ShadowLastDbHydrateAt = now
   try {
     const snap = await loadAgent1ShadowSnapshotFromDb()
-    if (snap) setAgent1ShadowSnapshot(snap)
+    if (snap) {
+      setAgent1ShadowSnapshot(snap)
+      if (typeof snap.simulationPaused === 'boolean') {
+        setAgent1ShadowSimulationPaused(snap.simulationPaused)
+      }
+    }
   } catch {
     // keep local snapshot
   }
@@ -1155,7 +1173,7 @@ async function readAgent1Settings() {
   }
   if (!Array.isArray(rows) || rows.length === 0) {
     return {
-      ...AGENT1_DEFAULT_SETTINGS,
+      ...normalizeAgent1Settings({}),
       updatedAt: null,
     }
   }
@@ -1202,7 +1220,7 @@ async function readAgent3Settings() {
   agent3BinanceAccountColumnReadable = select.includes('binance_account')
   if (!Array.isArray(rows) || rows.length === 0) {
     return {
-      ...AGENT3_DEFAULT_SETTINGS,
+      ...normalizeAgent3Settings({}),
       updatedAt: null,
     }
   }
@@ -1220,7 +1238,7 @@ async function readAgent1SettingsForShadow() {
     return await readAgent1Settings()
   } catch {
     return {
-      ...AGENT1_DEFAULT_SETTINGS,
+      ...normalizeAgent1Settings({}),
       updatedAt: null,
     }
   }
@@ -3226,6 +3244,25 @@ function parseBinanceDecimal(v) {
   return Number.isFinite(n) ? n : null
 }
 
+/** `availableBalance / totalWalletBalance` × 100 from `/fapi/v2/account` (same basis as execution headroom). */
+function marginAvailablePctFromFuturesAccount(acc) {
+  if (!acc || typeof acc !== 'object') {
+    return { availableBalanceUsdt: null, marginAvailablePct: null }
+  }
+  const totalWallet = parseBinanceDecimal(acc.totalWalletBalance)
+  const available = parseBinanceDecimal(acc.availableBalance)
+  if (!Number.isFinite(available)) {
+    return { availableBalanceUsdt: null, marginAvailablePct: null }
+  }
+  if (!Number.isFinite(totalWallet) || totalWallet <= 0) {
+    return { availableBalanceUsdt: available, marginAvailablePct: null }
+  }
+  return {
+    availableBalanceUsdt: available,
+    marginAvailablePct: (available / totalWallet) * 100,
+  }
+}
+
 /**
  * USDT-M futures wallet (USDT) — Binance sometimes omits or zeros
  * totalWalletBalance; fall back to assets[] then /fapi/v2/balance.
@@ -3635,7 +3672,7 @@ app.get('/api/agents/agent1/shadow-curve', async (_req, res) => {
   }
 })
 
-app.patch('/api/agents/agent1/shadow-simulation', (req, res) => {
+app.patch('/api/agents/agent1/shadow-simulation', async (req, res) => {
   try {
     if (typeof req.body?.paused !== 'boolean') {
       return res.status(400).json({ error: 'JSON body must include paused: boolean' })
@@ -3646,7 +3683,17 @@ app.patch('/api/agents/agent1/shadow-simulation', (req, res) => {
           'Shadow scheduler is off in server config (AGENT1_SHADOW_SCHEDULER=false). Remove it or set to true and restart to run simulation.',
       })
     }
-    setAgent1ShadowSimulationPaused(req.body.paused)
+    const paused = req.body.paused
+    setAgent1ShadowSimulationPaused(paused)
+    if (canUseShadowDbCoordination()) {
+      try {
+        const existing = await loadAgent1ShadowSnapshotFromDb()
+        const base = existing || getAgent1ShadowSnapshot()
+        await persistAgent1ShadowSnapshot({ ...base, simulationPaused: paused })
+      } catch (e) {
+        console.error('[agent1-shadow] persist simulationPaused failed', e)
+      }
+    }
     return res.json({
       ok: true,
       simulationPaused: getAgent1ShadowSimulationPaused(),
@@ -3748,13 +3795,13 @@ app.get('/api/agents/agent1/execution', async (_req, res) => {
     }
 
     let openPositionMap = new Map()
-    let a1Settings = AGENT1_DEFAULT_SETTINGS
+    let a1Settings = normalizeAgent1Settings({})
     try {
       if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
         a1Settings = await readAgent1Settings()
       }
     } catch {
-      a1Settings = AGENT1_DEFAULT_SETTINGS
+      a1Settings = normalizeAgent1Settings({})
     }
     const { apiKey, apiSecret } = resolveBinanceCredentials(a1Settings.binanceAccount)
     if (apiKey && apiSecret) {
@@ -3793,11 +3840,11 @@ app.get('/api/agents/agent1/execution', async (_req, res) => {
 /** Futures wallet + open-position unrealized PnL for the Agent 1 `binance_account` setting. */
 app.get('/api/agents/agent1/account-metrics', async (_req, res) => {
   try {
-    let settings = AGENT1_DEFAULT_SETTINGS
+    let settings = normalizeAgent1Settings({})
     try {
       settings = await readAgent1Settings()
     } catch {
-      settings = AGENT1_DEFAULT_SETTINGS
+      settings = normalizeAgent1Settings({})
     }
     const { apiKey, apiSecret, accountId } = resolveBinanceCredentials(settings.binanceAccount)
     if (!apiKey || !apiSecret) {
@@ -3805,8 +3852,10 @@ app.get('/api/agents/agent1/account-metrics', async (_req, res) => {
         error: `Binance API keys not configured for account "${accountId}"`,
       })
     }
+    const acc = await signedFuturesJson(apiKey, apiSecret, '/fapi/v2/account', {})
+    const { availableBalanceUsdt, marginAvailablePct } = marginAvailablePctFromFuturesAccount(acc)
     const [futuresWalletUsdt, risk] = await Promise.all([
-      getFuturesUsdtWalletTotal(apiKey, apiSecret),
+      getFuturesUsdtWalletTotal(apiKey, apiSecret, acc),
       fetchPositionRisk(apiKey, apiSecret),
     ])
     const rows = Array.isArray(risk) ? risk : []
@@ -3829,6 +3878,8 @@ app.get('/api/agents/agent1/account-metrics', async (_req, res) => {
     res.json({
       binanceAccount: accountId,
       futuresWalletUsdt,
+      availableBalanceUsdt,
+      marginAvailablePct,
       openPositionCount: open.length,
       unrealizedPnlUsdt,
       tradeSizeUsd: settings.tradeSizeUsd,
@@ -3849,11 +3900,11 @@ app.get('/api/agents/agent1/account-metrics', async (_req, res) => {
 app.get('/api/agents/agent3/account-metrics', async (_req, res) => {
   let accountId = 'master'
   try {
-    let settings = AGENT3_DEFAULT_SETTINGS
+    let settings = normalizeAgent3Settings({})
     try {
       settings = await readAgent3Settings()
     } catch {
-      settings = AGENT3_DEFAULT_SETTINGS
+      settings = normalizeAgent3Settings({})
     }
     const creds = resolveBinanceCredentials(settings.binanceAccount)
     accountId = creds.accountId
@@ -3864,8 +3915,10 @@ app.get('/api/agents/agent3/account-metrics', async (_req, res) => {
         binanceAccount: accountId,
       })
     }
+    const acc = await signedFuturesJson(apiKey, apiSecret, '/fapi/v2/account', {})
+    const { availableBalanceUsdt, marginAvailablePct } = marginAvailablePctFromFuturesAccount(acc)
     const [futuresWalletUsdt, risk] = await Promise.all([
-      getFuturesUsdtWalletTotal(apiKey, apiSecret),
+      getFuturesUsdtWalletTotal(apiKey, apiSecret, acc),
       fetchPositionRisk(apiKey, apiSecret),
     ])
     const rows = Array.isArray(risk) ? risk : []
@@ -3888,6 +3941,8 @@ app.get('/api/agents/agent3/account-metrics', async (_req, res) => {
     res.json({
       binanceAccount: accountId,
       futuresWalletUsdt,
+      availableBalanceUsdt,
+      marginAvailablePct,
       openPositionCount: open.length,
       unrealizedPnlUsdt,
       tradeSizeUsd: settings.tradeSizeUsd,
@@ -4170,13 +4225,13 @@ app.get('/api/agents/agent3/execution', async (_req, res) => {
       }
     }
     let openPositionMap = new Map()
-    let a3Settings = AGENT3_DEFAULT_SETTINGS
+    let a3Settings = normalizeAgent3Settings({})
     try {
       if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
         a3Settings = await readAgent3Settings()
       }
     } catch {
-      a3Settings = AGENT3_DEFAULT_SETTINGS
+      a3Settings = normalizeAgent3Settings({})
     }
     const { apiKey, apiSecret } = resolveBinanceCredentials(a3Settings.binanceAccount)
     if (apiKey && apiSecret) {
@@ -5104,6 +5159,9 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
     strategy === 'longGreenRetestLow' &&
     String(req.query.longRetestTpAtSpikeHigh ?? '').toLowerCase() === 'true'
 
+  const equityEmaSlowQ = Number.parseInt(String(req.query.equityEmaSlow ?? '50'), 10)
+  const equityEmaSlowOpt = Number.isFinite(equityEmaSlowQ) ? equityEmaSlowQ : 50
+
   try {
     const result = await computeSpikeTpSlBacktest(FUTURES_BASE, {
       minQuoteVolume24h,
@@ -5120,6 +5178,7 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
       emaLongFilter96_5m,
       emaLongSlopePositive96_5m,
       emaShortFilter96_5m,
+      equityEmaSlow: equityEmaSlowOpt,
       ...(tpROpt != null ? { tpR: tpROpt } : {}),
       ...(longRetestTpAtSpikeHigh ? { longRetestTpAtSpikeHigh: true } : {}),
     })
@@ -5130,6 +5189,120 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
       error: e instanceof Error ? e.message : 'Spike TP/SL backtest failed',
     })
   }
+})
+
+const QUICK_BT_MAX_CANDLES = 20000
+
+/**
+ * SSE: same engine as spike-tpsl-backtest with extended tail candles (up to 20k), progress events,
+ * no per-symbol OHLC charts. Agent 1 = long; Agent 3 = short_red_spike (shortRedSpike).
+ */
+app.get('/api/binance/spike-tpsl-quick-backtest/stream', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no')
+  if (typeof res.flushHeaders === 'function') res.flushHeaders()
+
+  const send = (obj) => {
+    res.write(`data: ${JSON.stringify(obj)}\n\n`)
+  }
+
+  const minQuoteVolume24h = Number.parseFloat(String(req.query.minQuoteVolume24h ?? '1000000'))
+  if (!Number.isFinite(minQuoteVolume24h) || minQuoteVolume24h < 0) {
+    send({ event: 'error', message: 'minQuoteVolume24h must be >= 0' })
+    res.end()
+    return
+  }
+
+  const interval = String(req.query.interval ?? '5m')
+  if (!ALLOWED_INTERVALS.has(interval)) {
+    send({
+      event: 'error',
+      message: `Invalid interval. Use one of: ${[...ALLOWED_INTERVALS].join(', ')}`,
+    })
+    res.end()
+    return
+  }
+
+  const candleCount = Number.parseInt(String(req.query.candleCount ?? '8000'), 10)
+  if (!Number.isFinite(candleCount) || candleCount < 50 || candleCount > QUICK_BT_MAX_CANDLES) {
+    send({
+      event: 'error',
+      message: `candleCount must be between 50 and ${QUICK_BT_MAX_CANDLES}`,
+    })
+    res.end()
+    return
+  }
+
+  const thresholdPct = Number.parseFloat(String(req.query.thresholdPct ?? '3'))
+  if (!Number.isFinite(thresholdPct) || thresholdPct <= 0) {
+    send({ event: 'error', message: 'thresholdPct must be a positive number' })
+    res.end()
+    return
+  }
+
+  const strategyRaw = String(req.query.strategy ?? 'long').trim()
+  const s = strategyRaw.toLowerCase().replace(/-/g, '_')
+  let strategy
+  if (s === 'long' || s === 'agent1') strategy = 'long'
+  else if (
+    s === 'short_red_spike' ||
+    s === 'shortredspike' ||
+    s === 'agent3' ||
+    s === 'short'
+  ) {
+    strategy = 'shortRedSpike'
+  } else {
+    send({
+      event: 'error',
+      message: 'strategy must be long (Agent 1) or short_red_spike / agent3 (Agent 3)',
+    })
+    res.end()
+    return
+  }
+
+  const maxSymQ = Number.parseInt(String(req.query.maxSymbols ?? '120'), 10)
+  const maxSymbols = Number.isFinite(maxSymQ) ? Math.min(300, Math.max(10, maxSymQ)) : 120
+
+  const equityEmaSlowQ = Number.parseInt(String(req.query.equityEmaSlow ?? '50'), 10)
+  const equityEmaSlowOpt = Number.isFinite(equityEmaSlowQ) ? equityEmaSlowQ : 50
+
+  let tpROpt = null
+  const tpRStr = req.query.tpR
+  if (tpRStr != null && String(tpRStr).trim() !== '') {
+    const tr = Number.parseFloat(String(tpRStr))
+    if (!Number.isFinite(tr) || tr <= 0 || tr > 100) {
+      send({ event: 'error', message: 'tpR must be a number in (0, 100]' })
+      res.end()
+      return
+    }
+    tpROpt = tr
+  }
+
+  try {
+    const result = await computeSpikeTpSlBacktest(FUTURES_BASE, {
+      minQuoteVolume24h,
+      interval,
+      candleCount,
+      thresholdPct,
+      strategy,
+      includeChartCandles: false,
+      extendedCandles: true,
+      maxSymbols,
+      equityEmaSlow: equityEmaSlowOpt,
+      ...(tpROpt != null ? { tpR: tpROpt } : {}),
+      onProgress: (p) => send({ event: 'progress', ...p }),
+    })
+    send({ event: 'done', result })
+  } catch (e) {
+    console.error(e)
+    send({
+      event: 'error',
+      message: e instanceof Error ? e.message : 'Quick backtest failed',
+    })
+  }
+  res.end()
 })
 
 /** V3: no volume filter; multi-day UTC range (≤31d); daily Σ price % + metrics; BTCUSDT 1d compare. */
@@ -5364,6 +5537,7 @@ if (process.env.AGENT1_SHADOW_SCHEDULER !== 'false') {
   startAgent1ShadowScheduler({
     futuresBase: FUTURES_BASE,
     readSettings: readAgent1SettingsForShadow,
+    syncPausedFromDb: canUseShadowDbCoordination() ? syncAgent1ShadowPausedFromDb : null,
     shouldRunTick: async () => {
       if (!canUseShadowDbCoordination()) {
         agent1ShadowLeaseOwner = true

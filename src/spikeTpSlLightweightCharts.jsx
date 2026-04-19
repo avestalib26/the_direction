@@ -11,7 +11,7 @@ import {
   HistogramSeries,
   LineSeries,
 } from 'lightweight-charts'
-import { EQUITY_STACK_BASE, normalizeEquityEmaPair } from './equityEmaInteractiveFilter.js'
+import { EQUITY_STACK_BASE, normalizeEquityEmaPeriod } from './equityEmaInteractiveFilter.js'
 
 const PER_TRADE_CAP = 3500
 const SYNTH_BASE = 1577836800 // 2020-01-01 00:00 UTC (seconds)
@@ -113,12 +113,17 @@ const COL_GRID = 'rgba(255, 255, 255, 0.06)'
 const COL_POS = '#0ecb81'
 const COL_NEG = '#f6465d'
 const COL_BTC = '#f0b90b'
-const COL_EMA_FAST = '#38bdf8'
 const COL_EMA_SLOW = '#f59e0b'
 
-export function SpikeTpSlEquityLightChart({ points, showFootnote = true }) {
+export function SpikeTpSlEquityLightChart({
+  points,
+  /** Optional second line: e.g. unfiltered cumulative when the main line is EMA-filtered (dimmer). */
+  baselinePoints = null,
+  showFootnote = true,
+}) {
   const containerRef = useRef(null)
   const lineData = useMemo(() => equityToLineData(points), [points])
+  const baselineData = useMemo(() => (baselinePoints ? equityToLineData(baselinePoints) : null), [baselinePoints])
   const btcData = useMemo(() => btcOverlayLineData(points), [points])
 
   useLayoutEffect(() => {
@@ -126,6 +131,7 @@ export function SpikeTpSlEquityLightChart({ points, showFootnote = true }) {
     if (!el || !lineData) return undefined
 
     const showBtc = btcData && btcData.length >= 2
+    const showBaseline = baselineData && baselineData.length >= 2
 
     const chart = createChart(el, {
       layout: {
@@ -155,6 +161,20 @@ export function SpikeTpSlEquityLightChart({ points, showFootnote = true }) {
         scaleMargins: { top: 0.08, bottom: 0.08 },
       },
     })
+
+    if (showBaseline) {
+      const baseSeries = chart.addSeries(LineSeries, {
+        color: 'rgba(183, 189, 198, 0.35)',
+        lineWidth: 1,
+        priceScaleId: 'right',
+        priceFormat: {
+          type: 'custom',
+          minMove: 0.01,
+          formatter: (p) => `${Number(p).toFixed(2)}%`,
+        },
+      })
+      baseSeries.setData(baselineData)
+    }
 
     const last = lineData[lineData.length - 1]?.value ?? 0
     const series = chart.addSeries(LineSeries, {
@@ -189,7 +209,7 @@ export function SpikeTpSlEquityLightChart({ points, showFootnote = true }) {
       ro.disconnect()
       chart.remove()
     }
-  }, [lineData, btcData])
+  }, [lineData, baselineData, btcData])
 
   if (!lineData) {
     return (
@@ -204,6 +224,13 @@ export function SpikeTpSlEquityLightChart({ points, showFootnote = true }) {
         <p className="hourly-spikes-hint spike-tpsl-lw-axis-hint">
           <strong>TradingView Lightweight Charts</strong> — time axis is synthetic (one step per trade #).
           <strong> Right axis</strong>: cumulative Σ price %.
+          {baselineData && baselineData.length >= 2 ? (
+            <>
+              {' '}
+              <strong>Dim line</strong>: all trades (unfiltered). <strong>Bold line</strong>: filtered mode — flat
+              stretches mean consecutive trades did not pass the entry gate, so the running Σ does not move.
+            </>
+          ) : null}
           {btcData && btcData.length >= 2 ? (
             <>
               {' '}
@@ -323,14 +350,13 @@ export function SpikeTpSlPerTradeCandleLightChart({
   tradesFallback,
   totalTradeRows,
   serverSubsampled,
-  emaFastPeriod = 10,
-  emaSlowPeriod = 50,
+  emaPeriod = 50,
   showFooterHint = true,
   /** `pnlFromZero` = same cumulative Σ price % axis as the equity line chart; `stack100` = 100 + Σ (legacy). */
   cumulativePnlScale = 'stack100',
 }) {
   const containerRef = useRef(null)
-  const { fast: emaFastSafe, slow: emaSlowSafe } = normalizeEquityEmaPair(emaFastPeriod, emaSlowPeriod)
+  const emaPeriodSafe = normalizeEquityEmaPeriod(emaPeriod)
 
   const pack = useMemo(
     () => buildPerTradeRows(perTradePricePctChron, tradesFallback),
@@ -364,10 +390,10 @@ export function SpikeTpSlPerTradeCandleLightChart({
     return rows.length > 0 ? rows : null
   }, [pack.rows, cumulativePnlScale])
 
-  const emaFastData = useMemo(() => {
+  const emaLineData = useMemo(() => {
     if (!candleData) return null
     const closes = candleData.map((r) => r.close)
-    const emaArr = computeEmaOnSeries(closes, emaFastSafe)
+    const emaArr = computeEmaOnSeries(closes, emaPeriodSafe)
     const out = []
     for (let i = 0; i < candleData.length; i++) {
       const v = emaArr[i]
@@ -375,20 +401,7 @@ export function SpikeTpSlPerTradeCandleLightChart({
       out.push({ time: candleData[i].time, value: v })
     }
     return out.length >= 2 ? out : null
-  }, [candleData, emaFastSafe])
-
-  const emaSlowData = useMemo(() => {
-    if (!candleData) return null
-    const closes = candleData.map((r) => r.close)
-    const emaArr = computeEmaOnSeries(closes, emaSlowSafe)
-    const out = []
-    for (let i = 0; i < candleData.length; i++) {
-      const v = emaArr[i]
-      if (v == null || !Number.isFinite(v)) continue
-      out.push({ time: candleData[i].time, value: v })
-    }
-    return out.length >= 2 ? out : null
-  }, [candleData, emaSlowSafe])
+  }, [candleData, emaPeriodSafe])
 
   useLayoutEffect(() => {
     const el = containerRef.current
@@ -434,25 +447,15 @@ export function SpikeTpSlPerTradeCandleLightChart({
     })
     candleSeries.setData(candleData)
 
-    if (emaSlowData && emaSlowData.length >= 2) {
-      const slowSeries = chart.addSeries(LineSeries, {
+    if (emaLineData && emaLineData.length >= 2) {
+      const emaSeries = chart.addSeries(LineSeries, {
         color: COL_EMA_SLOW,
         lineWidth: 2,
         crosshairMarkerVisible: true,
         lastValueVisible: true,
         priceLineVisible: false,
       })
-      slowSeries.setData(emaSlowData)
-    }
-    if (emaFastData && emaFastData.length >= 2) {
-      const fastSeries = chart.addSeries(LineSeries, {
-        color: COL_EMA_FAST,
-        lineWidth: 2,
-        crosshairMarkerVisible: true,
-        lastValueVisible: true,
-        priceLineVisible: false,
-      })
-      fastSeries.setData(emaFastData)
+      emaSeries.setData(emaLineData)
     }
 
     chart.timeScale().fitContent()
@@ -465,7 +468,7 @@ export function SpikeTpSlPerTradeCandleLightChart({
       ro.disconnect()
       chart.remove()
     }
-  }, [candleData, emaFastData, emaSlowData, emaFastSafe, emaSlowSafe, cumulativePnlScale])
+  }, [candleData, emaLineData, emaPeriodSafe, cumulativePnlScale])
 
   if (!candleData) {
     return (
@@ -505,10 +508,9 @@ export function SpikeTpSlPerTradeCandleLightChart({
               P&amp;L % added to the running total (no wicks).
             </>
           )}{' '}
-          <strong style={{ color: COL_EMA_FAST }}>EMA {emaFastSafe}</strong> (fast) and{' '}
-          <strong style={{ color: COL_EMA_SLOW }}>EMA {emaSlowSafe}</strong> (slow) on cumulative close. Filtered
-          stats use <strong>fast &gt; slow</strong> before each trade. Time = trade order (synthetic). Full run:{' '}
-          <strong>{fmtInt(fullN)}</strong> trades.
+          <strong style={{ color: COL_EMA_SLOW }}>EMA {emaPeriodSafe}</strong> on cumulative close — starts after
+          enough bars (warmup). Filter uses <strong>cumulative &gt; EMA</strong> before each trade. Time = trade order
+          (synthetic). Full run: <strong>{fmtInt(fullN)}</strong> trades.
         </p>
       ) : null}
     </div>

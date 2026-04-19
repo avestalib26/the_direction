@@ -32,6 +32,9 @@ export const SPIKE_TPSL_MAX_RANGE_DAYS = 3
 
 const KLINES_PAGE_LIMIT = 1500
 const RANGE_FETCH_MAX_PAGES = 48
+/** Tail mode: max candles per symbol when `opts.extendedCandles` is true (multi-page klines). */
+const EXTENDED_TAIL_MAX_CANDLES = 20000
+const EXTENDED_TAIL_MAX_PAGES = 48
 
 /** Keep HTTP JSON small so the UI does not freeze parsing/rendering huge arrays. */
 const API_EQUITY_CURVE_MAX_POINTS = 2500
@@ -371,6 +374,50 @@ async function fetchKlinesOHLCInRange(futuresBase, symbol, interval, startTime, 
   return [...byTime.keys()]
     .sort((a, b) => a - b)
     .map((t) => byTime.get(t))
+}
+
+/**
+ * Most recent `wantN` closed candles (oldest → newest), paginating backward with endTime.
+ * If history is shorter than `wantN`, returns all available (no error).
+ */
+async function fetchKlinesOHLCLastN(futuresBase, symbol, interval, wantN, headers = {}) {
+  const target = Math.floor(Number(wantN))
+  if (!Number.isFinite(target) || target <= 0) return []
+  const pageDelayMs = Number.parseInt(process.env.SPIKE_TPSL_PAGE_DELAY_MS ?? '0', 10)
+  let merged = []
+  let endTime = undefined
+  for (let page = 0; page < EXTENDED_TAIL_MAX_PAGES && merged.length < target; page++) {
+    const limit = Math.min(KLINES_PAGE_LIMIT, target - merged.length)
+    const q = new URLSearchParams({
+      symbol,
+      interval,
+      limit: String(Math.max(1, limit)),
+    })
+    if (endTime != null) q.set('endTime', String(endTime))
+    await acquireFuturesRestWeight(futuresKlinesRequestWeight(limit))
+    const r = await fetch(`${futuresBase}/fapi/v1/klines?${q}`, { headers })
+    const text = await r.text()
+    let data
+    try {
+      data = text ? JSON.parse(text) : {}
+    } catch {
+      throw new Error(`Binance klines: invalid JSON (${r.status})`)
+    }
+    if (!r.ok) {
+      const msg = data.msg || data.message || text
+      throw new Error(`Binance ${r.status}: ${msg}`)
+    }
+    if (!Array.isArray(data) || data.length === 0) break
+
+    const batch = data.map(mapKlineRow)
+    merged = merged.length === 0 ? batch : [...batch, ...merged]
+    if (merged.length >= target) break
+    if (data.length < limit) break
+    endTime = batch[0].openTime - 1
+    if (pageDelayMs > 0) await new Promise((res) => setTimeout(res, pageDelayMs))
+  }
+  if (merged.length > target) merged = merged.slice(-target)
+  return merged
 }
 
 function isGreenBodySpike(c, thresholdPct) {
@@ -1273,6 +1320,67 @@ function tradePriceReturnPct(t) {
   return ((x - e) / e) * 100
 }
 
+/** Matches `src/equityEmaInteractiveFilter.js` EQUITY_STACK_BASE — stacked equity curve baseline. */
+const EQUITY_EMA_STACK_BASE = 100
+
+function computeEmaFromClosesForEquityFilter(closes, period) {
+  const out = closes.map(() => null)
+  if (!Array.isArray(closes) || closes.length < period || period < 2) return out
+  let sum = 0
+  for (let i = 0; i < period; i++) sum += closes[i]
+  let ema = sum / period
+  out[period - 1] = ema
+  const alpha = 2 / (period + 1)
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * alpha + ema * (1 - alpha)
+    out[i] = ema
+  }
+  return out
+}
+
+function normalizeEquityEmaPeriodForApi(emaPeriodRaw) {
+  let p = Math.floor(Number(emaPeriodRaw))
+  if (!Number.isFinite(p)) p = 50
+  return Math.min(500, Math.max(2, p))
+}
+
+/**
+ * For each trade in chron (sorted by entry open time), true iff stacked cumulative close &gt; single EMA
+ * at index i−1 (same series as per-trade candle chart: entry-ordered 100 + Σ price %).
+ *
+ * @param {Array<{ entryOpenTime: number, exitOpenTime: number }>} chron
+ * @returns {boolean[]}
+ */
+function computePerTradeEquityEmaOkAtEntry(chron, emaPeriodRaw) {
+  const n = chron?.length ?? 0
+  if (!n) return []
+  const period = normalizeEquityEmaPeriodForApi(emaPeriodRaw)
+  const closes = []
+  let level = EQUITY_EMA_STACK_BASE
+  for (let i = 0; i < n; i++) {
+    const pct = tradePriceReturnPct(chron[i])
+    level += Number.isFinite(pct) ? pct : 0
+    closes.push(level)
+  }
+  const emaArr = computeEmaFromClosesForEquityFilter(closes, period)
+
+  const out = new Array(n)
+  for (let i = 0; i < n; i++) {
+    if (i === 0) {
+      out[i] = true
+      continue
+    }
+    const c = closes[i - 1]
+    const e = emaArr[i - 1]
+    out[i] =
+      e == null ||
+      !Number.isFinite(c) ||
+      !Number.isFinite(e) ||
+      c > e
+  }
+  return out
+}
+
 /** Win/loss for chart: TP always win, SL always loss; EOD by signed price %. */
 function tradeWinLossBucket(t) {
   if (t.outcome === 'tp') return 'win'
@@ -1333,6 +1441,40 @@ function buildEquityCurveSummedPricePct(tradesChronAsc) {
   for (let k = 0; k < tradesChronAsc.length; k++) {
     const t = tradesChronAsc[k]
     cum += tradePriceReturnPct(t)
+    pts.push({
+      tradeIndex: k + 1,
+      entryOpenTime: t.entryOpenTime,
+      equityPct: 100 + cum,
+      pnlPctFromStart: cum,
+    })
+  }
+  return { points: pts }
+}
+
+/**
+ * Cumulative Σ price % including only trades that pass the equity EMA-at-entry gate (same flags as stats).
+ * One point per trade step; downsample with the same helper as `equityCurve` so charts stay comparable.
+ */
+function buildFilteredEquityCurveSummedPricePct(tradesChronAsc, entryOkByTrade) {
+  const n = tradesChronAsc?.length ?? 0
+  if (n === 0) return { points: [] }
+  if (!Array.isArray(entryOkByTrade) || entryOkByTrade.length !== n) {
+    return { points: [] }
+  }
+  const pts = [
+    {
+      tradeIndex: 0,
+      entryOpenTime: null,
+      equityPct: 100,
+      pnlPctFromStart: 0,
+    },
+  ]
+  let cum = 0
+  for (let k = 0; k < n; k++) {
+    const t = tradesChronAsc[k]
+    const pct = tradePriceReturnPct(t)
+    const p = Number.isFinite(pct) ? pct : 0
+    if (entryOkByTrade[k] === true) cum += p
     pts.push({
       tradeIndex: k + 1,
       entryOpenTime: t.entryOpenTime,
@@ -1527,6 +1669,9 @@ async function mapPool(items, concurrency, mapper) {
  * @param {boolean} [opts.longRetestTpAtSpikeHigh] longGreenRetestLow only: TP = spike candle high; tpR ignored
  * @param {string} [opts.fromDate] YYYY-MM-DD UTC (with toDate)
  * @param {string} [opts.toDate] YYYY-MM-DD UTC (with fromDate)
+ * @param {boolean} [opts.extendedCandles] raise per-symbol tail cap to 20k and paginate klines past 1500
+ * @param {number} [opts.maxSymbols] cap universe size (default from env, max 300)
+ * @param {(e: object) => void} [opts.onProgress] progress hook (volumes / per-symbol klines / aggregate)
  */
 export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const {
@@ -1545,6 +1690,7 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     emaShortFilter96_5m: emaShortFilterRaw,
     allowOverlap: allowOverlapRaw,
     longRetestTpAtSpikeHigh: longRetestTpAtSpikeHighRaw,
+    equityEmaSlow: equityEmaSlowRaw,
   } = opts
 
   let maxSlPct = null
@@ -1561,6 +1707,8 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const tpR = normalizeTpR({ tpR: opts?.tpR })
   const longRetestTpAtSpikeHigh = Boolean(longRetestTpAtSpikeHighRaw)
   const tradeOpts = { maxSlPct, slAtSpikeOpen, tpR, longRetestTpAtSpikeHigh }
+  const extendedCandles = Boolean(opts.extendedCandles)
+  const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null
 
   const maxChartCandles = Math.min(
     1500,
@@ -1646,9 +1794,14 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const emaFilterActive = emaLongFilterActive || emaShortFilterActive || emaLongSlopeActive
 
   const utcRange = parseSpikeTpSlUtcRange(fromDateOpt, toDateOpt)
-  const n = Math.max(50, Math.min(1500, Math.floor(candleCount)))
+  const candleCap = extendedCandles ? EXTENDED_TAIL_MAX_CANDLES : 1500
+  const n = Math.max(50, Math.min(candleCap, Math.floor(candleCount)))
   const maxSymRaw = Number.parseInt(process.env.SPIKE_TPSL_MAX_SYMBOLS ?? '300', 10)
-  const maxSymbols = Number.isFinite(maxSymRaw) && maxSymRaw > 0 ? maxSymRaw : 300
+  const envMaxSym = Number.isFinite(maxSymRaw) && maxSymRaw > 0 ? maxSymRaw : 300
+  const maxSymbols =
+    Number.isFinite(opts.maxSymbols) && opts.maxSymbols > 0
+      ? Math.min(300, Math.floor(opts.maxSymbols))
+      : envMaxSym
   const concRaw = Number.parseInt(process.env.SPIKE_TPSL_CONCURRENCY ?? '4', 10)
   const CONCURRENCY =
     Number.isFinite(concRaw) && concRaw > 0 ? Math.min(16, concRaw) : 4
@@ -1661,29 +1814,44 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const requestedSymbols = volFiltered.length
   const selected = volFiltered.slice(0, maxSymbols)
 
-  const btcCandlesPromise = utcRange
-    ? fetchKlinesOHLCInRange(
+  async function loadCandlesForSymbol(symbol) {
+    if (utcRange) {
+      return fetchKlinesOHLCInRange(
         futuresBase,
-        'BTCUSDT',
+        symbol,
         interval,
         utcRange.startTime,
         utcRange.endTime,
         publicHeaders,
       )
-    : fetchKlinesOHLC(futuresBase, 'BTCUSDT', interval, n, publicHeaders)
+    }
+    if (n <= KLINES_PAGE_LIMIT) {
+      return fetchKlinesOHLC(futuresBase, symbol, interval, n, publicHeaders)
+    }
+    return fetchKlinesOHLCLastN(futuresBase, symbol, interval, n, publicHeaders)
+  }
 
-  const raw = await mapPool(selected, CONCURRENCY, async (row) => {
+  onProgress?.({
+    phase: 'volumes',
+    symbolsQualified: requestedSymbols,
+    symbolsSelected: selected.length,
+    candlesRequested: n,
+    extendedCandles,
+  })
+
+  const btcCandlesPromise = loadCandlesForSymbol('BTCUSDT')
+
+  const raw = await mapPool(selected, CONCURRENCY, async (row, idx) => {
     try {
-      const candles = utcRange
-        ? await fetchKlinesOHLCInRange(
-            futuresBase,
-            row.symbol,
-            interval,
-            utcRange.startTime,
-            utcRange.endTime,
-            publicHeaders,
-          )
-        : await fetchKlinesOHLC(futuresBase, row.symbol, interval, n, publicHeaders)
+      const candles = await loadCandlesForSymbol(row.symbol)
+      onProgress?.({
+        phase: 'symbol',
+        index: idx + 1,
+        total: selected.length,
+        symbol: row.symbol,
+        candlesFetched: candles.length,
+        candlesRequested: n,
+      })
       if (candles.length < 3) {
         return {
           symbol: row.symbol,
@@ -1767,6 +1935,15 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
       }
       return rowOut
     } catch (e) {
+      onProgress?.({
+        phase: 'symbol',
+        index: idx + 1,
+        total: selected.length,
+        symbol: row.symbol,
+        candlesFetched: 0,
+        candlesRequested: n,
+        error: e instanceof Error ? e.message : 'failed',
+      })
       return {
         symbol: row.symbol,
         quoteVolume24h: row.quoteVolume24h,
@@ -1776,6 +1953,8 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
       }
     }
   })
+
+  onProgress?.({ phase: 'aggregate', symbolRows: raw.length })
 
   const regimeTradesBySymbol =
     strat === 'regimeFlipEma50' ? runRegimeFlipTradesGlobal(raw, thresholdPct, tradeOpts) : null
@@ -1904,6 +2083,23 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const perTradeOutcomeChronFull = chron.map((t) => t.outcome)
   const { values: perTradeOutcomeChron } = subsampleArraySeries(
     perTradeOutcomeChronFull,
+    API_PER_TRADE_PCT_MAX,
+  )
+
+  const equityEmaPeriodForFlags = Number.parseInt(String(equityEmaSlowRaw ?? '50'), 10)
+  const perTradeEquityEmaAtEntryOkFull = computePerTradeEquityEmaOkAtEntry(
+    chron,
+    Number.isFinite(equityEmaPeriodForFlags) ? equityEmaPeriodForFlags : 50,
+  )
+  const { points: equityEmaFilteredCurveFull } = buildFilteredEquityCurveSummedPricePct(
+    chron,
+    perTradeEquityEmaAtEntryOkFull,
+  )
+  attachBtcCloseToEquityPoints(equityEmaFilteredCurveFull, btcByOpenTime)
+  const { points: equityEmaFilteredCurve, downsampled: equityEmaFilteredCurveDownsampled } =
+    downsampleEquityCurvePoints(equityEmaFilteredCurveFull, API_EQUITY_CURVE_MAX_POINTS)
+  const { values: perTradeEquityEmaAtEntryOk } = subsampleArraySeries(
+    perTradeEquityEmaAtEntryOkFull,
     API_PER_TRADE_PCT_MAX,
   )
 
@@ -2136,10 +2332,13 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     },
     equityCurve,
     equityCurveDownsampled,
+    equityEmaFilteredCurve,
+    equityEmaFilteredCurveDownsampled,
     perTradePricePctChron,
     perTradePricePctSubsampled,
     perTradeRChron,
     perTradeOutcomeChron,
+    perTradeEquityEmaAtEntryOk,
     perSymbol,
     trades: allTrades.slice(0, 400),
     tradesTruncated: allTrades.length > 400,

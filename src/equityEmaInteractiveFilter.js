@@ -16,29 +16,35 @@ function computeEmaFromCloses(closes, period) {
   return out
 }
 
-/** Ensure fast period &lt; slow period for a sensible pair (swap if needed, bump slow if tied). */
-export function normalizeEquityEmaPair(emaFastRaw, emaSlowRaw) {
-  let fast = Math.max(2, Math.floor(Number(emaFastRaw)) || 10)
-  let slow = Math.max(2, Math.floor(Number(emaSlowRaw)) || 50)
-  if (fast > slow) [fast, slow] = [slow, fast]
-  if (fast >= slow) slow = Math.min(fast + 1, 500)
-  return { fast, slow }
+/** Equity EMA period for stacked-curve filter (clamped 2–500; default 50). */
+export function normalizeEquityEmaPeriod(emaPeriodRaw) {
+  let p = Math.floor(Number(emaPeriodRaw))
+  if (!Number.isFinite(p)) p = 50
+  return Math.min(500, Math.max(2, p))
 }
 
 /**
- * Keep trade i only if fast EMA &gt; slow EMA on prior cumulative close (bar i−1).
- * Warmup: if either EMA missing at i−1, the trade is kept.
+ * Keep trade i only if stacked cumulative close &gt; single EMA at prior bar (i−1) — same idea as live regime
+ * (equity above its EMA). Warmup: if EMA missing at i−1, the trade is kept.
+ *
+ * When `entryOkByTrade` is provided (same length as pcts), uses server-computed flags on **entry-ordered** stack.
  *
  * @param {number[]} pcts
  * @param {number[]} rMultiples
  * @param {string[] | null} outcomes
- * @param {number} emaFastPeriod — smaller period (e.g. 10)
- * @param {number} emaSlowPeriod — larger period (e.g. 50)
+ * @param {number} emaPeriod — EMA length on stacked cumulative close (e.g. 50)
+ * @param {boolean[] | null | undefined} entryOkByTrade — optional; when set, ignores stack-based rule above
  */
-export function computeEquityEmaFilterStats(pcts, rMultiples, outcomes, emaFastPeriod, emaSlowPeriod) {
+export function computeEquityEmaFilterStats(
+  pcts,
+  rMultiples,
+  outcomes,
+  emaPeriod,
+  entryOkByTrade = null,
+) {
   const n = pcts?.length ?? 0
   if (!n || !Array.isArray(rMultiples) || rMultiples.length !== n) return null
-  const { fast, slow } = normalizeEquityEmaPair(emaFastPeriod, emaSlowPeriod)
+  const period = normalizeEquityEmaPeriod(emaPeriod)
 
   const closes = []
   let level = EQUITY_STACK_BASE
@@ -48,8 +54,10 @@ export function computeEquityEmaFilterStats(pcts, rMultiples, outcomes, emaFastP
     closes.push(level)
   }
 
-  const emaFast = computeEmaFromCloses(closes, fast)
-  const emaSlow = computeEmaFromCloses(closes, slow)
+  const emaRow = computeEmaFromCloses(closes, period)
+
+  const useEntryFlags =
+    Array.isArray(entryOkByTrade) && entryOkByTrade.length === n
 
   let kept = 0
   let skipped = 0
@@ -64,15 +72,16 @@ export function computeEquityEmaFilterStats(pcts, rMultiples, outcomes, emaFastP
 
   for (let i = 0; i < n; i++) {
     let ok = true
-    if (i > 0) {
-      const ef = emaFast[i - 1]
-      const es = emaSlow[i - 1]
+    if (useEntryFlags) {
+      ok = entryOkByTrade[i] === true
+    } else if (i > 0) {
+      const c = closes[i - 1]
+      const e = emaRow[i - 1]
       ok =
-        ef == null ||
-        es == null ||
-        !Number.isFinite(ef) ||
-        !Number.isFinite(es) ||
-        ef > es
+        e == null ||
+        !Number.isFinite(c) ||
+        !Number.isFinite(e) ||
+        c > e
     }
 
     if (!ok) {
@@ -101,8 +110,8 @@ export function computeEquityEmaFilterStats(pcts, rMultiples, outcomes, emaFastP
   const decided = tpHits + slHits
   return {
     mode: 'filtered',
-    emaFastPeriod: fast,
-    emaSlowPeriod: slow,
+    filterBasis: useEntryFlags ? 'entry_realized_equity' : 'stack_before_trade',
+    emaPeriod: period,
     sampleSize: n,
     kept,
     skipped,
@@ -155,8 +164,7 @@ export function computePerTradeSubsampleStats(pcts, rMultiples, outcomes) {
   const decided = tpHits + slHits
   return {
     mode: 'all',
-    emaFastPeriod: null,
-    emaSlowPeriod: null,
+    emaPeriod: null,
     sampleSize: n,
     kept: n,
     skipped: 0,
