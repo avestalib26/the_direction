@@ -1559,7 +1559,12 @@ async function runAgent1ExecutionTick() {
     for (const spike of pendingCandidates) {
       if (pending.length >= AGENT1_EXECUTION_MAX_SPIKES_PER_TICK) break
       const symbol = String(spike?.symbol ?? '').toUpperCase()
-      if (isAgent1SpikeStale(spike, settings.scanInterval, settings.scanSecondsBeforeClose)) {
+      const staleInfo = getAgent1SpikeStalenessInfo(
+        spike,
+        settings.scanInterval,
+        settings.scanSecondsBeforeClose,
+      )
+      if (staleInfo.stale) {
         try {
           await markAgent1SpikeSkipped(spike.id, 'stale spike')
         } catch (e) {
@@ -1570,7 +1575,11 @@ async function runAgent1ExecutionTick() {
         }
         const logKey = spikeExecutionLogKey(spike, symbol)
         if (!agent1StaleSpikeLogIds.has(logKey)) {
-          pushAgent1ExecutionLog('info', `skip ${symbol || 'UNKNOWN'}: stale spike`)
+          const agePart =
+            staleInfo.ageMs != null && staleInfo.maxAgeMs != null
+              ? ` ageMs=${Math.round(staleInfo.ageMs)} maxMs=${staleInfo.maxAgeMs} iv=${staleInfo.scanInterval} sbc=${staleInfo.scanSecondsBeforeClose}${staleInfo.usedEnvMaxAge ? ' env=AGENT1_EXECUTION_MAX_SPIKE_AGE_MS' : ''}`
+              : ''
+          pushAgent1ExecutionLog('info', `skip ${symbol || 'UNKNOWN'}: stale spike${agePart}`)
           agent1StaleSpikeLogIds.add(logKey)
           if (agent1StaleSpikeLogIds.size > 5000) {
             agent1StaleSpikeLogIds.clear()
@@ -2604,16 +2613,34 @@ function defaultMaxSpikeAgeMs(intervalMs, scanSecondsBeforeClose) {
   return intervalMs + slackAfterCloseMs
 }
 
-function isAgent1SpikeStale(spike, scanInterval, scanSecondsBeforeClose) {
+/**
+ * @returns {{ stale: boolean, ageMs: number|null, maxAgeMs: number|null, scanInterval: string, scanSecondsBeforeClose: number, usedEnvMaxAge: boolean }}
+ */
+function getAgent1SpikeStalenessInfo(spike, scanInterval, scanSecondsBeforeClose) {
   const openMs = Number.parseInt(String(spike?.candle_open_time_ms ?? ''), 10)
-  if (!Number.isFinite(openMs) || openMs <= 0) return false
+  if (!Number.isFinite(openMs) || openMs <= 0) {
+    return {
+      stale: false,
+      ageMs: null,
+      maxAgeMs: null,
+      scanInterval,
+      scanSecondsBeforeClose,
+      usedEnvMaxAge: false,
+    }
+  }
   const intervalMs = AGENT1_INTERVAL_MS[scanInterval] ?? AGENT1_INTERVAL_MS['5m']
   const envMaxAge = Number.parseInt(String(process.env.AGENT1_EXECUTION_MAX_SPIKE_AGE_MS ?? ''), 10)
-  const maxAgeMs = Number.isFinite(envMaxAge) && envMaxAge > 0
-    ? envMaxAge
-    : defaultMaxSpikeAgeMs(intervalMs, scanSecondsBeforeClose)
+  const usedEnvMaxAge = Number.isFinite(envMaxAge) && envMaxAge > 0
+  const maxAgeMs = usedEnvMaxAge ? envMaxAge : defaultMaxSpikeAgeMs(intervalMs, scanSecondsBeforeClose)
   const ageMs = Date.now() - openMs
-  return ageMs > maxAgeMs
+  return {
+    stale: ageMs > maxAgeMs,
+    ageMs,
+    maxAgeMs,
+    scanInterval,
+    scanSecondsBeforeClose,
+    usedEnvMaxAge,
+  }
 }
 
 async function markAgent1SpikeTradeTaken(spikeId) {
