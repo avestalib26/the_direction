@@ -1577,7 +1577,7 @@ async function runAgent1ExecutionTick() {
         if (!agent1StaleSpikeLogIds.has(logKey)) {
           const agePart =
             staleInfo.ageMs != null && staleInfo.maxAgeMs != null
-              ? ` ageMs=${Math.round(staleInfo.ageMs)} maxMs=${staleInfo.maxAgeMs} iv=${staleInfo.scanInterval} sbc=${staleInfo.scanSecondsBeforeClose}${staleInfo.usedEnvMaxAge ? ' env=AGENT1_EXECUTION_MAX_SPIKE_AGE_MS' : ''}`
+              ? ` ageMs=${Math.round(staleInfo.ageMs)} maxMs=${staleInfo.maxAgeMs} iv=${staleInfo.scanInterval} sbc=${staleInfo.scanSecondsBeforeClose}${staleInfo.usedEnvMaxAge ? ` env=${staleInfo.envMaxAgeKey}` : ''}`
               : ''
           pushAgent1ExecutionLog('info', `skip ${symbol || 'UNKNOWN'}: stale spike${agePart}`)
           agent1StaleSpikeLogIds.add(logKey)
@@ -1921,7 +1921,12 @@ async function runAgent3ExecutionTick() {
     for (const spike of pendingCandidates) {
       if (pending.length >= AGENT3_EXECUTION_MAX_SPIKES_PER_TICK) break
       const symbol = String(spike?.symbol ?? '').toUpperCase()
-      if (isAgent3SpikeStale(spike, settings.scanInterval, settings.scanSecondsBeforeClose)) {
+      const staleInfoA3 = getAgent3SpikeStalenessInfo(
+        spike,
+        settings.scanInterval,
+        settings.scanSecondsBeforeClose,
+      )
+      if (staleInfoA3.stale) {
         try {
           await markAgent3SpikeSkipped(spike.id, 'stale spike')
         } catch (e) {
@@ -1932,7 +1937,11 @@ async function runAgent3ExecutionTick() {
         }
         const logKey = spikeExecutionLogKey(spike, symbol)
         if (!agent3StaleSpikeLogIds.has(logKey)) {
-          pushAgent3ExecutionLog('info', `skip ${symbol || 'UNKNOWN'}: stale spike`)
+          const agePart =
+            staleInfoA3.ageMs != null && staleInfoA3.maxAgeMs != null
+              ? ` ageMs=${Math.round(staleInfoA3.ageMs)} maxMs=${staleInfoA3.maxAgeMs} iv=${staleInfoA3.scanInterval} sbc=${staleInfoA3.scanSecondsBeforeClose}${staleInfoA3.usedEnvMaxAge ? ` env=${staleInfoA3.envMaxAgeKey}` : ''}`
+              : ''
+          pushAgent3ExecutionLog('info', `skip ${symbol || 'UNKNOWN'}: stale spike${agePart}`)
           agent3StaleSpikeLogIds.add(logKey)
           if (agent3StaleSpikeLogIds.size > 5000) {
             agent3StaleSpikeLogIds.clear()
@@ -2614,9 +2623,10 @@ function defaultMaxSpikeAgeMs(intervalMs, scanSecondsBeforeClose) {
 }
 
 /**
- * @returns {{ stale: boolean, ageMs: number|null, maxAgeMs: number|null, scanInterval: string, scanSecondsBeforeClose: number, usedEnvMaxAge: boolean }}
+ * @param {string} maxAgeEnvKey - e.g. 'AGENT1_EXECUTION_MAX_SPIKE_AGE_MS'
+ * @returns {{ stale: boolean, ageMs: number|null, maxAgeMs: number|null, scanInterval: string, scanSecondsBeforeClose: number, usedEnvMaxAge: boolean, envMaxAgeKey: string }}
  */
-function getAgent1SpikeStalenessInfo(spike, scanInterval, scanSecondsBeforeClose) {
+function getSpikeStalenessInfo(spike, scanInterval, scanSecondsBeforeClose, maxAgeEnvKey) {
   const openMs = Number.parseInt(String(spike?.candle_open_time_ms ?? ''), 10)
   if (!Number.isFinite(openMs) || openMs <= 0) {
     return {
@@ -2626,10 +2636,11 @@ function getAgent1SpikeStalenessInfo(spike, scanInterval, scanSecondsBeforeClose
       scanInterval,
       scanSecondsBeforeClose,
       usedEnvMaxAge: false,
+      envMaxAgeKey: maxAgeEnvKey,
     }
   }
   const intervalMs = AGENT1_INTERVAL_MS[scanInterval] ?? AGENT1_INTERVAL_MS['5m']
-  const envMaxAge = Number.parseInt(String(process.env.AGENT1_EXECUTION_MAX_SPIKE_AGE_MS ?? ''), 10)
+  const envMaxAge = Number.parseInt(String(process.env[maxAgeEnvKey] ?? ''), 10)
   const usedEnvMaxAge = Number.isFinite(envMaxAge) && envMaxAge > 0
   const maxAgeMs = usedEnvMaxAge ? envMaxAge : defaultMaxSpikeAgeMs(intervalMs, scanSecondsBeforeClose)
   const ageMs = Date.now() - openMs
@@ -2640,7 +2651,26 @@ function getAgent1SpikeStalenessInfo(spike, scanInterval, scanSecondsBeforeClose
     scanInterval,
     scanSecondsBeforeClose,
     usedEnvMaxAge,
+    envMaxAgeKey: maxAgeEnvKey,
   }
+}
+
+function getAgent1SpikeStalenessInfo(spike, scanInterval, scanSecondsBeforeClose) {
+  return getSpikeStalenessInfo(
+    spike,
+    scanInterval,
+    scanSecondsBeforeClose,
+    'AGENT1_EXECUTION_MAX_SPIKE_AGE_MS',
+  )
+}
+
+function getAgent3SpikeStalenessInfo(spike, scanInterval, scanSecondsBeforeClose) {
+  return getSpikeStalenessInfo(
+    spike,
+    scanInterval,
+    scanSecondsBeforeClose,
+    'AGENT3_EXECUTION_MAX_SPIKE_AGE_MS',
+  )
 }
 
 async function markAgent1SpikeTradeTaken(spikeId) {
@@ -2726,18 +2756,6 @@ async function fetchPendingAgent3Spikes(limit = AGENT3_EXECUTION_MAX_SPIKES_PER_
     `/rest/v1/agent3_spikes?select=*&trade_taken=eq.false&execution_skipped=eq.false&order=created_at.desc&limit=${n}`,
   )
   return Array.isArray(rows) ? rows : []
-}
-
-function isAgent3SpikeStale(spike, scanInterval, scanSecondsBeforeClose) {
-  const openMs = Number.parseInt(String(spike?.candle_open_time_ms ?? ''), 10)
-  if (!Number.isFinite(openMs) || openMs <= 0) return false
-  const intervalMs = AGENT1_INTERVAL_MS[scanInterval] ?? AGENT1_INTERVAL_MS['5m']
-  const envMaxAge = Number.parseInt(String(process.env.AGENT3_EXECUTION_MAX_SPIKE_AGE_MS ?? ''), 10)
-  const maxAgeMs = Number.isFinite(envMaxAge) && envMaxAge > 0
-    ? envMaxAge
-    : defaultMaxSpikeAgeMs(intervalMs, scanSecondsBeforeClose)
-  const ageMs = Date.now() - openMs
-  return ageMs > maxAgeMs
 }
 
 async function markAgent3SpikeTradeTaken(spikeId) {

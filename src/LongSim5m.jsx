@@ -53,6 +53,14 @@ function fmtIso(ms) {
   return new Date(ms).toISOString()
 }
 
+/** Scheduler “Next fire” / sim status — India Standard Time (matches live ops tables). */
+function fmtIst(msOrIso) {
+  if (msOrIso == null) return '—'
+  const t = typeof msOrIso === 'number' ? msOrIso : Date.parse(String(msOrIso))
+  if (!Number.isFinite(t)) return '—'
+  return `${new Date(t).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'medium' })} IST`
+}
+
 function fmtShortAgo(msOrIso) {
   if (msOrIso == null) return '—'
   const t = typeof msOrIso === 'number' ? msOrIso : Date.parse(String(msOrIso))
@@ -997,9 +1005,18 @@ export function LongSim5m() {
         <div className="risk-summary agent1-risk-summary longsim5m-status">
           <div className="risk-chip">
             Tick: <strong>{sched.running ? '…' : sched.lastRunAt ? 'idle' : 'start'}</strong>
+            {sched.lastRunAt != null && fmtIst(sched.lastRunAt) !== '—' ? (
+              <span className="longsim5m-meta-muted" title="Last scheduler tick (UTC in tooltip)">
+                {' '}
+                · last {fmtIst(sched.lastRunAt)}
+              </span>
+            ) : null}
           </div>
           <div className="risk-chip">
-            Next: <strong>{fmtIso(sched.nextFireAt)}</strong>
+            Next:{' '}
+            <strong title={sched.nextFireAt != null ? fmtIso(sched.nextFireAt) : undefined}>
+              {fmtIst(sched.nextFireAt)}
+            </strong>
           </div>
           {simulationPaused && shadowSchedulerActive ? (
             <div className="risk-chip" style={{ color: '#fbbf24' }} title="Full replay and mark polls are paused; last curve is frozen.">
