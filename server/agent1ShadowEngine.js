@@ -2,13 +2,15 @@ import {
   acquireFuturesRestWeight,
   futuresKlinesRequestWeight,
 } from './binanceFuturesRestThrottle.js'
-import { longSpikeIndicesForAgent1Scan } from './fiveMinScreener.js'
-import { simulateLongTrade } from './spikeTpSlBacktest.js'
+import { longSpikeIndicesForAgent1Scan, shortSpikeIndicesForAgent3Scan } from './fiveMinScreener.js'
+import { simulateLongTrade, simulateShortRedSpikeTrade } from './spikeTpSlBacktest.js'
 import { computeFutures24hVolumes } from './volumeScreener.js'
 
 export const AGENT1_SHADOW_DEFAULT_BAR_COUNT = 1000
 export const AGENT1_SHADOW_MIN_QUOTE_VOLUME_FLOOR = 10_000_000
 export const AGENT1_SHADOW_REGIME_EMA_PERIOD = 50
+/** Take-profit multiple of spike R in shadow replay (long: TP = entry + R×tpR; short: entry − R×tpR). Not in DB. */
+export const AGENT1_SHADOW_REPLAY_TP_R = 2
 
 function parseKlineRow(k) {
   return {
@@ -83,11 +85,48 @@ export function replayAgent1ShadowLongTrades(candles, opts) {
   return trades
 }
 
+/**
+ * Short-only replay: non-overlapping; down spikes per Agent 3 scan metric; exits via simulateShortRedSpikeTrade.
+ */
+export function replayAgent3ShadowShortTrades(candles, opts) {
+  const thresholdPct = Number(opts.thresholdPct)
+  const maxSlPct = Number(opts.maxSlPct)
+  const spikeMetric = opts.spikeMetric ?? 'body'
+  const scanDirection = opts.scanDirection ?? 'down'
+  const tpR = Number(opts.tpR ?? 2)
+  const indices = shortSpikeIndicesForAgent3Scan(
+    candles,
+    Number.isFinite(thresholdPct) && thresholdPct > 0 ? thresholdPct : 3,
+    spikeMetric,
+    scanDirection,
+  )
+  let lastExitBar = -1
+  const trades = []
+  for (const si of indices) {
+    if (si + 1 <= lastExitBar) continue
+    const tr = simulateShortRedSpikeTrade(candles, si, {
+      maxSlPct: Number.isFinite(maxSlPct) && maxSlPct > 0 ? maxSlPct : undefined,
+      tpR: Number.isFinite(tpR) && tpR > 0 ? tpR : 2,
+    })
+    if (!tr) continue
+    trades.push(tr)
+    lastExitBar = tr.exitBarIndex
+  }
+  return trades
+}
+
 function tradePriceReturnPctLong(t) {
   const e = t.entryPrice ?? t.entry
   const x = t.exitPrice
   if (!Number.isFinite(e) || e === 0 || !Number.isFinite(x)) return 0
   return ((x - e) / e) * 100
+}
+
+function tradePriceReturnPctShort(t) {
+  const e = t.entryPrice ?? t.entry
+  const x = t.exitPrice
+  if (!Number.isFinite(e) || e === 0 || !Number.isFinite(x)) return 0
+  return ((e - x) / e) * 100
 }
 
 /** Cumulative sum of closed-trade price %; one point per close (v1: no open-trade mark-to-market). */
@@ -97,6 +136,29 @@ export function buildAgent1ShadowCurveClosedTrades(tradesChronAsc) {
   for (let i = 0; i < tradesChronAsc.length; i++) {
     const t = tradesChronAsc[i]
     const pct = tradePriceReturnPctLong(t)
+    cum += pct
+    curve.push({
+      tradeIndex: i + 1,
+      time: t.exitOpenTime,
+      pnlPct: pct,
+      cumulativePnlPct: cum,
+      equityBase100: 100 + cum,
+      outcome: t.outcome,
+      spikeOpenTime: t.spikeOpenTime,
+      entryOpenTime: t.entryOpenTime,
+      symbol: t.symbol ?? null,
+    })
+  }
+  return curve
+}
+
+/** Cumulative Σ price % for closed short trades (chronological by exit). */
+export function buildAgent3ShadowCurveClosedTrades(tradesChronAsc) {
+  const curve = []
+  let cum = 0
+  for (let i = 0; i < tradesChronAsc.length; i++) {
+    const t = tradesChronAsc[i]
+    const pct = tradePriceReturnPctShort(t)
     cum += pct
     curve.push({
       tradeIndex: i + 1,
@@ -140,6 +202,31 @@ export function buildLiveCurveWithOpenTrades(closedCurve, openTrades, markTimeMs
   if (!Array.isArray(openTrades) || openTrades.length === 0) return out
   let openPnlPctSum = 0
   for (const t of openTrades) openPnlPctSum += tradePriceReturnPctLong(t)
+  const base = out.length > 0 ? Number(out[out.length - 1].cumulativePnlPct) || 0 : 0
+  const markTime = Number.isFinite(Number(markTimeMs))
+    ? Number(markTimeMs)
+    : out.length > 0
+      ? out[out.length - 1].time
+      : Date.now()
+  out.push({
+    tradeIndex: out.length + 1,
+    time: markTime,
+    pnlPct: openPnlPctSum,
+    cumulativePnlPct: base + openPnlPctSum,
+    equityBase100: 100 + base + openPnlPctSum,
+    outcome: 'open_mark',
+    isOpenAggregate: true,
+    openCount: openTrades.length,
+  })
+  return out
+}
+
+/** Closed short curve + aggregate mark-to-market for open shorts. */
+export function buildLiveCurveWithOpenTradesShort(closedCurve, openTrades, markTimeMs) {
+  const out = Array.isArray(closedCurve) ? [...closedCurve] : []
+  if (!Array.isArray(openTrades) || openTrades.length === 0) return out
+  let openPnlPctSum = 0
+  for (const t of openTrades) openPnlPctSum += tradePriceReturnPctShort(t)
   const base = out.length > 0 ? Number(out[out.length - 1].cumulativePnlPct) || 0 : 0
   const markTime = Number.isFinite(Number(markTimeMs))
     ? Number(markTimeMs)
@@ -208,6 +295,14 @@ function calcLongRMultipleAtPrice(t, markPrice) {
   return (px - entry) / r
 }
 
+function calcShortRMultipleAtPrice(t, markPrice) {
+  const entry = Number(t?.entryPrice ?? t?.entry)
+  const r = Number(t?.R)
+  const px = Number(markPrice)
+  if (!Number.isFinite(entry) || !Number.isFinite(r) || !(r > 0) || !Number.isFinite(px)) return null
+  return (entry - px) / r
+}
+
 /**
  * Mark open trades with a latest live price map.
  * @param {Array<object>} openTradesRaw
@@ -232,9 +327,34 @@ export function markOpenTradesWithLatestPrices(openTradesRaw, latestPriceBySymbo
   return out
 }
 
+/**
+ * Mark open **short** trades with latest mid prices (same shape as long mark helper).
+ */
+export function markOpenShortTradesWithLatestPrices(openTradesRaw, latestPriceBySymbol, markTimeMs) {
+  const out = []
+  for (const t of openTradesRaw ?? []) {
+    const sym = String(t?.symbol ?? '').toUpperCase()
+    const livePx = latestPriceBySymbol.get(sym)
+    const markPx = Number.isFinite(Number(livePx)) ? Number(livePx) : Number(t?.exitPrice)
+    const rMul = calcShortRMultipleAtPrice(t, markPx)
+    out.push({
+      ...t,
+      exitPrice: Number.isFinite(markPx) ? markPx : t?.exitPrice,
+      exitOpenTime: Number.isFinite(Number(markTimeMs)) ? Number(markTimeMs) : t?.exitOpenTime,
+      outcome: 'open_live',
+      rMultiple: Number.isFinite(rMul) ? rMul : t?.rMultiple ?? null,
+    })
+  }
+  return out
+}
+
 export function summarizeTradeForApi(t) {
+  const isShort = String(t?.side ?? '').toLowerCase() === 'short'
+  const tpN = Number(t?.tpPrice)
+  const slN = Number(t?.slPrice)
   return {
     symbol: t.symbol ?? null,
+    side: t.side ?? 'long',
     spikeOpenTime: t.spikeOpenTime,
     entryOpenTime: t.entryOpenTime,
     exitOpenTime: t.exitOpenTime,
@@ -242,7 +362,9 @@ export function summarizeTradeForApi(t) {
     exitPrice: t.exitPrice,
     outcome: t.outcome,
     rMultiple: t.rMultiple,
-    pnlPct: tradePriceReturnPctLong(t),
+    pnlPct: isShort ? tradePriceReturnPctShort(t) : tradePriceReturnPctLong(t),
+    tpPrice: Number.isFinite(tpN) ? tpN : null,
+    slPrice: Number.isFinite(slN) ? slN : null,
     spikeBarIndex: t.spikeBarIndex,
     entryBarIndex: t.entryBarIndex,
     exitBarIndex: t.exitBarIndex,
@@ -265,12 +387,14 @@ async function mapPool(items, concurrency, mapper) {
 }
 
 /**
- * Same universe as Agent 1 / fiveMinScreener: 24h quote volume rank, min volume, scanMaxSymbols cap.
- * Replays long sim per symbol, then merges all closed trades by exit time (portfolio-style cumulative %).
+ * Market-wide shadow replay: 24h quote volume rank, min volume, scanMaxSymbols from **agent1_shadow_sim_config**
+ * (Supabase) + optional runtime overrides, plus `AGENT1_SHADOW_MIN_QUOTE_VOLUME_FLOOR`.
+ * One kline fetch per symbol; replays long and short legs on the same candles, then merges each side’s closed
+ * trades by exit time (portfolio-style cumulative %). Kline interval is shadow sim `scanInterval`.
  */
-export async function runMarketWideAgent1ShadowReplay(futuresBase, settings, barCount) {
-  const minQuoteVolume = Number(settings.scanMinQuoteVolume)
-  const maxSymbols = Number(settings.scanMaxSymbols)
+export async function runMarketWideAgent1ShadowReplay(futuresBase, settingsAgent1, barCount, settingsAgent3) {
+  const minQuoteVolume = Number(settingsAgent1.scanMinQuoteVolume)
+  const maxSymbols = Number(settingsAgent1.scanMaxSymbols)
   const effectiveMinQuoteVolume = Math.max(
     AGENT1_SHADOW_MIN_QUOTE_VOLUME_FLOOR,
     Number.isFinite(minQuoteVolume) && minQuoteVolume >= 0 ? minQuoteVolume : 0,
@@ -294,12 +418,20 @@ export async function runMarketWideAgent1ShadowReplay(futuresBase, settings, bar
     Math.max(4, Number.isFinite(concRaw) && concRaw > 0 ? concRaw : 18),
   )
 
-  const tradeOpts = {
-    thresholdPct: settings.scanThresholdPct,
-    maxSlPct: settings.maxSlPct,
-    spikeMetric: settings.scanSpikeMetric,
-    scanDirection: settings.scanDirection,
-    tpR: 2,
+  const tradeOptsA1 = {
+    thresholdPct: settingsAgent1.scanThresholdPct,
+    maxSlPct: settingsAgent1.maxSlPct,
+    spikeMetric: settingsAgent1.scanSpikeMetric,
+    scanDirection: settingsAgent1.scanDirection,
+    tpR: AGENT1_SHADOW_REPLAY_TP_R,
+  }
+  const a3 = settingsAgent3 && typeof settingsAgent3 === 'object' ? settingsAgent3 : {}
+  const tradeOptsA3 = {
+    thresholdPct: a3.scanThresholdPct,
+    maxSlPct: a3.maxSlPct,
+    spikeMetric: a3.scanSpikeMetric,
+    scanDirection: a3.scanDirection,
+    tpR: AGENT1_SHADOW_REPLAY_TP_R,
   }
 
   const raw = await mapPool(selected, CONCURRENCY, async (row) => {
@@ -307,7 +439,7 @@ export async function runMarketWideAgent1ShadowReplay(futuresBase, settings, bar
       const candles = await fetchAgent1ShadowKlines(
         futuresBase,
         row.symbol,
-        settings.scanInterval,
+        settingsAgent1.scanInterval,
         n,
       )
       if (!candles.length) {
@@ -315,11 +447,16 @@ export async function runMarketWideAgent1ShadowReplay(futuresBase, settings, bar
           symbol: row.symbol,
           candlesLen: 0,
           lastOpen: null,
-          trades: [],
+          tradesLong: [],
+          tradesShort: [],
           error: null,
         }
       }
-      const trades = replayAgent1ShadowLongTrades(candles, tradeOpts).map((t) => ({
+      const tradesLong = replayAgent1ShadowLongTrades(candles, tradeOptsA1).map((t) => ({
+        ...t,
+        symbol: row.symbol,
+      }))
+      const tradesShort = replayAgent3ShadowShortTrades(candles, tradeOptsA3).map((t) => ({
         ...t,
         symbol: row.symbol,
       }))
@@ -328,7 +465,8 @@ export async function runMarketWideAgent1ShadowReplay(futuresBase, settings, bar
         symbol: row.symbol,
         candlesLen: candles.length,
         lastOpen: last.openTime,
-        trades,
+        tradesLong,
+        tradesShort,
         error: null,
       }
     } catch (e) {
@@ -336,7 +474,8 @@ export async function runMarketWideAgent1ShadowReplay(futuresBase, settings, bar
         symbol: row.symbol,
         candlesLen: 0,
         lastOpen: null,
-        trades: [],
+        tradesLong: [],
+        tradesShort: [],
         error: e instanceof Error ? e.message : String(e),
       }
     }
@@ -344,6 +483,8 @@ export async function runMarketWideAgent1ShadowReplay(futuresBase, settings, bar
 
   const allClosedTrades = []
   const allOpenTrades = []
+  const allClosedTradesA3 = []
+  const allOpenTradesA3 = []
   let symbolsErrored = 0
   let symbolsWithData = 0
   let maxLastBar = null
@@ -353,24 +494,32 @@ export async function runMarketWideAgent1ShadowReplay(futuresBase, settings, bar
       continue
     }
     if (r.candlesLen > 0) symbolsWithData += 1
-    const split = splitClosedAndOpenShadowTrades(r.trades, r.lastOpen)
-    allClosedTrades.push(...split.closedTrades)
-    allOpenTrades.push(...split.openTrades)
+    const splitL = splitClosedAndOpenShadowTrades(r.tradesLong, r.lastOpen)
+    const splitS = splitClosedAndOpenShadowTrades(r.tradesShort, r.lastOpen)
+    allClosedTrades.push(...splitL.closedTrades)
+    allOpenTrades.push(...splitL.openTrades)
+    allClosedTradesA3.push(...splitS.closedTrades)
+    allOpenTradesA3.push(...splitS.openTrades)
     if (r.lastOpen != null && (maxLastBar == null || r.lastOpen > maxLastBar)) {
       maxLastBar = r.lastOpen
     }
   }
 
-  allClosedTrades.sort((a, b) => {
+  const sortChron = (a, b) => {
     const ta = a.exitOpenTime ?? 0
     const tb = b.exitOpenTime ?? 0
     if (ta !== tb) return ta - tb
     return String(a.symbol ?? '').localeCompare(String(b.symbol ?? ''))
-  })
+  }
+  allClosedTrades.sort(sortChron)
+  allClosedTradesA3.sort(sortChron)
   allOpenTrades.sort((a, b) => String(a.symbol ?? '').localeCompare(String(b.symbol ?? '')))
+  allOpenTradesA3.sort((a, b) => String(a.symbol ?? '').localeCompare(String(b.symbol ?? '')))
 
   const curve = buildAgent1ShadowCurveClosedTrades(allClosedTrades)
   const liveCurve = buildLiveCurveWithOpenTrades(curve, allOpenTrades, maxLastBar)
+  const curveAgent3 = buildAgent3ShadowCurveClosedTrades(allClosedTradesA3)
+  const liveCurveAgent3 = buildLiveCurveWithOpenTradesShort(curveAgent3, allOpenTradesA3, maxLastBar)
 
   return {
     universe: {
@@ -379,11 +528,16 @@ export async function runMarketWideAgent1ShadowReplay(futuresBase, settings, bar
       symbolsErrored,
       barCountPerSymbol: n,
       effectiveMinQuoteVolume,
+      klineInterval: settingsAgent1.scanInterval,
     },
     closedTrades: allClosedTrades,
     openTrades: allOpenTrades,
+    closedTradesAgent3: allClosedTradesA3,
+    openTradesAgent3: allOpenTradesA3,
     curve,
     liveCurve,
+    curveAgent3,
+    liveCurveAgent3,
     lastBarOpenTime: maxLastBar,
   }
 }

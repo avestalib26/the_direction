@@ -101,15 +101,26 @@ function App() {
   const [maxNegPnlPct, setMaxNegPnlPct] = useState('500')
   const [maxOpenPositions, setMaxOpenPositions] = useState('10')
   const [maxTotalPositionSize, setMaxTotalPositionSize] = useState('0')
-  /** null = loading; master on/off persisted in Supabase (header toggle). */
-  const [agent1MasterEnabled, setAgent1MasterEnabled] = useState(null)
-  const [agent1MasterSaving, setAgent1MasterSaving] = useState(false)
-  const [agent3MasterEnabled, setAgent3MasterEnabled] = useState(null)
-  const [agent3MasterSaving, setAgent3MasterSaving] = useState(false)
+  /** Manual = agentEnabled (arm agent). Auto = emaGateEnabled (shadow EMA gate for new trades). */
+  const [agent1ManualEnabled, setAgent1ManualEnabled] = useState(null)
+  const [agent1AutoEnabled, setAgent1AutoEnabled] = useState(null)
+  const [agent1ManualSaving, setAgent1ManualSaving] = useState(false)
+  const [agent1AutoSaving, setAgent1AutoSaving] = useState(false)
+  /** null = n/a; true/false = live gate from shadow regime (long leg A1 / short leg A3). */
+  const [agent1EmaLiveAllow, setAgent1EmaLiveAllow] = useState(null)
+  const [agent3ManualEnabled, setAgent3ManualEnabled] = useState(null)
+  const [agent3AutoEnabled, setAgent3AutoEnabled] = useState(null)
+  const [agent3ManualSaving, setAgent3ManualSaving] = useState(false)
+  const [agent3AutoSaving, setAgent3AutoSaving] = useState(false)
+  const [agent3EmaLiveAllow, setAgent3EmaLiveAllow] = useState(null)
   const [agent2MasterEnabled, setAgent2MasterEnabled] = useState(null)
   const [agent2MasterSaving, setAgent2MasterSaving] = useState(false)
   const [agent2TradingEnabled, setAgent2TradingEnabled] = useState(null)
   const [agent2TradingSaving, setAgent2TradingSaving] = useState(false)
+  /** Shadow portfolio sim: null until first GET /shadow-curve on agent views. */
+  const [shadowSimPaused, setShadowSimPaused] = useState(null)
+  const [shadowSchedulerActive, setShadowSchedulerActive] = useState(null)
+  const [shadowSimToggleBusy, setShadowSimToggleBusy] = useState(false)
 
   const loadPositions = useCallback(async () => {
     setLoading(true)
@@ -195,16 +206,22 @@ function App() {
   useEffect(() => {
     if (view !== 'agent1') return
     let cancelled = false
-    setAgent1MasterEnabled(null)
+    setAgent1ManualEnabled(null)
+    setAgent1AutoEnabled(null)
+    setAgent1EmaLiveAllow(null)
     ;(async () => {
       try {
         const res = await fetch('/api/agents/agent1/settings', { cache: 'no-store' })
         const data = await res.json().catch(() => ({}))
         if (cancelled) return
         if (!res.ok) throw new Error(data.error || String(res.status))
-        setAgent1MasterEnabled(data.settings?.agentEnabled !== false)
+        setAgent1ManualEnabled(data.settings?.agentEnabled !== false)
+        setAgent1AutoEnabled(data.settings?.emaGateEnabled !== false)
       } catch {
-        if (!cancelled) setAgent1MasterEnabled(null)
+        if (!cancelled) {
+          setAgent1ManualEnabled(null)
+          setAgent1AutoEnabled(null)
+        }
       }
     })()
     return () => {
@@ -215,20 +232,112 @@ function App() {
   useEffect(() => {
     if (view !== 'agent3') return
     let cancelled = false
-    setAgent3MasterEnabled(null)
+    setAgent3ManualEnabled(null)
+    setAgent3AutoEnabled(null)
+    setAgent3EmaLiveAllow(null)
     ;(async () => {
       try {
         const res = await fetch('/api/agents/agent3/settings', { cache: 'no-store' })
         const data = await res.json().catch(() => ({}))
         if (cancelled) return
         if (!res.ok) throw new Error(data.error || String(res.status))
-        setAgent3MasterEnabled(data.settings?.agentEnabled !== false)
+        setAgent3ManualEnabled(data.settings?.agentEnabled !== false)
+        setAgent3AutoEnabled(data.settings?.emaGateEnabled !== false)
       } catch {
-        if (!cancelled) setAgent3MasterEnabled(null)
+        if (!cancelled) {
+          setAgent3ManualEnabled(null)
+          setAgent3AutoEnabled(null)
+        }
       }
     })()
     return () => {
       cancelled = true
+    }
+  }, [view])
+
+  useEffect(() => {
+    if (view !== 'agent1') return undefined
+    let cancelled = false
+    const poll = async () => {
+      if (agent1ManualEnabled !== true || agent1AutoEnabled !== true) {
+        setAgent1EmaLiveAllow(null)
+        return
+      }
+      try {
+        const res = await fetch('/api/agents/agent1/regime', { cache: 'no-store' })
+        const data = await res.json().catch(() => ({}))
+        if (cancelled || !res.ok) return
+        const g = data.regime?.gateAllowLong
+        setAgent1EmaLiveAllow(g === true ? true : g === false ? false : null)
+      } catch {
+        if (!cancelled) setAgent1EmaLiveAllow(null)
+      }
+    }
+    void poll()
+    const iv = setInterval(poll, 10_000)
+    return () => {
+      cancelled = true
+      clearInterval(iv)
+    }
+  }, [view, agent1ManualEnabled, agent1AutoEnabled])
+
+  useEffect(() => {
+    if (view !== 'agent3') return undefined
+    let cancelled = false
+    const poll = async () => {
+      if (agent3ManualEnabled !== true || agent3AutoEnabled !== true) {
+        setAgent3EmaLiveAllow(null)
+        return
+      }
+      try {
+        const res = await fetch('/api/agents/agent3/regime', { cache: 'no-store' })
+        const data = await res.json().catch(() => ({}))
+        if (cancelled || !res.ok) return
+        const g = data.regime?.gateAllowLong
+        setAgent3EmaLiveAllow(g === true ? true : g === false ? false : null)
+      } catch {
+        if (!cancelled) setAgent3EmaLiveAllow(null)
+      }
+    }
+    void poll()
+    const iv = setInterval(poll, 10_000)
+    return () => {
+      cancelled = true
+      clearInterval(iv)
+    }
+  }, [view, agent3ManualEnabled, agent3AutoEnabled])
+
+  useEffect(() => {
+    if (view !== 'longsim5m') {
+      setShadowSimPaused(null)
+      setShadowSchedulerActive(null)
+      return undefined
+    }
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/agents/agent1/shadow-curve', { cache: 'no-store' })
+        const data = await res.json().catch(() => ({}))
+        if (cancelled) return
+        if (!res.ok) {
+          setShadowSimPaused(null)
+          setShadowSchedulerActive(null)
+          return
+        }
+        setShadowSimPaused(data.simulationPaused === true)
+        setShadowSchedulerActive(data.shadowSchedulerActive !== false)
+      } catch {
+        if (!cancelled) {
+          setShadowSimPaused(null)
+          setShadowSchedulerActive(null)
+        }
+      }
+    }
+    void poll()
+    const iv = setInterval(poll, 15_000)
+    return () => {
+      cancelled = true
+      clearInterval(iv)
     }
   }, [view])
 
@@ -272,16 +381,16 @@ function App() {
     return () => window.removeEventListener('agent2-settings-changed', onA2)
   }, [view])
 
-  const requestAgent1MasterToggle = useCallback(async () => {
-    if (agent1MasterEnabled == null || agent1MasterSaving) return
-    const next = !agent1MasterEnabled
+  const requestAgent1ManualToggle = useCallback(async () => {
+    if (agent1ManualEnabled == null || agent1ManualSaving) return
+    const next = !agent1ManualEnabled
     const ok = window.confirm(
       next
-        ? 'Turn Agent 1 ON? The server will run scheduled 5m spike scans when the API scheduler is enabled.'
-        : 'Turn Agent 1 OFF? Scheduled spike scans will stop until you turn the agent on again.',
+        ? 'Turn Manual ON for Agent 1? Scans and execution are allowed when the server scheduler is enabled (Auto still controls EMA gating when ON).'
+        : 'Turn Manual OFF? Agent 1 scans and new execution stop until Manual is on again (Auto has no effect while Manual is off).',
     )
     if (!ok) return
-    setAgent1MasterSaving(true)
+    setAgent1ManualSaving(true)
     try {
       const res = await fetch('/api/agents/agent1/enabled', {
         method: 'PATCH',
@@ -290,25 +399,49 @@ function App() {
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
-      setAgent1MasterEnabled(data.settings?.agentEnabled !== false)
+      setAgent1ManualEnabled(data.settings?.agentEnabled !== false)
       window.dispatchEvent(new Event('agent1-enabled-changed'))
     } catch (e) {
-      window.alert(e instanceof Error ? e.message : 'Failed to update Agent1')
+      window.alert(e instanceof Error ? e.message : 'Failed to update Agent 1')
     } finally {
-      setAgent1MasterSaving(false)
+      setAgent1ManualSaving(false)
     }
-  }, [agent1MasterEnabled, agent1MasterSaving])
+  }, [agent1ManualEnabled, agent1ManualSaving])
 
-  const requestAgent3MasterToggle = useCallback(async () => {
-    if (agent3MasterEnabled == null || agent3MasterSaving) return
-    const next = !agent3MasterEnabled
+  const applyAgent1EmaGateEnabled = useCallback(async (enabled) => {
+    setAgent1AutoSaving(true)
+    try {
+      const res = await fetch('/api/agents/agent1/ema-gate', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+      setAgent1AutoEnabled(data.settings?.emaGateEnabled !== false)
+      window.dispatchEvent(new Event('agent1-ema-gate-changed'))
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'Failed to update Agent 1 EMA gate')
+    } finally {
+      setAgent1AutoSaving(false)
+    }
+  }, [])
+
+  const requestAgent1AutoToggle = useCallback(async () => {
+    if (agent1ManualEnabled !== true || agent1AutoEnabled == null || agent1AutoSaving) return
+    await applyAgent1EmaGateEnabled(!agent1AutoEnabled)
+  }, [agent1ManualEnabled, agent1AutoEnabled, agent1AutoSaving, applyAgent1EmaGateEnabled])
+
+  const requestAgent3ManualToggle = useCallback(async () => {
+    if (agent3ManualEnabled == null || agent3ManualSaving) return
+    const next = !agent3ManualEnabled
     const ok = window.confirm(
       next
-        ? 'Turn Agent 3 ON? Down-spike scans and short execution run when server schedulers are enabled.'
-        : 'Turn Agent 3 OFF? Agent 3 scans and execution stop until you turn it on again.',
+        ? 'Turn Manual ON for Agent 3? Down-spike scans and shorts run when server schedulers are enabled.'
+        : 'Turn Manual OFF? Agent 3 stops until Manual is on again (Auto has no effect while Manual is off).',
     )
     if (!ok) return
-    setAgent3MasterSaving(true)
+    setAgent3ManualSaving(true)
     try {
       const res = await fetch('/api/agents/agent3/enabled', {
         method: 'PATCH',
@@ -317,14 +450,59 @@ function App() {
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
-      setAgent3MasterEnabled(data.settings?.agentEnabled !== false)
+      setAgent3ManualEnabled(data.settings?.agentEnabled !== false)
       window.dispatchEvent(new Event('agent3-enabled-changed'))
     } catch (e) {
       window.alert(e instanceof Error ? e.message : 'Failed to update Agent 3')
     } finally {
-      setAgent3MasterSaving(false)
+      setAgent3ManualSaving(false)
     }
-  }, [agent3MasterEnabled, agent3MasterSaving])
+  }, [agent3ManualEnabled, agent3ManualSaving])
+
+  const applyAgent3EmaGateEnabled = useCallback(async (enabled) => {
+    setAgent3AutoSaving(true)
+    try {
+      const res = await fetch('/api/agents/agent3/ema-gate', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+      setAgent3AutoEnabled(data.settings?.emaGateEnabled !== false)
+      window.dispatchEvent(new Event('agent3-ema-gate-changed'))
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'Failed to update Agent 3 EMA gate')
+    } finally {
+      setAgent3AutoSaving(false)
+    }
+  }, [])
+
+  const requestAgent3AutoToggle = useCallback(async () => {
+    if (agent3ManualEnabled !== true || agent3AutoEnabled == null || agent3AutoSaving) return
+    await applyAgent3EmaGateEnabled(!agent3AutoEnabled)
+  }, [agent3ManualEnabled, agent3AutoEnabled, agent3AutoSaving, applyAgent3EmaGateEnabled])
+
+  const requestShadowSimToggle = useCallback(async () => {
+    if (shadowSchedulerActive !== true || shadowSimPaused === null || shadowSimToggleBusy) return
+    const nextPaused = !shadowSimPaused
+    setShadowSimToggleBusy(true)
+    try {
+      const res = await fetch('/api/agents/agent1/shadow-simulation', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused: nextPaused }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+      setShadowSimPaused(data.simulationPaused === true)
+      window.dispatchEvent(new Event('agent1-shadow-sim-changed'))
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'Failed to update shadow simulation')
+    } finally {
+      setShadowSimToggleBusy(false)
+    }
+  }, [shadowSchedulerActive, shadowSimPaused, shadowSimToggleBusy])
 
   const requestAgent2MasterToggle = useCallback(async () => {
     if (agent2MasterEnabled == null || agent2MasterSaving) return
@@ -450,6 +628,40 @@ function App() {
     })
   }, [positions])
 
+  const shadowSimRunning = shadowSchedulerActive === true && shadowSimPaused === false
+  const shadowSimToggleEl = view === 'longsim5m' ? (
+    <button
+      type="button"
+      className={`agent1-master-toggle ${shadowSimRunning ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
+      onClick={() => void requestShadowSimToggle()}
+      disabled={
+        shadowSimToggleBusy || shadowSchedulerActive !== true || shadowSimPaused === null
+      }
+      aria-pressed={shadowSimRunning}
+      title={
+        shadowSchedulerActive !== true
+          ? 'Shadow scheduler is off in API config (AGENT1_SHADOW_SCHEDULER=false). Set it true in .env / deploy env and restart; then you can pause or resume simulation here.'
+          : shadowSimPaused
+            ? 'Simulation paused — no replay or mark ticks. Click to resume (uses compute and Binance requests).'
+            : 'Simulation running — portfolio shadow replay on each tick. Click to pause and save resources.'
+      }
+    >
+      <span className="agent1-master-toggle__track" aria-hidden />
+      <span className="agent1-master-toggle__thumb" aria-hidden />
+      <span className="agent1-master-toggle__text">
+        {shadowSimToggleBusy
+          ? '…'
+          : shadowSchedulerActive !== true
+            ? 'Sim API off'
+            : shadowSimPaused === null
+              ? 'Sim …'
+              : shadowSimPaused
+                ? 'Sim paused'
+                : 'Sim on'}
+      </span>
+    </button>
+  ) : null
+
   return (
     <div className="layout">
       <header
@@ -473,22 +685,60 @@ function App() {
             <div className="top-bar-agent1-actions">
               <button
                 type="button"
-                className={`agent1-master-toggle ${agent1MasterEnabled ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
-                onClick={() => requestAgent1MasterToggle()}
-                disabled={agent1MasterEnabled == null || agent1MasterSaving}
-                aria-pressed={agent1MasterEnabled === true}
+                className={`agent1-master-toggle ${agent1ManualEnabled ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
+                onClick={() => requestAgent1ManualToggle()}
+                disabled={agent1ManualEnabled == null || agent1ManualSaving}
+                aria-pressed={agent1ManualEnabled === true}
+                title="Manual: arms Agent 1 (scans + execution). When Manual is off, Auto has no effect."
+              >
+                <span className="agent1-master-toggle__track" aria-hidden />
+                <span className="agent1-master-toggle__thumb" aria-hidden />
+                <span className="agent1-master-toggle__text">
+                  {agent1ManualSaving
+                    ? '…'
+                    : `Manual ${agent1ManualEnabled ? 'on' : 'off'}`}
+                </span>
+              </button>
+              <button
+                type="button"
+                className={`agent1-master-toggle ${agent1AutoEnabled ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
+                onClick={() => requestAgent1AutoToggle()}
+                disabled={
+                  agent1ManualEnabled !== true ||
+                  agent1AutoEnabled == null ||
+                  agent1AutoSaving
+                }
+                aria-pressed={agent1AutoEnabled === true}
                 title={
-                  agent1MasterEnabled
-                    ? 'Agent is ON — click to turn OFF (confirmation)'
-                    : 'Agent is OFF — click to turn ON (confirmation)'
+                  agent1ManualEnabled !== true
+                    ? 'Turn Manual on first. Auto = shadow EMA gate for new longs (cumulative Σ% > EMA on long sim curve).'
+                    : agent1AutoEnabled
+                      ? 'Auto on: require shadow long curve above EMA before new longs. Click to turn off (bypass EMA).'
+                      : 'Auto off: new longs ignore EMA gate. Click to require shadow EMA allow.'
                 }
               >
                 <span className="agent1-master-toggle__track" aria-hidden />
                 <span className="agent1-master-toggle__thumb" aria-hidden />
                 <span className="agent1-master-toggle__text">
-                  {agent1MasterSaving ? '…' : agent1MasterEnabled ? 'On' : 'Off'}
+                  {agent1AutoSaving
+                    ? '…'
+                    : `Auto ${agent1AutoEnabled ? 'on' : 'off'}`}
                 </span>
               </button>
+              {agent1ManualEnabled === true &&
+              agent1AutoEnabled === true &&
+              agent1EmaLiveAllow !== null ? (
+                <span
+                  className={`agent-header-ema-pill ${
+                    agent1EmaLiveAllow
+                      ? 'agent-header-ema-pill--allow'
+                      : 'agent-header-ema-pill--block'
+                  }`}
+                  title="Live shadow sim EMA gate (long leg); updates every ~10s."
+                >
+                  EMA {agent1EmaLiveAllow ? 'allow' : 'block'}
+                </span>
+              ) : null}
             </div>
           </>
         )}
@@ -498,22 +748,60 @@ function App() {
             <div className="top-bar-agent1-actions">
               <button
                 type="button"
-                className={`agent1-master-toggle ${agent3MasterEnabled ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
-                onClick={() => requestAgent3MasterToggle()}
-                disabled={agent3MasterEnabled == null || agent3MasterSaving}
-                aria-pressed={agent3MasterEnabled === true}
+                className={`agent1-master-toggle ${agent3ManualEnabled ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
+                onClick={() => requestAgent3ManualToggle()}
+                disabled={agent3ManualEnabled == null || agent3ManualSaving}
+                aria-pressed={agent3ManualEnabled === true}
+                title="Manual: arms Agent 3. When Manual is off, Auto has no effect."
+              >
+                <span className="agent1-master-toggle__track" aria-hidden />
+                <span className="agent1-master-toggle__thumb" aria-hidden />
+                <span className="agent1-master-toggle__text">
+                  {agent3ManualSaving
+                    ? '…'
+                    : `Manual ${agent3ManualEnabled ? 'on' : 'off'}`}
+                </span>
+              </button>
+              <button
+                type="button"
+                className={`agent1-master-toggle ${agent3AutoEnabled ? 'agent1-master-toggle--on' : 'agent1-master-toggle--off'}`}
+                onClick={() => requestAgent3AutoToggle()}
+                disabled={
+                  agent3ManualEnabled !== true ||
+                  agent3AutoEnabled == null ||
+                  agent3AutoSaving
+                }
+                aria-pressed={agent3AutoEnabled === true}
                 title={
-                  agent3MasterEnabled
-                    ? 'Agent 3 ON — click to turn OFF'
-                    : 'Agent 3 OFF — click to turn ON'
+                  agent3ManualEnabled !== true
+                    ? 'Turn Manual on first. Auto = shadow EMA gate for new shorts (short Σ% > EMA on sim curve).'
+                    : agent3AutoEnabled
+                      ? 'Auto on: require shadow short curve above EMA before new shorts. Click to bypass EMA.'
+                      : 'Auto off: new shorts ignore EMA gate. Click to require shadow EMA allow.'
                 }
               >
                 <span className="agent1-master-toggle__track" aria-hidden />
                 <span className="agent1-master-toggle__thumb" aria-hidden />
                 <span className="agent1-master-toggle__text">
-                  {agent3MasterSaving ? '…' : agent3MasterEnabled ? 'On' : 'Off'}
+                  {agent3AutoSaving
+                    ? '…'
+                    : `Auto ${agent3AutoEnabled ? 'on' : 'off'}`}
                 </span>
               </button>
+              {agent3ManualEnabled === true &&
+              agent3AutoEnabled === true &&
+              agent3EmaLiveAllow !== null ? (
+                <span
+                  className={`agent-header-ema-pill ${
+                    agent3EmaLiveAllow
+                      ? 'agent-header-ema-pill--allow'
+                      : 'agent-header-ema-pill--block'
+                  }`}
+                  title="Live shadow sim EMA gate (short leg); updates every ~10s."
+                >
+                  EMA {agent3EmaLiveAllow ? 'allow' : 'block'}
+                </span>
+              ) : null}
             </div>
           </>
         )}
@@ -568,7 +856,12 @@ function App() {
             </div>
           </>
         )}
-        {view === 'longsim5m' && <h1 className="top-bar-title">5m long simulation</h1>}
+        {view === 'longsim5m' && (
+          <>
+            <h1 className="top-bar-title">A1 &amp; A3 simulation</h1>
+            <div className="top-bar-agent1-actions">{shadowSimToggleEl}</div>
+          </>
+        )}
       </header>
 
       {menuOpen && (
@@ -656,7 +949,7 @@ function App() {
                       go('longsim5m')
                     }}
                   >
-                    5m long simulation
+                    A1 &amp; A3 simulation
                   </a>
                 </li>
               </ul>

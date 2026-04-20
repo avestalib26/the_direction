@@ -27,3 +27,5 @@ comment on table public.agent1_shadow_snapshot is
 insert into public.agent1_shadow_snapshot (snapshot_key, payload, writer_id)
 values ('main', '{}'::jsonb, 'bootstrap')
 on conflict (snapshot_key) do nothing;
+
+-- Shadow sim scan/universe/spike config (separate migration): supabase/agent1_shadow_sim_config.sql

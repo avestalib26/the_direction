@@ -168,32 +168,92 @@ const COL_BTC = '#f0b90b'
 const COL_EMA_SLOW = '#f59e0b'
 const COL_COMPARE_LONG = '#22c55e'
 const COL_COMPARE_SHORT = '#ea580c'
+const COL_COMPARE_LONG2 = '#0ea5e9'
+const COL_COMPARE_SHORT2 = '#a855f7'
 const COL_BB_BAND = 'rgba(96, 165, 250, 0.55)'
 const COL_BB_MID = 'rgba(147, 197, 253, 0.45)'
 
 /**
- * Two cumulative Σ price % curves: Agent 1 long vs Agent 3 short, same y-scale.
+ * Cumulative Σ price % curves on one y-scale (Agent 1 vs 3, optional Agent 4 & 5).
  * X-axis = normalized progress through each run (start → end), not wall-clock time.
+ * @param {{ points: unknown, side: 'long'|'short', label: string, color?: string }[]} [extraCompareSeries]
  */
 export function SpikeTpSlCompareEquityChart({
   longPoints,
   shortPoints,
+  extraCompareSeries = null,
   showFootnote = true,
   /** Called with chart after mount; `null` on cleanup — used to sync time scale with other panels. */
   onChartReady = null,
+  /** Optional background activity bars: [{ time, state }] where state: 0=none,1=long,2=short,3=both. */
+  activityBars = null,
 }) {
   const containerRef = useRef(null)
   const onChartReadyRef = useRef(onChartReady)
   useEffect(() => {
     onChartReadyRef.current = onChartReady
   }, [onChartReady])
-  const longData = useMemo(() => equityToCompareProgressLineData(longPoints), [longPoints])
-  const shortData = useMemo(() => equityToCompareProgressLineData(shortPoints), [shortPoints])
+  const comparePack = useMemo(() => {
+    const shortLines = []
+    const longLines = []
+    const pushShort = (points, label, color) => {
+      const data = equityToCompareProgressLineData(points)
+      if (!data || data.length < 2) return
+      const lastV = data[data.length - 1]?.value ?? 0
+      const lineColor = lastV >= 0 ? color : COL_NEG
+      shortLines.push({ data, label, lineColor })
+    }
+    const pushLong = (points, label, color) => {
+      const data = equityToCompareProgressLineData(points)
+      if (!data || data.length < 2) return
+      const lastV = data[data.length - 1]?.value ?? 0
+      const lineColor = lastV >= 0 ? color : COL_NEG
+      longLines.push({ data, label, lineColor })
+    }
+    if (shortPoints) pushShort(shortPoints, 'Agent 3 (short / red spike)', COL_COMPARE_SHORT)
+    if (longPoints) pushLong(longPoints, 'Agent 1 (long / green spike)', COL_COMPARE_LONG)
+    if (Array.isArray(extraCompareSeries)) {
+      for (const ex of extraCompareSeries) {
+        if (!ex?.points) continue
+        const side = ex.side === 'short' ? 'short' : 'long'
+        const defaultCol = side === 'short' ? COL_COMPARE_SHORT2 : COL_COMPARE_LONG2
+        const col = typeof ex.color === 'string' && ex.color ? ex.color : defaultCol
+        const label = ex.label || (side === 'short' ? 'Short' : 'Long')
+        if (side === 'short') pushShort(ex.points, label, col)
+        else pushLong(ex.points, label, col)
+      }
+    }
+    const drawSeries = [...shortLines, ...longLines]
+    const legendItems = []
+    if (longLines[0]) legendItems.push(longLines[0])
+    if (shortLines[0]) legendItems.push(shortLines[0])
+    for (let i = 1; i < longLines.length; i++) legendItems.push(longLines[i])
+    for (let i = 1; i < shortLines.length; i++) legendItems.push(shortLines[i])
+    return { drawSeries, legendItems }
+  }, [longPoints, shortPoints, extraCompareSeries])
+  const { drawSeries, legendItems } = comparePack
+  const activityData = useMemo(() => {
+    if (!Array.isArray(activityBars) || activityBars.length < 2) return null
+    const out = []
+    for (const row of activityBars) {
+      const t = Number(row?.time)
+      const s = Number(row?.state)
+      if (!Number.isFinite(t) || !Number.isFinite(s) || s <= 0) continue
+      const color =
+        s >= 3
+          ? 'rgba(245, 158, 11, 0.22)'
+          : s === 1
+            ? 'rgba(34, 197, 94, 0.18)'
+            : 'rgba(234, 88, 12, 0.18)'
+      out.push({ time: t, value: 1, color })
+    }
+    return out.length >= 2 ? out : null
+  }, [activityBars])
 
   useLayoutEffect(() => {
     const el = containerRef.current
     if (!el) return undefined
-    if ((!longData || longData.length < 2) && (!shortData || shortData.length < 2)) {
+    if (!drawSeries.length) {
       onChartReadyRef.current?.(null)
       return undefined
     }
@@ -216,6 +276,11 @@ export function SpikeTpSlCompareEquityChart({
         timeVisible: true,
         secondsVisible: false,
       },
+      leftPriceScale: {
+        visible: false,
+        borderColor: COL_GRID,
+        scaleMargins: { top: 0, bottom: 0 },
+      },
       rightPriceScale: {
         visible: true,
         borderColor: COL_GRID,
@@ -229,24 +294,24 @@ export function SpikeTpSlCompareEquityChart({
       formatter: (p) => `${Number(p).toFixed(2)}%`,
     }
 
-    if (shortData && shortData.length >= 2) {
-      const lastS = shortData[shortData.length - 1]?.value ?? 0
-      chart.addSeries(LineSeries, {
-        color: lastS >= 0 ? COL_COMPARE_SHORT : COL_NEG,
-        lineWidth: 2,
-        priceScaleId: 'right',
-        priceFormat: fmtPct,
-      }).setData(shortData)
+    if (activityData && activityData.length >= 2) {
+      chart.addSeries(HistogramSeries, {
+        priceScaleId: 'left',
+        base: 0,
+        lastValueVisible: false,
+        priceLineVisible: false,
+        crosshairMarkerVisible: false,
+        priceFormat: { type: 'price', precision: 0, minMove: 1 },
+      }).setData(activityData)
     }
 
-    if (longData && longData.length >= 2) {
-      const lastL = longData[longData.length - 1]?.value ?? 0
+    for (const row of drawSeries) {
       chart.addSeries(LineSeries, {
-        color: lastL >= 0 ? COL_COMPARE_LONG : COL_NEG,
+        color: row.lineColor,
         lineWidth: 2,
         priceScaleId: 'right',
         priceFormat: fmtPct,
-      }).setData(longData)
+      }).setData(row.data)
     }
 
     chart.timeScale().fitContent()
@@ -261,23 +326,34 @@ export function SpikeTpSlCompareEquityChart({
       ro.disconnect()
       chart.remove()
     }
-  }, [longData, shortData])
+  }, [drawSeries, activityData])
 
-  if ((!longData || longData.length < 2) && (!shortData || shortData.length < 2)) {
+  if (!drawSeries.length) {
     return (
-      <p className="hourly-spikes-hint">Run both backtests with at least one trade each to plot the comparison.</p>
+      <p className="hourly-spikes-hint">
+        Run the backtest(s) with at least one closed trade to plot the comparison lines.
+      </p>
     )
   }
 
   return (
     <div className="spike-tpsl-lw-host">
       <div className="spike-tpsl-compare-legend" aria-hidden="false">
-        <span className="spike-tpsl-compare-legend__item spike-tpsl-compare-legend__item--long">
-          <span className="spike-tpsl-compare-legend__swatch" /> Agent 1 (long / green spike)
-        </span>
-        <span className="spike-tpsl-compare-legend__item spike-tpsl-compare-legend__item--short">
-          <span className="spike-tpsl-compare-legend__swatch" /> Agent 3 (short / red spike)
-        </span>
+        {legendItems.map((row, li) => (
+          <span key={`${row.label}-${li}`} className="spike-tpsl-compare-legend__item">
+            <span
+              className="spike-tpsl-compare-legend__swatch"
+              style={{ background: row.lineColor }}
+            />{' '}
+            {row.label}
+          </span>
+        ))}
+        {activityData ? (
+          <span className="spike-tpsl-compare-legend__item">
+            <span className="spike-tpsl-compare-legend__swatch" style={{ background: 'rgba(245, 158, 11, 0.38)' }} />{' '}
+            Activity fill: green=Agent 1, orange=Agent 3, amber=both
+          </span>
+        ) : null}
       </div>
       <div ref={containerRef} className="spike-tpsl-lw-chart" />
       {showFootnote ? (
@@ -285,6 +361,7 @@ export function SpikeTpSlCompareEquityChart({
           <strong>Compare mode</strong>: horizontal axis is <strong>progress through each run</strong> (0% → 100% of
           trades), not calendar time, so different trade counts align for shape comparison. <strong>Right axis</strong>:
           cumulative Σ price % (same engine as quick backtest).
+          {activityData ? ' Vertical fills show when each agent is active under EMA gate.' : ''}
         </p>
       ) : null}
     </div>

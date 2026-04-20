@@ -84,6 +84,16 @@ async function fetchAgent3Execution() {
   return data
 }
 
+/** Short-leg regime from shared shadow simulation (`GET /api/agents/agent3/regime` — same engine as Long Sim). */
+async function fetchShadowSimRegime() {
+  const res = await fetch('/api/agents/agent3/regime', { cache: 'no-store' })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    throw new Error(data.error || `Request failed (${res.status})`)
+  }
+  return data
+}
+
 async function fetchAgent3AccountMetrics() {
   const res = await fetch('/api/agents/agent3/account-metrics', { cache: 'no-store' })
   const data = await res.json().catch(() => ({}))
@@ -173,6 +183,7 @@ export function Agent3() {
   const [scanSpikeMetric, setScanSpikeMetric] = useState('body')
   const [scanDirection, setScanDirection] = useState('down')
   const [agentEnabled, setAgentEnabled] = useState(false)
+  const [emaGateEnabled, setEmaGateEnabled] = useState(false)
   const [binanceAccount, setBinanceAccount] = useState('master')
   const [binanceAccountColumnReadable, setBinanceAccountColumnReadable] = useState(true)
 
@@ -182,6 +193,8 @@ export function Agent3() {
   const [savedAt, setSavedAt] = useState('')
 
   const [scanStatus, setScanStatus] = useState(null)
+  /** Short-leg cumulative % vs EMA from `GET /api/agents/agent3/regime` (`regime` field). */
+  const [regimeA3, setRegimeA3] = useState(null)
   const [execution, setExecution] = useState(null)
   const [spikes, setSpikes] = useState([])
   const [visibleSpikesCount, setVisibleSpikesCount] = useState(30)
@@ -269,6 +282,15 @@ export function Agent3() {
       setScanStatus(st)
     } catch {
       setScanStatus(null)
+    }
+  }, [])
+
+  const loadRegime = useCallback(async () => {
+    try {
+      const data = await fetchShadowSimRegime()
+      setRegimeA3(data?.regime ?? null)
+    } catch {
+      setRegimeA3(null)
     }
   }, [])
 
@@ -407,6 +429,7 @@ export function Agent3() {
         setScanSpikeMetric(String(s.scanSpikeMetric ?? 'body'))
         setScanDirection(String(s.scanDirection ?? 'down'))
         setAgentEnabled(s.agentEnabled !== false)
+        setEmaGateEnabled(s.emaGateEnabled !== false)
         setBinanceAccount(String(s.binanceAccount ?? 'master'))
         setSavedAt(String(s.updatedAt ?? ''))
       } catch (e) {
@@ -418,11 +441,13 @@ export function Agent3() {
     load()
     loadSpikes()
     loadScanStatus()
+    loadRegime()
     loadExecution()
     loadAccountMetrics()
     const iv = setInterval(() => {
       loadScanStatus()
       loadSpikes()
+      loadRegime()
       loadExecution()
       loadAccountMetrics()
     }, 30_000)
@@ -430,15 +455,17 @@ export function Agent3() {
       off = true
       clearInterval(iv)
     }
-  }, [loadAccountMetrics, loadExecution, loadSpikes, loadScanStatus])
+  }, [loadAccountMetrics, loadExecution, loadRegime, loadSpikes, loadScanStatus])
 
   useEffect(() => {
     const onHeaderToggle = () => {
       loadScanStatus()
+      void loadRegime()
       ;(async () => {
         try {
           const { settings: s, binanceAccountColumnReadable: colOk } = await fetchAgent3Settings()
           setAgentEnabled(s.agentEnabled !== false)
+          setEmaGateEnabled(s.emaGateEnabled !== false)
           setBinanceAccountColumnReadable(colOk)
         } catch {
           /* keep previous */
@@ -446,8 +473,12 @@ export function Agent3() {
       })()
     }
     window.addEventListener('agent3-enabled-changed', onHeaderToggle)
-    return () => window.removeEventListener('agent3-enabled-changed', onHeaderToggle)
-  }, [loadScanStatus])
+    window.addEventListener('agent3-ema-gate-changed', onHeaderToggle)
+    return () => {
+      window.removeEventListener('agent3-enabled-changed', onHeaderToggle)
+      window.removeEventListener('agent3-ema-gate-changed', onHeaderToggle)
+    }
+  }, [loadRegime, loadScanStatus])
 
   useEffect(() => {
     if (typeof window === 'undefined') return undefined
@@ -510,6 +541,7 @@ export function Agent3() {
         scanSpikeMetric,
         scanDirection,
         agentEnabled,
+        emaGateEnabled,
         binanceAccount,
       })
       setTradeSizeUsd(String(out.tradeSizeUsd))
@@ -543,6 +575,7 @@ export function Agent3() {
       setScanSpikeMetric(String(out.scanSpikeMetric))
       setScanDirection(String(out.scanDirection))
       setAgentEnabled(out.agentEnabled !== false)
+      setEmaGateEnabled(out.emaGateEnabled !== false)
       setBinanceAccount(String(out.binanceAccount ?? 'master'))
       setBinanceAccountColumnReadable(colOk)
       setSavedAt(String(out.updatedAt ?? new Date().toISOString()))
@@ -686,6 +719,31 @@ export function Agent3() {
           </div>
           <div className="risk-chip">
             Last spikes written: <strong>{scanStatus.lastSpikeCount ?? '—'}</strong>
+          </div>
+          <div className="risk-chip">
+            Short sim Σ%:{' '}
+            <strong>
+              {Number.isFinite(Number(regimeA3?.latestCumPnlPct))
+                ? `${Number(regimeA3.latestCumPnlPct).toFixed(3)}%`
+                : '—'}
+            </strong>
+          </div>
+          <div className="risk-chip">
+            EMA50 (short curve):{' '}
+            <strong>
+              {Number.isFinite(Number(regimeA3?.emaValue)) ? `${Number(regimeA3.emaValue).toFixed(3)}%` : '—'}
+            </strong>
+          </div>
+          <div className="risk-chip">
+            Gate:{' '}
+            <strong>
+              {emaGateEnabled
+                ? regimeA3?.gateAllowLong
+                  ? 'ALLOW SHORT'
+                  : 'BLOCK SHORT'
+                : 'DISABLED (BYPASS)'}
+            </strong>
+            <span className="hourly-spikes-hint"> (top bar Auto / EMA gate)</span>
           </div>
           <div className="risk-chip">
             Exec loop: <strong>{execution?.state?.running ? 'running' : 'idle'}</strong>
@@ -889,9 +947,11 @@ export function Agent3() {
         </div>
       ) : null}
 
-      <h2 ref={executionRef} className="vol-screener-title agent1-section-title agent1-anchor-target">
-        Execution
-      </h2>
+      <details ref={executionRef} className="agent-settings-details agent1-anchor-target">
+        <summary className="agent-settings-details-summary">
+          <span className="vol-screener-title agent1-section-title">Execution</span>
+        </summary>
+        <div className="agent-settings-details-body">
       <p className="hourly-spikes-hint agent1-section-hint">
         Sizing, scan cadence, and spike filters for live shorts — same engine as simulation above.
       </p>
@@ -1010,8 +1070,14 @@ export function Agent3() {
           />
         </label>
       </div>
+        </div>
+      </details>
 
-      <h2 className="vol-screener-title agent1-section-title">Kline spike scan (pre-close)</h2>
+      <details className="agent-settings-details">
+        <summary className="agent-settings-details-summary">
+          <span className="vol-screener-title agent1-section-title">Kline spike scan (pre-close)</span>
+        </summary>
+        <div className="agent-settings-details-body">
       <div className="backtest1-form agent1-form">
         <label className="backtest1-field">
           <span className="backtest1-label">Timeframe</span>
@@ -1036,9 +1102,6 @@ export function Agent3() {
             ))}
           </select>
         </label>
-        <p className="hourly-spikes-hint" style={{ gridColumn: '1 / -1', margin: 0 }}>
-          Uses the latest kline from Binance, which is the open candle until it closes.
-        </p>
         <label className="backtest1-field">
           <span className="backtest1-label">Seconds before candle close</span>
           <input
@@ -1124,6 +1187,7 @@ export function Agent3() {
             onClick={() => {
               loadSpikes()
               loadScanStatus()
+              loadRegime()
               loadExecution()
               loadAccountMetrics()
             }}
@@ -1138,6 +1202,8 @@ export function Agent3() {
           ) : null}
         </div>
       </div>
+        </div>
+      </details>
       {error ? (
         <p className="vol-screener-lead" role="alert" style={{ color: '#b91c1c' }}>
           {error}

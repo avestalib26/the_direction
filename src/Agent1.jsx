@@ -181,7 +181,6 @@ export function Agent1() {
 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
-  const [emaGateSaving, setEmaGateSaving] = useState(false)
   const [error, setError] = useState('')
   const [savedAt, setSavedAt] = useState('')
 
@@ -463,7 +462,11 @@ export function Agent1() {
       })()
     }
     window.addEventListener('agent1-enabled-changed', onHeaderToggle)
-    return () => window.removeEventListener('agent1-enabled-changed', onHeaderToggle)
+    window.addEventListener('agent1-ema-gate-changed', onHeaderToggle)
+    return () => {
+      window.removeEventListener('agent1-enabled-changed', onHeaderToggle)
+      window.removeEventListener('agent1-ema-gate-changed', onHeaderToggle)
+    }
   }, [loadScanStatus])
 
   useEffect(() => {
@@ -585,29 +588,6 @@ export function Agent1() {
     }
   }
 
-  const onToggleEmaGate = async () => {
-    if (loading || saving || emaGateSaving) return
-    const next = !emaGateEnabled
-    const ok = window.confirm(
-      next
-        ? 'Enable EMA gating for Agent 1 execution? Trades will be blocked when curve is below EMA.'
-        : 'Disable EMA gating for Agent 1 execution? Agent will bypass regime gate and execute by spikes only.',
-    )
-    if (!ok) return
-    setEmaGateSaving(true)
-    setError('')
-    try {
-      const out = await saveAgent1Settings({ emaGateEnabled: next })
-      setEmaGateEnabled(out.emaGateEnabled !== false)
-      setSavedAt(String(out.updatedAt ?? new Date().toISOString()))
-      loadExecution()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to update EMA gate setting')
-    } finally {
-      setEmaGateSaving(false)
-    }
-  }
-
   return (
     <div className="vol-screener agent1-page agent1-page--long">
       <nav className="agent1-tabs" aria-label="Agent 1 sections">
@@ -622,10 +602,6 @@ export function Agent1() {
           </button>
         ))}
       </nav>
-      <p className="agent1-page-lead">
-        <strong>Agent 1</strong> — long USDT-M perps on <strong>green-body</strong> spikes. Optional{' '}
-        <strong>EMA regime gate</strong> can block entries when the stacked curve is below its EMA.
-      </p>
       <div className="agent1-account-tablet">
         {accountMetricsError ? (
           <p className="vol-screener-lead agent1-account-tablet__err" role="alert">
@@ -739,9 +715,7 @@ export function Agent1() {
             <strong>
               {emaGateEnabled ? (regime?.gateAllowLong ? 'ALLOW LONG' : 'BLOCK LONG') : 'DISABLED (BYPASS)'}
             </strong>
-          </div>
-          <div className="risk-chip">
-            EMA gate: <strong>{emaGateEnabled ? 'ON' : 'OFF'}</strong>
+            <span className="hourly-spikes-hint"> (top bar Auto / EMA gate)</span>
           </div>
           <div className="risk-chip">
             Exec loop: <strong>{execution?.state?.running ? 'running' : 'idle'}</strong>
@@ -944,26 +918,12 @@ export function Agent1() {
         </div>
       ) : null}
 
-      <h2 ref={executionRef} className="vol-screener-title agent1-section-title agent1-anchor-target">
-        Execution
-      </h2>
-      <p className="hourly-spikes-hint agent1-section-hint">
-        EMA gate toggles regime filter for live entries. Below: sizing, scan cadence, and spike filters — same engine as
-        simulation above.
-      </p>
+      <details ref={executionRef} className="agent-settings-details agent1-anchor-target">
+        <summary className="agent-settings-details-summary">
+          <span className="vol-screener-title agent1-section-title">Execution</span>
+        </summary>
+        <div className="agent-settings-details-body">
       <div className="backtest1-form agent1-form agent1-form--compact-fields" aria-busy={loading}>
-        <div className="agent1-form-actions" style={{ gridColumn: '1 / -1', paddingTop: 0 }}>
-          <button
-            type="button"
-            className={`backtest1-btn ${emaGateEnabled ? 'backtest1-btn--secondary' : ''}`}
-            onClick={onToggleEmaGate}
-            disabled={loading || saving || emaGateSaving}
-          >
-            {emaGateSaving
-              ? 'Updating EMA gate…'
-              : `EMA gate: ${emaGateEnabled ? 'ON (click to disable)' : 'OFF (click to enable)'}`}
-          </button>
-        </div>
         <label className="backtest1-field">
           <span className="backtest1-label">Binance account</span>
           <select
@@ -1078,8 +1038,14 @@ export function Agent1() {
           />
         </label>
       </div>
+        </div>
+      </details>
 
-      <h2 className="vol-screener-title agent1-section-title">Kline spike scan (pre-close)</h2>
+      <details className="agent-settings-details">
+        <summary className="agent-settings-details-summary">
+          <span className="vol-screener-title agent1-section-title">Kline spike scan (pre-close)</span>
+        </summary>
+        <div className="agent-settings-details-body">
       <div className="backtest1-form agent1-form">
         <label className="backtest1-field">
           <span className="backtest1-label">Timeframe</span>
@@ -1104,9 +1070,6 @@ export function Agent1() {
             ))}
           </select>
         </label>
-        <p className="hourly-spikes-hint" style={{ gridColumn: '1 / -1', margin: 0 }}>
-          Uses the latest kline from Binance, which is the open candle until it closes.
-        </p>
         <label className="backtest1-field">
           <span className="backtest1-label">Seconds before candle close</span>
           <input
@@ -1206,6 +1169,8 @@ export function Agent1() {
           ) : null}
         </div>
       </div>
+        </div>
+      </details>
       {error ? (
         <p className="vol-screener-lead" role="alert" style={{ color: '#b91c1c' }}>
           {error}
@@ -1286,10 +1251,6 @@ export function Agent1() {
       )}
 
       <h3 className="vol-screener-title agent1-section-title">Cumulative net PnL (Agent 1 closes)</h3>
-      <p className="hourly-spikes-hint">
-        On demand: up to the last <strong>1000</strong> rows in <code>agent1_trades</code> with status closed.
-        Net USDT = realized + commission + funding (same as the table below). Not your full Binance account.
-      </p>
       <div className="agent1-form-actions" style={{ marginBottom: '0.65rem', flexWrap: 'wrap', gap: '0.5rem' }}>
         <button
           type="button"

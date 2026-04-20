@@ -6,6 +6,7 @@ import {
   compareProgressSynthTimeFromPointIndex,
 } from './spikeTpSlLightweightCharts.jsx'
 import { simulateAccountBalanceFromTradePcts } from './accountLeverageSim.js'
+import { normalizeEquityEmaPeriod } from './equityEmaInteractiveFilter.js'
 import { consumeQuickBacktestStream, MAX_QUICK_BACKTEST_CANDLES } from './spikeQuickBacktestClient.js'
 
 const INTERVAL_OPTIONS = [
@@ -56,33 +57,273 @@ function fmtUsd2(n) {
   return `${Number(n).toFixed(2)} USDT`
 }
 
-/**
- * Build chart line + sim meta from quick backtest result; x-axis aligned with compare/candle progress.
- */
-function buildAccountSimForResult(result, startingBalanceStr, tradeSizePctStr, leverageStr) {
-  if (!result?.perTradePricePctChron?.length || !result.equityCurve?.length || result.equityCurve.length < 2) {
-    return null
+function computeEmaOnCloses(closes, period) {
+  const out = closes.map(() => null)
+  if (!Array.isArray(closes) || closes.length < period || period < 2) return out
+  let sum = 0
+  for (let i = 0; i < period; i++) sum += closes[i]
+  let ema = sum / period
+  out[period - 1] = ema
+  const alpha = 2 / (period + 1)
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * alpha + ema * (1 - alpha)
+    out[i] = ema
   }
-  const startingBalance = Number.parseFloat(String(startingBalanceStr).replace(/,/g, ''))
-  const tradeSizePct = Number.parseFloat(String(tradeSizePctStr).replace(/,/g, ''))
-  const leverage = Number.parseFloat(String(leverageStr).replace(/,/g, ''))
-  const pcts = result.perTradePricePctChron.map((x) => {
+  return out
+}
+
+function maxDrawdownFromPnlPoints(points) {
+  if (!Array.isArray(points) || points.length < 2) return null
+  let peak = -Infinity
+  let maxDd = 0
+  for (const p of points) {
+    const v = Number(p?.pnlPctFromStart)
+    if (!Number.isFinite(v)) continue
+    if (v > peak) peak = v
+    const dd = peak - v
+    if (dd > maxDd) maxDd = dd
+  }
+  return Number.isFinite(maxDd) ? maxDd : null
+}
+
+/**
+ * EMA gate per side: keep trade i only if cumulative close at i-1 > EMA(i-1).
+ * Strict warmup: first `period` trades are skipped until EMA is established.
+ * If server entry flags are present, reuse them for consistency with backend.
+ */
+function buildEmaGatedPackForResult(result, emaPeriod = QUICK_EMA_PERIOD) {
+  const pctsRaw = result?.perTradePricePctChron
+  if (!Array.isArray(pctsRaw) || pctsRaw.length === 0) return null
+  const n = pctsRaw.length
+  const pcts = pctsRaw.map((x) => {
     const v = Number(x)
     return Number.isFinite(v) ? v : 0
   })
+  const period = normalizeEquityEmaPeriod(emaPeriod)
+
+  const closes = []
+  let c = 0
+  for (let i = 0; i < n; i++) {
+    c += pcts[i]
+    closes.push(c)
+  }
+  const ema = computeEmaOnCloses(closes, period)
+  const entryFlagsRaw = result?.perTradeEquityEmaAtEntryOk
+  const useEntryFlags = Array.isArray(entryFlagsRaw) && entryFlagsRaw.length === n
+  const entryOk = new Array(n).fill(false)
+  for (let i = 0; i < n; i++) {
+    // Strict warmup: do not count trades before EMA(period) is established.
+    // For prior-point gating, first eligible trade index is `period`.
+    if (i < period) {
+      entryOk[i] = false
+      continue
+    }
+    if (useEntryFlags) {
+      entryOk[i] = entryFlagsRaw[i] === true
+      continue
+    }
+    const prevClose = closes[i - 1]
+    const prevEma = ema[i - 1]
+    entryOk[i] = Number.isFinite(prevClose) && Number.isFinite(prevEma) && prevClose > prevEma
+  }
+
+  const points = [{ tradeIndex: 0, pnlPctFromStart: 0 }]
+  const activeByPoint = [false]
+  let cum = 0
+  let kept = 0
+  let skipped = 0
+  let sumR = 0
+  let tpHits = 0
+  let slHits = 0
+  let eodHits = 0
+  let winningTrades = 0
+  let losingTrades = 0
+  let breakevenTrades = 0
+  const rChron = Array.isArray(result?.perTradeRChron) && result.perTradeRChron.length === n ? result.perTradeRChron : null
+  const oc = Array.isArray(result?.perTradeOutcomeChron) && result.perTradeOutcomeChron.length === n
+    ? result.perTradeOutcomeChron
+    : null
+
+  for (let i = 0; i < n; i++) {
+    const ok = entryOk[i] === true
+    activeByPoint.push(ok)
+    if (ok) {
+      cum += pcts[i]
+      kept += 1
+      const r = Number(rChron?.[i])
+      if (Number.isFinite(r)) {
+        sumR += r
+        if (r > 0) winningTrades += 1
+        else if (r < 0) losingTrades += 1
+        else breakevenTrades += 1
+      }
+      const o = oc?.[i]
+      if (o === 'tp') tpHits += 1
+      else if (o === 'sl') slHits += 1
+      else if (o === 'eod') eodHits += 1
+    } else {
+      skipped += 1
+    }
+    points.push({ tradeIndex: i + 1, pnlPctFromStart: cum })
+  }
+
+  const decided = tpHits + slHits
+  const summary = {
+    totalTrades: kept,
+    skippedTradesByEma: skipped,
+    finalPnlPctFromStart: cum,
+    avgPnlPctPerTrade: kept > 0 ? cum / kept : null,
+    maxDrawdownPnlPct: maxDrawdownFromPnlPoints(points),
+    sumR: Number.isFinite(sumR) ? sumR : null,
+    avgR: kept > 0 && Number.isFinite(sumR) ? sumR / kept : null,
+    tpHits,
+    slHits,
+    eodHits,
+    winningTrades,
+    losingTrades,
+    breakevenTrades,
+    winRateTpVsSlPct: decided > 0 ? (100 * tpHits) / decided : null,
+    usedServerEntryFlags: useEntryFlags,
+  }
+  const cut = Math.min(period, points.length - 1)
+  const displayPoints = points.slice(cut)
+  const displayActivity = activeByPoint.slice(cut)
+
+  let equityCurveOut = displayPoints.length >= 2 ? displayPoints : points
+  if (Array.isArray(result?.equityEmaFilteredCurve) && result.equityEmaFilteredCurve.length > 1) {
+    const srv = result.equityEmaFilteredCurve
+      .map((p) => ({
+        tradeIndex: p.tradeIndex,
+        pnlPctFromStart: Number(p.pnlPctFromStart),
+      }))
+      .filter((p) => Number.isFinite(p.pnlPctFromStart))
+    if (srv.length > 1) {
+      const cutSrv = Math.min(period, Math.max(0, srv.length - 1))
+      const sliced = srv.slice(cutSrv)
+      equityCurveOut = sliced.length >= 2 ? sliced : srv
+      const lastFin = Number(srv[srv.length - 1]?.pnlPctFromStart)
+      if (Number.isFinite(lastFin)) {
+        summary.finalPnlPctFromStart = lastFin
+        summary.avgPnlPctPerTrade = kept > 0 ? lastFin / kept : null
+        summary.maxDrawdownPnlPct = maxDrawdownFromPnlPoints(srv)
+      }
+    }
+  }
+
+  return {
+    equityCurve: equityCurveOut,
+    activityByPoint: displayActivity.length >= 2 ? displayActivity : activeByPoint,
+    summary,
+    period,
+    sourceTrades: n,
+    subsampled: Boolean(result?.perTradePricePctSubsampled),
+  }
+}
+
+function buildCombinedActivityBars(longPack, shortPack) {
+  const nLong = longPack?.activityByPoint?.length ?? 0
+  const nShort = shortPack?.activityByPoint?.length ?? 0
+  const n = Math.max(nLong, nShort)
+  if (n < 2) return null
+  const out = []
+  for (let i = 0; i < n; i++) {
+    const t = compareProgressSynthTimeFromPointIndex(i, n)
+    let longOn = false
+    let shortOn = false
+    if (nLong >= 2 && longPack?.activityByPoint) {
+      const idxL = Math.round((i / (n - 1)) * (nLong - 1))
+      longOn = longPack.activityByPoint[idxL] === true
+    }
+    if (nShort >= 2 && shortPack?.activityByPoint) {
+      const idxS = Math.round((i / (n - 1)) * (nShort - 1))
+      shortOn = shortPack.activityByPoint[idxS] === true
+    }
+    const state = (longOn ? 1 : 0) + (shortOn ? 2 : 0)
+    out.push({ time: t, state })
+  }
+  return out
+}
+
+function getResampledAtIndex(arr, toLen, i) {
+  if (!Array.isArray(arr) || arr.length === 0 || toLen <= 0) return 0
+  if (arr.length === 1) return Number(arr[0]) || 0
+  const idx = Math.round((i / (toLen - 1)) * (arr.length - 1))
+  const v = Number(arr[idx])
+  return Number.isFinite(v) ? v : 0
+}
+
+function equityCurveDeltas(points) {
+  if (!Array.isArray(points) || points.length < 2) return []
+  const out = []
+  for (let i = 1; i < points.length; i++) {
+    const prev = Number(points[i - 1]?.pnlPctFromStart)
+    const cur = Number(points[i]?.pnlPctFromStart)
+    if (!Number.isFinite(prev) || !Number.isFinite(cur)) out.push(0)
+    else out.push(cur - prev)
+  }
+  return out
+}
+
+function getResampledBoolAtIndex(arr, toLen, i) {
+  if (!Array.isArray(arr) || arr.length === 0 || toLen <= 0) return false
+  if (arr.length === 1) return arr[0] === true
+  const idx = Math.round((i / (toLen - 1)) * (arr.length - 1))
+  return arr[idx] === true
+}
+
+/**
+ * Shared-wallet simulation where EMA-gated Agent 1 + Agent 3 returns are combined per normalized progress step.
+ * This is an approximation when side trade counts differ, because returns are aligned by progress index.
+ */
+function buildCombinedEmaGatedAccountSim(longPack, shortPack, startingBalanceStr, tradeSizePctStr, leverageStr) {
+  const dL = equityCurveDeltas(longPack?.equityCurve)
+  const dS = equityCurveDeltas(shortPack?.equityCurve)
+  const n = Math.max(dL.length, dS.length)
+  if (n < 1) return null
+
+  const pctsCombined = []
+  let longOnlySteps = 0
+  let shortOnlySteps = 0
+  let bothSteps = 0
+  for (let i = 0; i < n; i++) {
+    const longOn = getResampledBoolAtIndex(longPack?.activityByPoint, n + 1, i + 1)
+    const shortOn = getResampledBoolAtIndex(shortPack?.activityByPoint, n + 1, i + 1)
+    if (longOn && shortOn) bothSteps += 1
+    else if (longOn) longOnlySteps += 1
+    else if (shortOn) shortOnlySteps += 1
+
+    const xL = getResampledAtIndex(dL, n, i)
+    const xS = getResampledAtIndex(dS, n, i)
+    pctsCombined.push(xL + xS)
+  }
+
+  const startingBalance = Number.parseFloat(String(startingBalanceStr).replace(/,/g, ''))
+  const tradeSizePct = Number.parseFloat(String(tradeSizePctStr).replace(/,/g, ''))
+  const leverage = Number.parseFloat(String(leverageStr).replace(/,/g, ''))
   const sim = simulateAccountBalanceFromTradePcts({
     startingBalance,
     tradeSizePct,
     leverage,
-    perTradePricePcts: pcts,
+    perTradePricePcts: pctsCombined,
   })
   if (!sim) return null
-  const nEq = Math.max(2, Math.floor(result.equityCurve.length))
-  const points = sim.points.map((p) => ({
-    time: compareProgressSynthTimeFromPointIndex(p.tradeIndex, nEq),
+  const totalPoints = Math.max(2, sim.points.length)
+  const points = sim.points.map((p, i) => ({
+    time: compareProgressSynthTimeFromPointIndex(i, totalPoints),
     value: p.balance,
   }))
-  return { sim, points, subsampled: Boolean(result.perTradePricePctSubsampled) }
+  return {
+    sim,
+    points,
+    nSteps: n,
+    longOnlySteps,
+    shortOnlySteps,
+    bothSteps,
+    approxByResample:
+      (Array.isArray(dL) && Array.isArray(dS) && dL.length > 0 && dS.length > 0 && dL.length !== dS.length) ||
+      longPack?.subsampled ||
+      shortPack?.subsampled,
+  }
 }
 
 function pushProgress(setLog, line) {
@@ -211,6 +452,61 @@ function LongShortSideMetrics({ title, summary, symbolsSkipped, isFirst }) {
   )
 }
 
+function EmaGatedSideMetrics({ title, gatedPack, isFirst }) {
+  if (!gatedPack?.summary) return null
+  const s = gatedPack.summary
+  const total = s.totalTrades ?? 0
+  const winPctSigned = total > 0 ? (100 * (s.winningTrades ?? 0)) / total : null
+  return (
+    <>
+      <h3
+        className="hourly-spikes-h3"
+        style={{ marginTop: isFirst ? '0.35rem' : '1.15rem', marginBottom: '0.35rem' }}
+      >
+        {title}
+      </h3>
+      <div className="backtest1-summary-grid">
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">Trades kept (EMA gate)</span>
+          <span className="backtest1-stat-value">{total > 0 ? total.toLocaleString() : '—'}</span>
+        </div>
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">Trades skipped (below EMA)</span>
+          <span className="backtest1-stat-value">{(s.skippedTradesByEma ?? 0).toLocaleString()}</span>
+        </div>
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">EMA-gated cumulative Σ %</span>
+          <span className={`backtest1-stat-value ${(s.finalPnlPctFromStart ?? 0) >= 0 ? 'pnl-pos' : 'pnl-neg'}`}>
+            {fmtSignedPct2(s.finalPnlPctFromStart)}
+          </span>
+        </div>
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">Max drawdown (Σ %)</span>
+          <span className="backtest1-stat-value pnl-neg">{fmtDrawdownPct(s.maxDrawdownPnlPct)}</span>
+        </div>
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">Avg % / kept trade</span>
+          <span className={`backtest1-stat-value ${(s.avgPnlPctPerTrade ?? 0) >= 0 ? 'pnl-pos' : 'pnl-neg'}`}>
+            {fmtSignedPct2(s.avgPnlPctPerTrade)}
+          </span>
+        </div>
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">Σ % ÷ max DD</span>
+          <span className="backtest1-stat-value">{fmtReturnPerMaxDd(s)}</span>
+        </div>
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">Win rate (TP vs SL)</span>
+          <span className="backtest1-stat-value">{fmtPct1(s.winRateTpVsSlPct)}</span>
+        </div>
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">Win % (signed P&amp;L)</span>
+          <span className="backtest1-stat-value">{fmtPct1(winPctSigned)}</span>
+        </div>
+      </div>
+    </>
+  )
+}
+
 export function AgentLongShortCompareBacktest() {
   const [minQuoteVolume24h, setMinQuoteVolume24h] = useState('10000000')
   const [interval, setInterval] = useState('5m')
@@ -226,6 +522,7 @@ export function AgentLongShortCompareBacktest() {
   const [error, setError] = useState(null)
   const [resultLong, setResultLong] = useState(null)
   const [resultShort, setResultShort] = useState(null)
+  const [resultAgent4, setResultAgent4] = useState(null)
   const [progressLog, setProgressLog] = useState([])
 
   const run = useCallback(async () => {
@@ -233,6 +530,7 @@ export function AgentLongShortCompareBacktest() {
     setError(null)
     setResultLong(null)
     setResultShort(null)
+    setResultAgent4(null)
     setProgressLog([])
     try {
       const vol = Number.parseFloat(String(minQuoteVolume24h).replace(/,/g, ''))
@@ -283,16 +581,36 @@ export function AgentLongShortCompareBacktest() {
             const extra = evt.error ? ` — ${evt.error}` : ''
             pushProgress(
               setProgressLog,
-              `[short ${evt.index}/${evt.total}] ${evt.symbol}: ${evt.candlesFetched}/${evt.candlesRequested} bars${extra}`,
+              `[A3 short ${evt.index}/${evt.total}] ${evt.symbol}: ${evt.candlesFetched}/${evt.candlesRequested} bars${extra}`,
             )
           } else if (evt.phase === 'aggregate') {
-            pushProgress(setProgressLog, 'Short: aggregating trades & equity…')
+            pushProgress(setProgressLog, 'Agent 3: aggregating trades & equity…')
           }
         } else if (evt.event === 'done') {
           setResultShort(evt.result)
-          pushProgress(setProgressLog, 'Short run done. Compare chart ready.')
+          pushProgress(setProgressLog, 'Agent 3 done.')
         } else if (evt.event === 'error') {
           throw new Error(evt.message || 'Short backtest error')
+        }
+      })
+
+      pushProgress(setProgressLog, 'Starting Agent 4 (long / red spike, 2R fixed)…')
+      await consumeQuickBacktestStream(buildQuery({ ...base, strategy: 'agent4' }), (evt) => {
+        if (evt.event === 'progress') {
+          if (evt.phase === 'symbol') {
+            const extra = evt.error ? ` — ${evt.error}` : ''
+            pushProgress(
+              setProgressLog,
+              `[A4 long ${evt.index}/${evt.total}] ${evt.symbol}: ${evt.candlesFetched}/${evt.candlesRequested} bars${extra}`,
+            )
+          } else if (evt.phase === 'aggregate') {
+            pushProgress(setProgressLog, 'Agent 4: aggregating trades & equity…')
+          }
+        } else if (evt.event === 'done') {
+          setResultAgent4(evt.result)
+          pushProgress(setProgressLog, 'Agent 4 done. Compare charts ready.')
+        } else if (evt.event === 'error') {
+          throw new Error(evt.message || 'Agent 4 backtest error')
         }
       })
     } catch (e) {
@@ -304,24 +622,41 @@ export function AgentLongShortCompareBacktest() {
 
   const sLong = resultLong?.summary
   const sShort = resultShort?.summary
-  const showSummary = Boolean(sLong || sShort)
+  const sA4 = resultAgent4?.summary
+  const showSummary = Boolean(sLong || sShort || sA4)
 
-  const accountSimLong = useMemo(
-    () => buildAccountSimForResult(resultLong, startingBalance, tradeSizePct, leverage),
-    [resultLong, startingBalance, tradeSizePct, leverage],
+  const compareExtraSeries = useMemo(() => {
+    if (resultAgent4?.equityCurve?.length > 1) {
+      return [
+        {
+          points: resultAgent4.equityCurve,
+          side: 'long',
+          label: 'Agent 4 (long / red spike, 2R)',
+        },
+      ]
+    }
+    return null
+  }, [resultAgent4])
+
+  const emaGateLong = useMemo(() => buildEmaGatedPackForResult(resultLong, QUICK_EMA_PERIOD), [resultLong])
+  const emaGateShort = useMemo(() => buildEmaGatedPackForResult(resultShort, QUICK_EMA_PERIOD), [resultShort])
+  const emaGateActivityBars = useMemo(
+    () => buildCombinedActivityBars(emaGateLong, emaGateShort),
+    [emaGateLong, emaGateShort],
   )
-  const accountSimShort = useMemo(
-    () => buildAccountSimForResult(resultShort, startingBalance, tradeSizePct, leverage),
-    [resultShort, startingBalance, tradeSizePct, leverage],
+  const emaGateCombinedAccount = useMemo(
+    () => buildCombinedEmaGatedAccountSim(emaGateLong, emaGateShort, startingBalance, tradeSizePct, leverage),
+    [emaGateLong, emaGateShort, startingBalance, tradeSizePct, leverage],
   )
 
   return (
     <div className="vol-screener spike-tpsl-bt">
       <h1 className="vol-screener-title">Long / short simulation</h1>
       <p className="vol-screener-lead">
-        One click runs the <strong>same</strong> quick backtest twice: <strong>Agent 1</strong> (long on green spikes) and{' '}
-        <strong>Agent 3</strong> (short on red spikes). The chart overlays both cumulative Σ price % curves so you can
-        compare which side fits your regime.
+        One click runs three quick backtests: <strong>Agent 1</strong> (long on green spikes), <strong>Agent 3</strong>{' '}
+        (short on red spikes), and <strong>Agent 4</strong> (long on red spikes, fixed 2R TP / 1R SL). The compare chart
+        overlays cumulative Σ price % curves. <strong>tpR</strong> applies to Agents 1 and 3 only; Agent 4 uses fixed
+        2R take-profit in the engine.
       </p>
 
       <div className="backtest1-form" style={{ maxWidth: 560, marginBottom: '1.25rem' }}>
@@ -386,7 +721,7 @@ export function AgentLongShortCompareBacktest() {
           />
         </label>
         <p className="backtest1-meta" style={{ gridColumn: '1 / -1', margin: '0.25rem 0 0' }}>
-          Account simulation (applies after run; uses per-trade % returns chronologically)
+          Balance / size / leverage: used for the EMA-gated combined wallet (Agent 1 + Agent 3) only
         </p>
         <label className="backtest1-field">
           <span className="backtest1-label">Starting balance (USDT)</span>
@@ -416,7 +751,7 @@ export function AgentLongShortCompareBacktest() {
           />
         </label>
         <button type="button" className="backtest1-btn" onClick={run} disabled={running}>
-          {running ? 'Running long + short…' : 'Run long & short comparison'}
+          {running ? 'Running Agents 1, 3, 4…' : 'Run comparison (3 agents)'}
         </button>
       </div>
 
@@ -448,7 +783,7 @@ export function AgentLongShortCompareBacktest() {
 
       {showSummary ? (
         <section className="hourly-spikes-section">
-          <h2 className="hourly-spikes-h2">Results — long vs short</h2>
+          <h2 className="hourly-spikes-h2">Results — all agents</h2>
           <p className="hourly-spikes-hint" style={{ marginBottom: '0.75rem' }}>
             <strong>Max drawdown</strong> is the largest peak-to-trough drop in cumulative Σ price % (same definition as
             the main Spike backtest). <strong>Win rate (TP vs SL)</strong> uses only TP+SL exits; EOD uses signed price %.
@@ -466,106 +801,101 @@ export function AgentLongShortCompareBacktest() {
             symbolsSkipped={resultShort?.skipped}
             isFirst={false}
           />
+          <LongShortSideMetrics
+            title="Agent 4 — long (red spike, 2R fixed)"
+            summary={sA4}
+            symbolsSkipped={resultAgent4?.skipped}
+            isFirst={false}
+          />
         </section>
       ) : null}
 
-      {accountSimLong || accountSimShort ? (
+      {emaGateLong?.equityCurve?.length > 1 || emaGateShort?.equityCurve?.length > 1 ? (
         <section className="hourly-spikes-section">
-          <h2 className="hourly-spikes-h2">Simulated account balance</h2>
+          <h2 className="hourly-spikes-h2">EMA(50)-gated equity compare</h2>
           <p className="hourly-spikes-hint" style={{ marginBottom: '0.75rem' }}>
-            <strong>Sequential trades:</strong> each row is one <strong>closed</strong> trade; we book P&amp;L, then the
-            next trade may use margin from the new balance (as if the prior position closed before the next opens — so
-            100% size does not stack two open positions in this toy model). If balance falls to 0 or below, margin is 0,
-            so <strong>no further trades</strong> get exposure (those steps add 0 P&amp;L). Each trade:{' '}
-            <strong>margin</strong> = max(balance, 0) × (trade size % ÷ 100), <strong>notional</strong> = margin ×
-            leverage, <strong>PnL USDT</strong> = notional × (per-trade price % ÷ 100). X-axis matches normalized run
-            progress (same as charts below).
-            {(accountSimLong?.subsampled || accountSimShort?.subsampled) && (
-              <>
-                {' '}
-                <strong>Note:</strong> per-trade series was subsampled for the payload — simulation is approximate when
-                trade count is very large.
-              </>
-            )}
+            Entry rule per agent: take a trade only when that agent&apos;s cumulative Σ equity is above EMA(50) at the
+            prior point. The first 50 trades are skipped as EMA warmup. Trades already opened before a later cross are still fully closed by their
+            normal TP/SL/EOD outcome; the gate only affects <strong>new entries</strong>. Vertical fills on the chart
+            show active windows: green=Agent 1, orange=Agent 3, amber=both.
           </p>
-          {accountSimLong ? (
+          <SpikeTpSlCompareEquityChart
+            longPoints={emaGateLong?.equityCurve}
+            shortPoints={emaGateShort?.equityCurve}
+            activityBars={emaGateActivityBars}
+            showFootnote={false}
+          />
+          {emaGateCombinedAccount ? (
             <>
-              <h3 className="hourly-spikes-h3" style={{ marginTop: 0 }}>
-                Agent 1 — long
+              <h3 className="hourly-spikes-h3" style={{ marginTop: '1rem' }}>
+                Combined account (EMA-gated Agent 1 + Agent 3 on one wallet)
               </h3>
+              <p className="hourly-spikes-hint" style={{ marginBottom: '0.5rem' }}>
+                Single shared-wallet curve where both EMA-gated agents affect the same balance. Per-step return is
+                combined as Agent1% + Agent3% on normalized progress.
+              </p>
               <div className="backtest1-summary-grid" style={{ marginBottom: '0.5rem' }}>
                 <div className="backtest1-stat">
                   <span className="backtest1-stat-label">Final balance</span>
                   <span
                     className={`backtest1-stat-value ${
-                      accountSimLong.sim.finalBalance >= accountSimLong.sim.startingBalance ? 'pnl-pos' : 'pnl-neg'
+                      emaGateCombinedAccount.sim.finalBalance >= emaGateCombinedAccount.sim.startingBalance
+                        ? 'pnl-pos'
+                        : 'pnl-neg'
                     }`}
                   >
-                    {fmtUsd2(accountSimLong.sim.finalBalance)}
+                    {fmtUsd2(emaGateCombinedAccount.sim.finalBalance)}
                   </span>
                 </div>
                 <div className="backtest1-stat">
                   <span className="backtest1-stat-label">Max drawdown (balance)</span>
-                  <span className="backtest1-stat-value pnl-neg">{fmtUsd2(accountSimLong.sim.maxDrawdownUsd)}</span>
-                </div>
-                {accountSimLong.sim.tradesSkippedNoFreeMargin > 0 ? (
-                  <div className="backtest1-stat">
-                    <span className="backtest1-stat-label">Trades skipped (no free margin)</span>
-                    <span className="backtest1-stat-value">
-                      {accountSimLong.sim.tradesSkippedNoFreeMargin.toLocaleString()}
-                    </span>
-                  </div>
-                ) : null}
-              </div>
-              <SpikeTpSlAccountBalanceLightChart points={accountSimLong.points} showFootnote={false} />
-            </>
-          ) : null}
-          {accountSimShort ? (
-            <>
-              <h3 className="hourly-spikes-h3" style={{ marginTop: accountSimLong ? '1.25rem' : 0 }}>
-                Agent 3 — short
-              </h3>
-              <div className="backtest1-summary-grid" style={{ marginBottom: '0.5rem' }}>
-                <div className="backtest1-stat">
-                  <span className="backtest1-stat-label">Final balance</span>
-                  <span
-                    className={`backtest1-stat-value ${
-                      accountSimShort.sim.finalBalance >= accountSimShort.sim.startingBalance ? 'pnl-pos' : 'pnl-neg'
-                    }`}
-                  >
-                    {fmtUsd2(accountSimShort.sim.finalBalance)}
+                  <span className="backtest1-stat-value pnl-neg">
+                    {fmtUsd2(emaGateCombinedAccount.sim.maxDrawdownUsd)}
                   </span>
                 </div>
                 <div className="backtest1-stat">
-                  <span className="backtest1-stat-label">Max drawdown (balance)</span>
-                  <span className="backtest1-stat-value pnl-neg">{fmtUsd2(accountSimShort.sim.maxDrawdownUsd)}</span>
+                  <span className="backtest1-stat-label">Long-only / short-only / both steps</span>
+                  <span className="backtest1-stat-value">
+                    {emaGateCombinedAccount.longOnlySteps.toLocaleString()} /{' '}
+                    {emaGateCombinedAccount.shortOnlySteps.toLocaleString()} /{' '}
+                    {emaGateCombinedAccount.bothSteps.toLocaleString()}
+                  </span>
                 </div>
-                {accountSimShort.sim.tradesSkippedNoFreeMargin > 0 ? (
-                  <div className="backtest1-stat">
-                    <span className="backtest1-stat-label">Trades skipped (no free margin)</span>
-                    <span className="backtest1-stat-value">
-                      {accountSimShort.sim.tradesSkippedNoFreeMargin.toLocaleString()}
-                    </span>
-                  </div>
-                ) : null}
               </div>
-              <SpikeTpSlAccountBalanceLightChart points={accountSimShort.points} showFootnote={false} />
+              <SpikeTpSlAccountBalanceLightChart points={emaGateCombinedAccount.points} showFootnote={false} />
+              {emaGateCombinedAccount.approxByResample ? (
+                <p className="hourly-spikes-hint" style={{ marginTop: '0.5rem' }}>
+                  Combined curve is approximate because agent trade counts differ (progress-resampled merge) and/or
+                  per-trade payload is subsampled.
+                </p>
+              ) : null}
             </>
           ) : null}
-          <p className="hourly-spikes-hint" style={{ marginTop: '0.75rem' }}>
-            Adjust starting balance, trade size %, and leverage above — charts update without re-running the backtest.
-          </p>
+          <EmaGatedSideMetrics title="Agent 1 — long (EMA gated)" gatedPack={emaGateLong} isFirst />
+          <EmaGatedSideMetrics title="Agent 3 — short (EMA gated)" gatedPack={emaGateShort} isFirst={false} />
+          {emaGateLong?.subsampled || emaGateShort?.subsampled ? (
+            <p className="hourly-spikes-hint">
+              EMA-gated metrics use the per-trade payload sent by API. This run is subsampled, so gated results are
+              approximate.
+            </p>
+          ) : null}
         </section>
       ) : null}
 
-      {resultLong?.equityCurve?.length > 1 || resultShort?.equityCurve?.length > 1 ? (
+      {resultLong?.equityCurve?.length > 1 ||
+      resultShort?.equityCurve?.length > 1 ||
+      resultAgent4?.equityCurve?.length > 1 ? (
         <section className="hourly-spikes-section">
-          <h2 className="hourly-spikes-h2">Cumulative Σ price % — long vs short</h2>
+          <h2 className="hourly-spikes-h2">Cumulative Σ price % — all agents</h2>
           <p className="hourly-spikes-hint">
             Candles use the same <strong>normalized progress</strong> time base as the compare line (per side). Each
             chart pans and zooms on its own.
           </p>
-          <SpikeTpSlCompareEquityChart longPoints={resultLong?.equityCurve} shortPoints={resultShort?.equityCurve} />
+          <SpikeTpSlCompareEquityChart
+            longPoints={resultLong?.equityCurve}
+            shortPoints={resultShort?.equityCurve}
+            extraCompareSeries={compareExtraSeries}
+          />
           {resultLong?.equityCurve?.length > 1 ? (
             <>
               <h3 className="hourly-spikes-h3" style={{ marginTop: '1.25rem' }}>
@@ -599,6 +929,25 @@ export function AgentLongShortCompareBacktest() {
                 cumulativePnlScale="pnlFromZero"
                 chartTimeMode="compareProgress"
                 compareProgressEquityPointCount={resultShort.equityCurve.length}
+                showFooterHint={false}
+                bollingerToggle
+              />
+            </>
+          ) : null}
+          {resultAgent4?.equityCurve?.length > 1 ? (
+            <>
+              <h3 className="hourly-spikes-h3" style={{ marginTop: '1.25rem' }}>
+                Agent 4 — stacked cumulative % candles + EMA({QUICK_EMA_PERIOD})
+              </h3>
+              <SpikeTpSlPerTradeCandleLightChart
+                perTradePricePctChron={resultAgent4.perTradePricePctChron}
+                tradesFallback={resultAgent4.trades}
+                totalTradeRows={resultAgent4.totalTradeRows}
+                serverSubsampled={Boolean(resultAgent4.perTradePricePctSubsampled)}
+                emaPeriod={QUICK_EMA_PERIOD}
+                cumulativePnlScale="pnlFromZero"
+                chartTimeMode="compareProgress"
+                compareProgressEquityPointCount={resultAgent4.equityCurve.length}
                 showFooterHint={false}
                 bollingerToggle
               />

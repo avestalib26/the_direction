@@ -38,8 +38,18 @@ import {
 } from './agent3ScanScheduler.js'
 import { normalizeBinanceAccountId, resolveBinanceCredentials } from './binanceCredentials.js'
 import {
+  assertValidShadowSimBases,
+  defaultShadowSimLongBase,
+  defaultShadowSimShortBase,
+  mergeShadowSimConfigPatch,
+  shadowSimBasesToDbRow,
+  shadowSimRowToBases,
+  SHADOW_SIM_CONFIG_KEY,
+} from './agent1ShadowSimConfig.js'
+import {
   getAgent1ShadowSimulationPaused,
   getAgent1ShadowSnapshot,
+  patchShadowSimRuntimeOverrides,
   setAgent1ShadowSimulationPaused,
   setAgent1ShadowSnapshot,
   startAgent1ShadowScheduler,
@@ -948,6 +958,60 @@ async function loadAgent1ShadowSnapshotFromDb() {
   return payload
 }
 
+const SHADOW_SIM_CONFIG_CACHE_MS = 5000
+let shadowSimConfigCache = { expires: 0, data: null }
+
+function defaultShadowSimConfigPack() {
+  return {
+    long: defaultShadowSimLongBase(),
+    short: defaultShadowSimShortBase(),
+    updatedAt: null,
+    fromDb: false,
+    configKey: SHADOW_SIM_CONFIG_KEY,
+  }
+}
+
+function bustShadowSimConfigCache() {
+  shadowSimConfigCache = { expires: 0, data: null }
+}
+
+async function loadAgent1ShadowSimConfigFromDbCached({ force = false } = {}) {
+  const now = Date.now()
+  if (!force && shadowSimConfigCache.data && now < shadowSimConfigCache.expires) {
+    return shadowSimConfigCache.data
+  }
+  const fallback = defaultShadowSimConfigPack()
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    shadowSimConfigCache = { expires: now + SHADOW_SIM_CONFIG_CACHE_MS, data: fallback }
+    return fallback
+  }
+  try {
+    const keyEnc = encodeURIComponent(SHADOW_SIM_CONFIG_KEY)
+    const rows = await supabaseRest(
+      `/rest/v1/agent1_shadow_sim_config?select=*&config_key=eq.${keyEnc}&limit=1`,
+    )
+    const row = Array.isArray(rows) && rows[0] ? rows[0] : null
+    if (!row) {
+      shadowSimConfigCache = { expires: now + SHADOW_SIM_CONFIG_CACHE_MS, data: fallback }
+      return fallback
+    }
+    const { long, short } = shadowSimRowToBases(row)
+    const data = {
+      long,
+      short,
+      updatedAt: row.updated_at ?? null,
+      fromDb: true,
+      configKey: row.config_key ?? SHADOW_SIM_CONFIG_KEY,
+    }
+    shadowSimConfigCache = { expires: now + SHADOW_SIM_CONFIG_CACHE_MS, data }
+    return data
+  } catch (e) {
+    console.error('[agent1-shadow-sim-config] load failed', e)
+    shadowSimConfigCache = { expires: now + SHADOW_SIM_CONFIG_CACHE_MS, data: fallback }
+    return fallback
+  }
+}
+
 /** Applies `simulationPaused` from shared DB so every API instance matches the latest PATCH (lease owner included). */
 async function syncAgent1ShadowPausedFromDb() {
   if (!canUseShadowDbCoordination()) return
@@ -1128,6 +1192,10 @@ const AGENT1_SETTINGS_SELECT_LEGACY =
 const AGENT3_SETTINGS_SELECT =
   'agent_name,trade_size_usd,trade_size_wallet_pct,leverage,margin_mode,max_tp_pct,max_sl_pct,max_open_positions,updated_at,' +
   'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled,binance_account,min_available_wallet_pct'
+/** Same shape as {@link AGENT1_SETTINGS_SELECT_LEGACY}: older DB rows may lack max_open_positions and newer wallet columns. */
+const AGENT3_SETTINGS_SELECT_LEGACY =
+  'agent_name,trade_size_usd,leverage,margin_mode,max_tp_pct,max_sl_pct,updated_at,' +
+  'scan_seconds_before_close,scan_threshold_pct,scan_min_quote_volume,scan_max_symbols,scan_spike_metric,scan_direction,scan_interval,agent_enabled,ema_gate_enabled'
 
 async function readAgent1Settings() {
   let select = AGENT1_SETTINGS_SELECT
@@ -1193,6 +1261,7 @@ async function readAgent3Settings() {
       `/rest/v1/agent_settings?select=${select}` + '&agent_name=eq.agent3' + '&limit=1'
     try {
       rows = await supabaseRest(p)
+      agent3BinanceAccountColumnReadable = select.includes('binance_account')
       break
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -1214,10 +1283,18 @@ async function readAgent3Settings() {
         select = select.replace(',min_available_wallet_pct', '')
         continue
       }
+      if (/max_open_positions/i.test(msg)) {
+        const legacyPath =
+          `/rest/v1/agent_settings?select=${AGENT3_SETTINGS_SELECT_LEGACY}` +
+          '&agent_name=eq.agent3' +
+          '&limit=1'
+        rows = await supabaseRest(legacyPath)
+        agent3BinanceAccountColumnReadable = false
+        break
+      }
       throw e
     }
   }
-  agent3BinanceAccountColumnReadable = select.includes('binance_account')
   if (!Array.isArray(rows) || rows.length === 0) {
     return {
       ...normalizeAgent3Settings({}),
@@ -1232,18 +1309,6 @@ async function readAgent3Settings() {
   }
 }
 
-/** Shadow replay uses Agent 1 scan/SL settings; falls back to defaults if Supabase or read fails. */
-async function readAgent1SettingsForShadow() {
-  try {
-    return await readAgent1Settings()
-  } catch {
-    return {
-      ...normalizeAgent1Settings({}),
-      updatedAt: null,
-    }
-  }
-}
-
 function normalizePositionSideForKey(v) {
   const s = String(v ?? '').trim().toUpperCase()
   if (s === 'LONG' || s === 'SHORT' || s === 'BOTH') return s
@@ -1254,7 +1319,20 @@ function buildAgentTradePositionKey(symbol, positionSide) {
   return `${String(symbol ?? '').toUpperCase()}|${normalizePositionSideForKey(positionSide)}`
 }
 
-/** Non-zero position rows from /fapi/v2/positionRisk → keys (same rules as fetchAgent1OpenPositionKeys). */
+/**
+ * Hedge: LONG / SHORT are separate rows. One-way: often positionSide BOTH with signed positionAmt —
+ * normalize to LONG (amt > 0) or SHORT (amt < 0) so open-key sets match per-leg checks.
+ */
+function positionSideForOpenKeyFromRiskRow(p) {
+  const sideRaw = String(p?.positionSide ?? '').trim().toUpperCase()
+  if (sideRaw === 'LONG') return 'LONG'
+  if (sideRaw === 'SHORT') return 'SHORT'
+  const amt = Number.parseFloat(String(p?.positionAmt ?? '0'))
+  if (!Number.isFinite(amt) || amt === 0) return 'BOTH'
+  return amt > 0 ? 'LONG' : 'SHORT'
+}
+
+/** Non-zero position rows from /fapi/v2/positionRisk → keys (LONG/SHORT legs; BOTH only if amt sign missing). */
 function openPositionKeysFromRiskRows(rows) {
   const out = new Set()
   if (!Array.isArray(rows)) return out
@@ -1263,7 +1341,8 @@ function openPositionKeysFromRiskRows(rows) {
     if (!Number.isFinite(amt) || Math.abs(amt) <= 0) continue
     const symbol = normalizeUsdtFuturesSymbol(p?.symbol, { allowMissingSuffix: false })
     if (!symbol) continue
-    out.add(buildAgentTradePositionKey(symbol, p?.positionSide))
+    const sideForKey = positionSideForOpenKeyFromRiskRow(p)
+    out.add(buildAgentTradePositionKey(symbol, sideForKey))
   }
   return out
 }
@@ -1282,15 +1361,34 @@ function openPositionRowMapFromRiskRows(rows) {
   return map
 }
 
-/** True if any tracked open position uses this symbol (any side). Fixes one-way vs hedge keys: DB/exchange use BOTH, old check used LONG only. */
-function agent1HasOpenPositionOnSymbol(openKeys, symbol) {
+/** True if this symbol already has an open leg on the given side (LONG for Agent 1, SHORT for Agent 3). Hedge: other side does not block. */
+function agentHasOpenPositionOnSymbolSide(openKeys, symbol, side) {
   const sym = String(symbol ?? '').toUpperCase()
   if (!sym || !(openKeys instanceof Set) || openKeys.size === 0) return false
-  const prefix = `${sym}|`
-  for (const k of openKeys) {
-    if (typeof k === 'string' && k.startsWith(prefix)) return true
+  const leg = side === 'SHORT' ? 'SHORT' : 'LONG'
+  return openKeys.has(buildAgentTradePositionKey(sym, leg))
+}
+
+/** DB rows with position_side BOTH are one-way legacy; exchange merge supplies LONG/SHORT legs — skip BOTH keys to avoid blocking the opposite hedge leg. */
+function addOpenKeysFromAgentTradeRows(openKeys, tradeRows) {
+  if (!(openKeys instanceof Set) || !Array.isArray(tradeRows)) return
+  for (const t of tradeRows) {
+    if (normalizePositionSideForKey(t.position_side) === 'BOTH') continue
+    openKeys.add(buildAgentTradePositionKey(t.symbol, t.position_side))
   }
-  return false
+}
+
+/** In-memory openKeys must use LONG/SHORT legs like `openPositionKeysFromRiskRows`. ONE-WAY fills use positionSide BOTH — infer from order side. */
+function openPositionKeyFromPlacement(placedOut) {
+  if (!placedOut || typeof placedOut !== 'object') return null
+  const symbol = normalizeUsdtFuturesSymbol(placedOut.symbol, { allowMissingSuffix: false })
+  if (!symbol) return null
+  const ps = String(placedOut.positionSide ?? '').trim().toUpperCase()
+  if (ps === 'LONG' || ps === 'SHORT') return buildAgentTradePositionKey(symbol, ps)
+  const orderSide = String(placedOut.side ?? '').trim().toUpperCase()
+  if (orderSide === 'BUY') return buildAgentTradePositionKey(symbol, 'LONG')
+  if (orderSide === 'SELL') return buildAgentTradePositionKey(symbol, 'SHORT')
+  return buildAgentTradePositionKey(symbol, 'BOTH')
 }
 
 async function fetchAgent1OpenPositionKeys(apiKey, apiSecret) {
@@ -1320,6 +1418,13 @@ async function reconcileAgent1OpenTradesWithExchange(apiKey, apiSecret) {
   for (const tr of openTrades) {
     const key = buildAgentTradePositionKey(tr.symbol, tr.position_side)
     if (openKeys.has(key)) continue
+    if (
+      normalizePositionSideForKey(tr.position_side) === 'BOTH' &&
+      (agentHasOpenPositionOnSymbolSide(openKeys, tr.symbol, 'LONG') ||
+        agentHasOpenPositionOnSymbolSide(openKeys, tr.symbol, 'SHORT'))
+    ) {
+      continue
+    }
     let closeMeta = {}
     try {
       closeMeta = await fetchAgentTradeCloseAccounting(apiKey, apiSecret, tr, 'agent1')
@@ -1368,6 +1473,13 @@ async function reconcileAgent3OpenTradesWithExchange(apiKey, apiSecret) {
   for (const tr of openTrades) {
     const key = buildAgentTradePositionKey(tr.symbol, tr.position_side)
     if (openKeys.has(key)) continue
+    if (
+      normalizePositionSideForKey(tr.position_side) === 'BOTH' &&
+      (agentHasOpenPositionOnSymbolSide(openKeys, tr.symbol, 'LONG') ||
+        agentHasOpenPositionOnSymbolSide(openKeys, tr.symbol, 'SHORT'))
+    ) {
+      continue
+    }
     let closeMeta = {}
     try {
       closeMeta = await fetchAgentTradeCloseAccounting(apiKey, apiSecret, tr, 'agent3')
@@ -1522,9 +1634,8 @@ async function runAgent1ExecutionTick() {
     }
 
     const openTrades = await listAgent1TradeRecords('open', 500)
-    const openKeys = new Set(
-      openTrades.map((t) => buildAgentTradePositionKey(t.symbol, t.position_side)),
-    )
+    const openKeys = new Set()
+    addOpenKeysFromAgentTradeRows(openKeys, openTrades)
     try {
       const exchangeOpenKeys = await fetchAgent1OpenPositionKeys(apiKey, apiSecret)
       for (const k of exchangeOpenKeys) openKeys.add(k)
@@ -1604,7 +1715,7 @@ async function runAgent1ExecutionTick() {
         pushAgent1ExecutionLog('warn', `skip ${symbol}: missing spike_low`)
         continue
       }
-      if (agent1HasOpenPositionOnSymbol(openKeys, symbol)) {
+      if (agentHasOpenPositionOnSymbolSide(openKeys, symbol, 'LONG')) {
         await markAgent1SpikeSkipped(spike.id, 'long already open')
         pushAgent1ExecutionLog('info', `skip ${symbol}: long already open`)
         continue
@@ -1695,7 +1806,8 @@ async function runAgent1ExecutionTick() {
           )
         } else {
           await markAgent1SpikeTradeTaken(spike.id)
-          openKeys.add(buildAgentTradePositionKey(placedOut.symbol, placedOut.positionSide))
+          const placedKey = openPositionKeyFromPlacement(placedOut)
+          if (placedKey) openKeys.add(placedKey)
           placed += 1
           pushAgent1ExecutionLog(
             'info',
@@ -1760,6 +1872,9 @@ async function runAgent3ExecutionTick() {
   let placed = 0
   try {
     const settings = await readAgent3Settings()
+    if (settings.emaGateEnabled !== false) {
+      await maybeHydrateAgent1ShadowSnapshot()
+    }
     const { apiKey, apiSecret, accountId } = resolveBinanceCredentials(settings.binanceAccount)
     if (!apiKey || !apiSecret) {
       agent3ExecutionState.lastError = `Binance API keys missing for account "${accountId}"`
@@ -1819,10 +1934,58 @@ async function runAgent3ExecutionTick() {
       pending.push(spike)
     }
 
+    const emaGateEnabledA3 = settings.emaGateEnabled !== false
+    const regimeA3 = getAgent1ShadowSnapshot()?.regimeAgent3 ?? null
+    if (emaGateEnabledA3 && (!regimeA3 || regimeA3.gateAllowLong !== true)) {
+      agent3ExecutionState.lastGateBlockAt = Date.now()
+      const nextGateState = regimeA3 == null ? 'blocked_unavailable' : 'blocked_below_ema'
+      if (pending.length > 0) {
+        const reason = nextGateState === 'blocked_unavailable' ? 'regime unavailable' : 'regime blocked'
+        for (const spike of pending) {
+          const symbol = String(spike?.symbol ?? '').toUpperCase()
+          const logKey = spikeExecutionLogKey(spike, symbol || 'UNKNOWN')
+          if (!agent3BlockedRegimeSpikeLogIds.has(logKey)) {
+            pushAgent3ExecutionLog('info', `skip ${symbol || 'UNKNOWN'}: ${reason}`)
+            agent3BlockedRegimeSpikeLogIds.add(logKey)
+            if (agent3BlockedRegimeSpikeLogIds.size > 5000) {
+              agent3BlockedRegimeSpikeLogIds.clear()
+            }
+          }
+        }
+      }
+      agent3LastGateState = nextGateState
+      try {
+        const rec = await reconcileAgent3OpenTradesWithExchange(apiKey, apiSecret)
+        if (rec.closedNow > 0) {
+          pushAgent3ExecutionLog('info', `closed detected: ${rec.closedNow}`)
+        }
+      } catch (e) {
+        pushAgent3ExecutionLog(
+          'warn',
+          `reconcile (gate blocked): ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+      return
+    }
+    if (!emaGateEnabledA3) {
+      if (agent3LastGateState !== 'disabled') {
+        pushAgent3ExecutionLog('warn', 'EMA gate disabled: Agent 3 execution bypassing regime gate')
+      }
+      agent3LastGateState = 'disabled'
+    } else if (agent3LastGateState !== 'allow') {
+      pushAgent3ExecutionLog(
+        'info',
+        `gate open: allow short (cum=${Number.isFinite(Number(regimeA3?.latestCumPnlPct)) ? Number(regimeA3.latestCumPnlPct).toFixed(3) : 'na'} ema=${Number.isFinite(Number(regimeA3?.emaValue)) ? Number(regimeA3.emaValue).toFixed(3) : 'na'})`,
+      )
+      agent3LastGateState = 'allow'
+    }
+    if (agent3BlockedRegimeSpikeLogIds.size > 0) {
+      agent3BlockedRegimeSpikeLogIds.clear()
+    }
+
     const openTrades = await listAgent3TradeRecords('open', 500)
-    const openKeys = new Set(
-      openTrades.map((t) => buildAgentTradePositionKey(t.symbol, t.position_side)),
-    )
+    const openKeys = new Set()
+    addOpenKeysFromAgentTradeRows(openKeys, openTrades)
     try {
       const exchangeOpenKeys = await fetchAgent1OpenPositionKeys(apiKey, apiSecret)
       for (const k of exchangeOpenKeys) openKeys.add(k)
@@ -1902,9 +2065,9 @@ async function runAgent3ExecutionTick() {
         pushAgent3ExecutionLog('warn', `skip ${symbol}: missing spike_high`)
         continue
       }
-      if (agent1HasOpenPositionOnSymbol(openKeys, symbol)) {
-        await markAgent3SpikeSkipped(spike.id, 'position already open on symbol')
-        pushAgent3ExecutionLog('info', `skip ${symbol}: position already open on symbol`)
+      if (agentHasOpenPositionOnSymbolSide(openKeys, symbol, 'SHORT')) {
+        await markAgent3SpikeSkipped(spike.id, 'short already open')
+        pushAgent3ExecutionLog('info', `skip ${symbol}: short already open`)
         continue
       }
       if (openKeys.size >= settings.maxOpenPositions) {
@@ -1993,7 +2156,8 @@ async function runAgent3ExecutionTick() {
           )
         } else {
           await markAgent3SpikeTradeTaken(spike.id)
-          openKeys.add(buildAgentTradePositionKey(placedOut.symbol, placedOut.positionSide))
+          const placedKey = openPositionKeyFromPlacement(placedOut)
+          if (placedKey) openKeys.add(placedKey)
           placed += 1
           pushAgent3ExecutionLog(
             'info',
@@ -2161,6 +2325,11 @@ async function upsertAgent3Settings(input) {
       break
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
+      if (/max_open_positions/i.test(msg)) {
+        throw new Error(
+          'maxOpenPositions requires DB migration. Run supabase/agent_settings_alter_agent1.sql (adds columns used by all agents) and retry.',
+        )
+      }
       if (/trade_size_wallet_pct/i.test(msg) && Object.hasOwn(bodyToSend, 'trade_size_wallet_pct')) {
         const { trade_size_wallet_pct: _w, ...rest } = bodyToSend
         bodyToSend = rest
@@ -2306,11 +2475,14 @@ const agent3ExecutionState = {
   lastError: null,
   lastProcessed: 0,
   lastPlaced: 0,
+  lastGateBlockAt: null,
   leaseOwner: false,
 }
 
 let agent1LastGateState = 'unknown'
 const agent1BlockedRegimeSpikeLogIds = new Set()
+let agent3LastGateState = 'unknown'
+const agent3BlockedRegimeSpikeLogIds = new Set()
 const agent1StaleSpikeLogIds = new Set()
 const agent3StaleSpikeLogIds = new Set()
 /** userTrades pagination cursors: keys are `${scope}:${symbol}|${side}` so Agent 1 / 3 / 2 do not clobber each other in one-way (BOTH) mode. */
@@ -3601,6 +3773,34 @@ app.patch('/api/agents/agent1/enabled', async (req, res) => {
   }
 })
 
+app.patch('/api/agents/agent1/ema-gate', async (req, res) => {
+  try {
+    if (typeof req.body?.enabled !== 'boolean') {
+      return res.status(400).json({ error: 'JSON body must include enabled: boolean' })
+    }
+    const current = await readAgent1Settings()
+    const { updatedAt: _upd, ...rest } = current
+    const settings = await upsertAgent1Settings({
+      ...rest,
+      emaGateEnabled: req.body.enabled,
+    })
+    return res.json({
+      ok: true,
+      settings,
+      binanceAccountColumnReadable: agent1BinanceAccountColumnReadable,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to update Agent 1 EMA gate flag',
+    })
+  }
+})
+
 app.get('/api/agents/agent1/scan-status', async (_req, res) => {
   try {
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -3672,6 +3872,73 @@ app.get('/api/agents/agent1/shadow-curve', async (_req, res) => {
   }
 })
 
+app.get('/api/agents/agent1/shadow-sim-config', async (_req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      const pack = defaultShadowSimConfigPack()
+      return res.json({
+        configKey: pack.configKey,
+        updatedAt: pack.updatedAt,
+        fromDb: false,
+        long: pack.long,
+        short: pack.short,
+        warning: 'Supabase not configured; values are code defaults only',
+      })
+    }
+    const pack = await loadAgent1ShadowSimConfigFromDbCached({ force: false })
+    res.json({
+      configKey: pack.configKey,
+      updatedAt: pack.updatedAt,
+      fromDb: pack.fromDb,
+      long: pack.long,
+      short: pack.short,
+    })
+  } catch (e) {
+    res.status(500).json({
+      error: e instanceof Error ? e.message : 'Failed to load shadow sim config',
+    })
+  }
+})
+
+app.patch('/api/agents/agent1/shadow-sim-config', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    const body = req.body
+    if (!body || typeof body !== 'object') {
+      return res.status(400).json({ error: 'JSON body required' })
+    }
+    const cur = await loadAgent1ShadowSimConfigFromDbCached({ force: true })
+    const { long, short } = mergeShadowSimConfigPatch(body, cur.long, cur.short)
+    assertValidShadowSimBases(long, short)
+    const row = shadowSimBasesToDbRow(SHADOW_SIM_CONFIG_KEY, long, short)
+    await supabaseRest('/rest/v1/agent1_shadow_sim_config?on_conflict=config_key&select=*', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates,return=representation',
+      },
+      body: JSON.stringify(row),
+    })
+    bustShadowSimConfigCache()
+    const pack = await loadAgent1ShadowSimConfigFromDbCached({ force: true })
+    return res.json({
+      ok: true,
+      configKey: pack.configKey,
+      updatedAt: pack.updatedAt,
+      fromDb: pack.fromDb,
+      long: pack.long,
+      short: pack.short,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'Failed to update shadow sim config'
+    const isVal = /required|must be|JSON/i.test(msg)
+    return res.status(isVal ? 400 : 500).json({ error: msg })
+  }
+})
+
 app.patch('/api/agents/agent1/shadow-simulation', async (req, res) => {
   try {
     if (typeof req.body?.paused !== 'boolean') {
@@ -3706,6 +3973,45 @@ app.patch('/api/agents/agent1/shadow-simulation', async (req, res) => {
   }
 })
 
+app.patch('/api/agents/agent1/shadow-sim-params', async (req, res) => {
+  try {
+    if (process.env.AGENT1_SHADOW_SCHEDULER === 'false') {
+      return res.status(400).json({
+        error:
+          'Shadow scheduler is off in server config (AGENT1_SHADOW_SCHEDULER=false). Set it true and restart to run simulation.',
+      })
+    }
+    const body = req.body
+    if (!body || typeof body !== 'object') {
+      return res.status(400).json({ error: 'JSON body required' })
+    }
+    patchShadowSimRuntimeOverrides(body)
+    const snap = getAgent1ShadowSnapshot()
+    if (canUseShadowDbCoordination()) {
+      try {
+        const existing = await loadAgent1ShadowSnapshotFromDb()
+        const base = existing && typeof existing === 'object' ? existing : snap
+        await persistAgent1ShadowSnapshot({
+          ...base,
+          shadowSimRuntimeOverrides: snap.shadowSimRuntimeOverrides,
+          simulationPaused: getAgent1ShadowSimulationPaused(),
+        })
+      } catch (e) {
+        console.error('[agent1-shadow] persist shadow-sim-params failed', e)
+      }
+    }
+    return res.json({
+      ok: true,
+      shadowSimRuntimeOverrides: snap.shadowSimRuntimeOverrides,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'Failed to update shadow sim params'
+    const isVal = /required|must be/i.test(msg)
+    return res.status(isVal ? 400 : 500).json({ error: msg })
+  }
+})
+
 app.get('/api/agents/agent1/regime', async (_req, res) => {
   try {
     if (canUseShadowDbCoordination() && !agent1ShadowLeaseOwner) {
@@ -3714,6 +4020,7 @@ app.get('/api/agents/agent1/regime', async (_req, res) => {
     const snap = getAgent1ShadowSnapshot()
     res.json({
       regime: snap.regime ?? null,
+      regimeAgent3: snap.regimeAgent3 ?? null,
       updatedAt: snap.updatedAt ?? null,
       simUpdatedAt: snap.simUpdatedAt ?? null,
       markUpdatedAt: snap.markUpdatedAt ?? null,
@@ -3722,6 +4029,30 @@ app.get('/api/agents/agent1/regime', async (_req, res) => {
   } catch (e) {
     res.status(500).json({
       error: e instanceof Error ? e.message : 'Failed to load regime snapshot',
+    })
+  }
+})
+
+/**
+ * Agent 3 short-leg regime only — same in-memory snapshot as the A1/A3 shadow simulation (Long Sim).
+ * `regime` is `regimeAgent3` from `runAgent1ShadowTickOnce` (cumulative short Σ% vs EMA on the short live curve).
+ */
+app.get('/api/agents/agent3/regime', async (_req, res) => {
+  try {
+    if (canUseShadowDbCoordination() && !agent1ShadowLeaseOwner) {
+      await maybeHydrateAgent1ShadowSnapshot()
+    }
+    const snap = getAgent1ShadowSnapshot()
+    res.json({
+      regime: snap.regimeAgent3 ?? null,
+      updatedAt: snap.updatedAt ?? null,
+      simUpdatedAt: snap.simUpdatedAt ?? null,
+      markUpdatedAt: snap.markUpdatedAt ?? null,
+      scheduler: snap.scheduler ?? null,
+    })
+  } catch (e) {
+    res.status(500).json({
+      error: e instanceof Error ? e.message : 'Failed to load Agent 3 regime snapshot',
     })
   }
 })
@@ -4113,6 +4444,37 @@ app.patch('/api/agents/agent3/enabled', async (req, res) => {
   }
 })
 
+app.patch('/api/agents/agent3/ema-gate', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: 'Supabase not configured' })
+    }
+    if (typeof req.body?.enabled !== 'boolean') {
+      return res.status(400).json({ error: 'JSON body must include enabled: boolean' })
+    }
+    const current = await readAgent3Settings()
+    const { updatedAt: _upd, ...rest } = current
+    const settings = await upsertAgent3Settings({
+      ...rest,
+      emaGateEnabled: req.body.enabled,
+    })
+    return res.json({
+      ok: true,
+      settings,
+      binanceAccountColumnReadable: agent3BinanceAccountColumnReadable,
+      fetchedAt: new Date().toISOString(),
+    })
+  } catch (e) {
+    if (e instanceof SupabaseConfigError) {
+      return res.status(503).json({ error: e.message })
+    }
+    console.error(e)
+    return res.status(502).json({
+      error: e instanceof Error ? e.message : 'Failed to update Agent 3 EMA gate flag',
+    })
+  }
+})
+
 app.get('/api/agents/agent3/scan-status', async (_req, res) => {
   try {
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -4496,7 +4858,7 @@ app.get('/api/agents/agent2/execution', async (_req, res) => {
         }))
       }
     }
-    const openPositionMap = new Map()
+    let openPositionMap = new Map()
     const a2Creds = resolveBinanceCredentials(process.env.AGENT2_BINANCE_ACCOUNT ?? 'master')
     if (a2Creds.apiKey && a2Creds.apiSecret) {
       try {
@@ -5195,7 +5557,7 @@ const QUICK_BT_MAX_CANDLES = 20000
 
 /**
  * SSE: same engine as spike-tpsl-backtest with extended tail candles (up to 20k), progress events,
- * no per-symbol OHLC charts. Agent 1 = long; Agent 3 = short_red_spike (shortRedSpike).
+ * no per-symbol OHLC charts. Agent 1 = long; Agent 3 = short_red_spike; Agent 4 = long_on_red_2r.
  */
 app.get('/api/binance/spike-tpsl-quick-backtest/stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
@@ -5253,10 +5615,19 @@ app.get('/api/binance/spike-tpsl-quick-backtest/stream', async (req, res) => {
     s === 'short'
   ) {
     strategy = 'shortRedSpike'
+  } else if (
+    s === 'longonredspike2r' ||
+    s === 'long_on_red_spike_2r' ||
+    s === 'long_on_red_2r' ||
+    s === 'agent4' ||
+    s === 'agent_4'
+  ) {
+    strategy = 'longOnRedSpike2R'
   } else {
     send({
       event: 'error',
-      message: 'strategy must be long (Agent 1) or short_red_spike / agent3 (Agent 3)',
+      message:
+        'strategy must be long (Agent 1), short_red_spike / agent3 (Agent 3), or long_on_red_2r / agent4 (Agent 4)',
     })
     res.end()
     return
@@ -5536,8 +5907,24 @@ if (AGENT3_EXECUTION_ENABLED) {
 if (process.env.AGENT1_SHADOW_SCHEDULER !== 'false') {
   startAgent1ShadowScheduler({
     futuresBase: FUTURES_BASE,
-    readSettings: readAgent1SettingsForShadow,
+    loadShadowSimBaseSettings: async () => {
+      const pack = await loadAgent1ShadowSimConfigFromDbCached()
+      return {
+        longBase: pack.long,
+        shortBase: pack.short,
+        configUpdatedAt: pack.updatedAt,
+        configFromDb: pack.fromDb,
+      }
+    },
     syncPausedFromDb: canUseShadowDbCoordination() ? syncAgent1ShadowPausedFromDb : null,
+    syncShadowOverridesFromDb: canUseShadowDbCoordination()
+      ? async () => {
+          const row = await loadAgent1ShadowSnapshotFromDb()
+          if (row && Object.prototype.hasOwnProperty.call(row, 'shadowSimRuntimeOverrides')) {
+            setAgent1ShadowSnapshot({ shadowSimRuntimeOverrides: row.shadowSimRuntimeOverrides })
+          }
+        }
+      : null,
     shouldRunTick: async () => {
       if (!canUseShadowDbCoordination()) {
         agent1ShadowLeaseOwner = true

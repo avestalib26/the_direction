@@ -147,6 +147,29 @@ export function longSpikeIndicesForAgent1Scan(candles, thresholdPct, spikeMetric
   return out
 }
 
+/**
+ * Agent 3 short shadow: down spike per scan metric (red body or lower wick).
+ * When scanDirection is `up` only, there is no short candidate.
+ */
+export function isAgent3ShortSpikeBar(c, thresholdPct, spikeMetric, scanDirection) {
+  const dir = String(scanDirection ?? 'down').toLowerCase()
+  const wantDown = dir !== 'up'
+  if (!wantDown) return false
+  const metric = String(spikeMetric ?? 'body').toLowerCase() === 'wick' ? 'wick' : 'body'
+  const downFn = metric === 'wick' ? isWickSpikeDown : isBodySpikeDown
+  return downFn(c, thresholdPct)
+}
+
+/** Bar indices i with a short (down) spike on candle i (needs bar i+1 for entry). */
+export function shortSpikeIndicesForAgent3Scan(candles, thresholdPct, spikeMetric, scanDirection) {
+  const out = []
+  const n = candles?.length ?? 0
+  for (let i = 0; i < n - 1; i++) {
+    if (isAgent3ShortSpikeBar(candles[i], thresholdPct, spikeMetric, scanDirection)) out.push(i)
+  }
+  return out
+}
+
 export async function computeFiveMinScreener(futuresBase, {
   candleCount,
   minQuoteVolume,
