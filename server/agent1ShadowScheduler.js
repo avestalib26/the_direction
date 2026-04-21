@@ -307,12 +307,12 @@ export async function runAgent1ShadowTickOnce(deps) {
       },
       ongoingTradesRaw: result.openTrades,
       ongoingTradesRawAgent3: result.openTradesAgent3,
-      regime: buildShadowRegimeSnapshotFromLiveCurve(result.liveCurve, {
+      regime: buildShadowRegimeSnapshotFromLiveCurve(result.curve, {
         emaPeriod: AGENT1_SHADOW_REGIME_EMA_PERIOD,
         source: 'sim',
         updatedAt: new Date().toISOString(),
       }),
-      regimeAgent3: buildShadowRegimeSnapshotFromLiveCurve(result.liveCurveAgent3, {
+      regimeAgent3: buildShadowRegimeSnapshotFromLiveCurve(result.curveAgent3, {
         emaPeriod: AGENT1_SHADOW_REGIME_EMA_PERIOD,
         source: 'sim',
         updatedAt: new Date().toISOString(),
@@ -409,12 +409,12 @@ export async function runAgent1ShadowTickOnce(deps) {
     },
     ongoingTradesRaw: splitL.openTrades,
     ongoingTradesRawAgent3: splitS.openTrades,
-    regime: buildShadowRegimeSnapshotFromLiveCurve(liveCurve, {
+    regime: buildShadowRegimeSnapshotFromLiveCurve(curve, {
       emaPeriod: AGENT1_SHADOW_REGIME_EMA_PERIOD,
       source: 'sim',
       updatedAt: new Date().toISOString(),
     }),
-    regimeAgent3: buildShadowRegimeSnapshotFromLiveCurve(liveCurveAgent3, {
+    regimeAgent3: buildShadowRegimeSnapshotFromLiveCurve(curveAgent3, {
       emaPeriod: AGENT1_SHADOW_REGIME_EMA_PERIOD,
       source: 'sim',
       updatedAt: new Date().toISOString(),
@@ -549,12 +549,12 @@ export function startAgent1ShadowScheduler(deps) {
         agent3OngoingTrades: markedOpenA3.map(summarizeTradeForApi),
         updatedAt: new Date(nowMs).toISOString(),
         markUpdatedAt: new Date(nowMs).toISOString(),
-        regime: buildShadowRegimeSnapshotFromLiveCurve(liveCurve, {
+        regime: buildShadowRegimeSnapshotFromLiveCurve(latestClosedCurve, {
           emaPeriod: AGENT1_SHADOW_REGIME_EMA_PERIOD,
           source: 'mark',
           updatedAt: new Date(nowMs).toISOString(),
         }),
-        regimeAgent3: buildShadowRegimeSnapshotFromLiveCurve(liveCurveAgent3, {
+        regimeAgent3: buildShadowRegimeSnapshotFromLiveCurve(latestClosedCurveAgent3, {
           emaPeriod: AGENT1_SHADOW_REGIME_EMA_PERIOD,
           source: 'mark',
           updatedAt: new Date(nowMs).toISOString(),

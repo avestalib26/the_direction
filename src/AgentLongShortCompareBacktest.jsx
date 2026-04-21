@@ -57,6 +57,20 @@ function fmtUsd2(n) {
   return `${Number(n).toFixed(2)} USDT`
 }
 
+/** Visual-only rebase so plotted cumulative curves start at 0 at first shown point. */
+function rebaseCurveFromFirst(points) {
+  if (!Array.isArray(points) || points.length === 0) return []
+  const base = Number(points[0]?.pnlPctFromStart)
+  if (!Number.isFinite(base)) return points.map((p) => ({ ...p }))
+  return points.map((p) => {
+    const v = Number(p?.pnlPctFromStart)
+    return {
+      ...p,
+      pnlPctFromStart: Number.isFinite(v) ? v - base : 0,
+    }
+  })
+}
+
 function computeEmaOnCloses(closes, period) {
   const out = closes.map(() => null)
   if (!Array.isArray(closes) || closes.length < period || period < 2) return out
@@ -87,39 +101,77 @@ function maxDrawdownFromPnlPoints(points) {
 }
 
 /**
- * EMA gate per side: keep trade i only if cumulative close at i-1 > EMA(i-1).
- * Strict warmup: first `period` trades are skipped until EMA is established.
- * If server entry flags are present, reuse them for consistency with backend.
+ * EMA gate per side on **closed trades only** (TP/SL).
+ * Ongoing/EOD trades are fully ignored in gating and cumulative curve construction.
  */
 function buildEmaGatedPackForResult(result, emaPeriod = QUICK_EMA_PERIOD) {
   const pctsRaw = result?.perTradePricePctChron
   if (!Array.isArray(pctsRaw) || pctsRaw.length === 0) return null
   const n = pctsRaw.length
-  const pcts = pctsRaw.map((x) => {
+  const pctsAll = pctsRaw.map((x) => {
     const v = Number(x)
     return Number.isFinite(v) ? v : 0
   })
+  const ocAll = Array.isArray(result?.perTradeOutcomeChron) && result.perTradeOutcomeChron.length === n
+    ? result.perTradeOutcomeChron
+    : null
+  const rChronAll = Array.isArray(result?.perTradeRChron) && result.perTradeRChron.length === n
+    ? result.perTradeRChron
+    : null
+  const closedIndices = []
+  for (let i = 0; i < n; i++) {
+    if (ocAll?.[i] === 'eod') continue
+    closedIndices.push(i)
+  }
+  const m = closedIndices.length
+  if (m === 0) {
+    const flat = [
+      { tradeIndex: 0, pnlPctFromStart: 0 },
+      { tradeIndex: 1, pnlPctFromStart: 0 },
+    ]
+    return {
+      equityCurve: flat,
+      activityByPoint: [false, false],
+      summary: {
+        totalTrades: 0,
+        skippedTradesByEma: 0,
+        finalPnlPctFromStart: 0,
+        avgPnlPctPerTrade: null,
+        maxDrawdownPnlPct: 0,
+        sumR: 0,
+        avgR: null,
+        tpHits: 0,
+        slHits: 0,
+        eodHits: 0,
+        winningTrades: 0,
+        losingTrades: 0,
+        breakevenTrades: 0,
+        winRateTpVsSlPct: null,
+        ignoredOngoingTrades: n,
+        usedServerEntryFlags: false,
+      },
+      period: normalizeEquityEmaPeriod(emaPeriod),
+      sourceTrades: n,
+      closedSourceTrades: 0,
+      subsampled: Boolean(result?.perTradePricePctSubsampled),
+    }
+  }
+  const pcts = closedIndices.map((idx) => pctsAll[idx])
   const period = normalizeEquityEmaPeriod(emaPeriod)
 
   const closes = []
   let c = 0
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < m; i++) {
     c += pcts[i]
     closes.push(c)
   }
   const ema = computeEmaOnCloses(closes, period)
-  const entryFlagsRaw = result?.perTradeEquityEmaAtEntryOk
-  const useEntryFlags = Array.isArray(entryFlagsRaw) && entryFlagsRaw.length === n
-  const entryOk = new Array(n).fill(false)
-  for (let i = 0; i < n; i++) {
+  const entryOk = new Array(m).fill(false)
+  for (let i = 0; i < m; i++) {
     // Strict warmup: do not count trades before EMA(period) is established.
     // For prior-point gating, first eligible trade index is `period`.
     if (i < period) {
       entryOk[i] = false
-      continue
-    }
-    if (useEntryFlags) {
-      entryOk[i] = entryFlagsRaw[i] === true
       continue
     }
     const prevClose = closes[i - 1]
@@ -139,25 +191,21 @@ function buildEmaGatedPackForResult(result, emaPeriod = QUICK_EMA_PERIOD) {
   let winningTrades = 0
   let losingTrades = 0
   let breakevenTrades = 0
-  const rChron = Array.isArray(result?.perTradeRChron) && result.perTradeRChron.length === n ? result.perTradeRChron : null
-  const oc = Array.isArray(result?.perTradeOutcomeChron) && result.perTradeOutcomeChron.length === n
-    ? result.perTradeOutcomeChron
-    : null
 
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < m; i++) {
     const ok = entryOk[i] === true
     activeByPoint.push(ok)
     if (ok) {
       cum += pcts[i]
       kept += 1
-      const r = Number(rChron?.[i])
+      const r = Number(rChronAll?.[closedIndices[i]])
       if (Number.isFinite(r)) {
         sumR += r
         if (r > 0) winningTrades += 1
         else if (r < 0) losingTrades += 1
         else breakevenTrades += 1
       }
-      const o = oc?.[i]
+      const o = ocAll?.[closedIndices[i]]
       if (o === 'tp') tpHits += 1
       else if (o === 'sl') slHits += 1
       else if (o === 'eod') eodHits += 1
@@ -183,32 +231,14 @@ function buildEmaGatedPackForResult(result, emaPeriod = QUICK_EMA_PERIOD) {
     losingTrades,
     breakevenTrades,
     winRateTpVsSlPct: decided > 0 ? (100 * tpHits) / decided : null,
-    usedServerEntryFlags: useEntryFlags,
+    ignoredOngoingTrades: n - m,
+    usedServerEntryFlags: false,
   }
   const cut = Math.min(period, points.length - 1)
   const displayPoints = points.slice(cut)
   const displayActivity = activeByPoint.slice(cut)
 
-  let equityCurveOut = displayPoints.length >= 2 ? displayPoints : points
-  if (Array.isArray(result?.equityEmaFilteredCurve) && result.equityEmaFilteredCurve.length > 1) {
-    const srv = result.equityEmaFilteredCurve
-      .map((p) => ({
-        tradeIndex: p.tradeIndex,
-        pnlPctFromStart: Number(p.pnlPctFromStart),
-      }))
-      .filter((p) => Number.isFinite(p.pnlPctFromStart))
-    if (srv.length > 1) {
-      const cutSrv = Math.min(period, Math.max(0, srv.length - 1))
-      const sliced = srv.slice(cutSrv)
-      equityCurveOut = sliced.length >= 2 ? sliced : srv
-      const lastFin = Number(srv[srv.length - 1]?.pnlPctFromStart)
-      if (Number.isFinite(lastFin)) {
-        summary.finalPnlPctFromStart = lastFin
-        summary.avgPnlPctPerTrade = kept > 0 ? lastFin / kept : null
-        summary.maxDrawdownPnlPct = maxDrawdownFromPnlPoints(srv)
-      }
-    }
-  }
+  const equityCurveOut = rebaseCurveFromFirst(displayPoints.length >= 2 ? displayPoints : points)
 
   return {
     equityCurve: equityCurveOut,
@@ -216,6 +246,7 @@ function buildEmaGatedPackForResult(result, emaPeriod = QUICK_EMA_PERIOD) {
     summary,
     period,
     sourceTrades: n,
+    closedSourceTrades: m,
     subsampled: Boolean(result?.perTradePricePctSubsampled),
   }
 }
@@ -340,6 +371,7 @@ function buildQuery({
   thresholdPct,
   strategy,
   tpR,
+  maxSlPct,
   maxSymbols,
 }) {
   const q = new URLSearchParams({
@@ -351,6 +383,7 @@ function buildQuery({
     equityEmaSlow: String(QUICK_EMA_PERIOD),
   })
   if (Number.isFinite(tpR) && tpR > 0) q.set('tpR', String(tpR))
+  if (Number.isFinite(maxSlPct) && maxSlPct > 0) q.set('maxSlPct', String(maxSlPct))
   if (Number.isFinite(maxSymbols) && maxSymbols >= 10) q.set('maxSymbols', String(Math.min(300, maxSymbols)))
   return q
 }
@@ -509,10 +542,11 @@ function EmaGatedSideMetrics({ title, gatedPack, isFirst }) {
 
 export function AgentLongShortCompareBacktest() {
   const [minQuoteVolume24h, setMinQuoteVolume24h] = useState('10000000')
-  const [interval, setInterval] = useState('5m')
-  const [thresholdPct, setThresholdPct] = useState('3')
+  const [interval, setInterval] = useState('15m')
+  const [thresholdPct, setThresholdPct] = useState('5')
   const [candleCount, setCandleCount] = useState('500')
   const [tpR, setTpR] = useState('2')
+  const [maxSlPct, setMaxSlPct] = useState('30')
   const [maxSymbols, setMaxSymbols] = useState('300')
   const [startingBalance, setStartingBalance] = useState('100')
   const [tradeSizePct, setTradeSizePct] = useState('10')
@@ -537,6 +571,7 @@ export function AgentLongShortCompareBacktest() {
       const th = Number.parseFloat(String(thresholdPct))
       const n = Number.parseInt(String(candleCount).replace(/,/g, ''), 10)
       const tp = Number.parseFloat(String(tpR).replace(/,/g, ''))
+      const maxSl = Number.parseFloat(String(maxSlPct).replace(/,/g, ''))
       const maxSym = Number.parseInt(String(maxSymbols).trim(), 10)
 
       if (!Number.isFinite(vol) || vol < 0) throw new Error('Volume must be >= 0')
@@ -551,6 +586,7 @@ export function AgentLongShortCompareBacktest() {
         candleCount: n,
         thresholdPct: th,
         tpR: Number.isFinite(tp) && tp > 0 ? tp : undefined,
+        maxSlPct: Number.isFinite(maxSl) && maxSl > 0 ? Math.min(maxSl, 100) : undefined,
         maxSymbols: Number.isFinite(maxSym) && maxSym >= 10 ? Math.min(300, maxSym) : undefined,
       }
 
@@ -618,7 +654,7 @@ export function AgentLongShortCompareBacktest() {
     } finally {
       setRunning(false)
     }
-  }, [minQuoteVolume24h, interval, thresholdPct, candleCount, tpR, maxSymbols])
+  }, [minQuoteVolume24h, interval, thresholdPct, candleCount, tpR, maxSlPct, maxSymbols])
 
   const sLong = resultLong?.summary
   const sShort = resultShort?.summary
@@ -640,10 +676,23 @@ export function AgentLongShortCompareBacktest() {
 
   const emaGateLong = useMemo(() => buildEmaGatedPackForResult(resultLong, QUICK_EMA_PERIOD), [resultLong])
   const emaGateShort = useMemo(() => buildEmaGatedPackForResult(resultShort, QUICK_EMA_PERIOD), [resultShort])
+  const emaGateA4 = useMemo(() => buildEmaGatedPackForResult(resultAgent4, QUICK_EMA_PERIOD), [resultAgent4])
   const emaGateActivityBars = useMemo(
     () => buildCombinedActivityBars(emaGateLong, emaGateShort),
     [emaGateLong, emaGateShort],
   )
+  const emaGateExtraSeries = useMemo(() => {
+    if (emaGateA4?.equityCurve?.length > 1) {
+      return [
+        {
+          points: emaGateA4.equityCurve,
+          side: 'long',
+          label: 'Agent 4 (long / red spike, EMA gated)',
+        },
+      ]
+    }
+    return null
+  }, [emaGateA4])
   const emaGateCombinedAccount = useMemo(
     () => buildCombinedEmaGatedAccountSim(emaGateLong, emaGateShort, startingBalance, tradeSizePct, leverage),
     [emaGateLong, emaGateShort, startingBalance, tradeSizePct, leverage],
@@ -709,6 +758,17 @@ export function AgentLongShortCompareBacktest() {
             value={tpR}
             onChange={(e) => setTpR(e.target.value)}
             disabled={running}
+          />
+        </label>
+        <label className="backtest1-field">
+          <span className="backtest1-label">Max SL % cap (optional)</span>
+          <input
+            className="backtest1-input"
+            value={maxSlPct}
+            onChange={(e) => setMaxSlPct(e.target.value)}
+            disabled={running}
+            inputMode="decimal"
+            placeholder="e.g. 1"
           />
         </label>
         <label className="backtest1-field">
@@ -810,18 +870,22 @@ export function AgentLongShortCompareBacktest() {
         </section>
       ) : null}
 
-      {emaGateLong?.equityCurve?.length > 1 || emaGateShort?.equityCurve?.length > 1 ? (
+      {emaGateLong?.equityCurve?.length > 1 ||
+      emaGateShort?.equityCurve?.length > 1 ||
+      emaGateA4?.equityCurve?.length > 1 ? (
         <section className="hourly-spikes-section">
           <h2 className="hourly-spikes-h2">EMA(50)-gated equity compare</h2>
           <p className="hourly-spikes-hint" style={{ marginBottom: '0.75rem' }}>
             Entry rule per agent: take a trade only when that agent&apos;s cumulative Σ equity is above EMA(50) at the
-            prior point. The first 50 trades are skipped as EMA warmup. Trades already opened before a later cross are still fully closed by their
-            normal TP/SL/EOD outcome; the gate only affects <strong>new entries</strong>. Vertical fills on the chart
+            prior point. The first 50 trades are skipped as EMA warmup. This panel is computed from{' '}
+            <strong>closed trades only</strong> (TP/SL); ongoing/EOD legs are ignored so they do not influence crosses.
+            The gate only affects <strong>new entries</strong>. Vertical fills on the chart
             show active windows: green=Agent 1, orange=Agent 3, amber=both.
           </p>
           <SpikeTpSlCompareEquityChart
             longPoints={emaGateLong?.equityCurve}
             shortPoints={emaGateShort?.equityCurve}
+            extraCompareSeries={emaGateExtraSeries}
             activityBars={emaGateActivityBars}
             showFootnote={false}
           />
@@ -873,7 +937,8 @@ export function AgentLongShortCompareBacktest() {
           ) : null}
           <EmaGatedSideMetrics title="Agent 1 — long (EMA gated)" gatedPack={emaGateLong} isFirst />
           <EmaGatedSideMetrics title="Agent 3 — short (EMA gated)" gatedPack={emaGateShort} isFirst={false} />
-          {emaGateLong?.subsampled || emaGateShort?.subsampled ? (
+          <EmaGatedSideMetrics title="Agent 4 — long (EMA gated)" gatedPack={emaGateA4} isFirst={false} />
+          {emaGateLong?.subsampled || emaGateShort?.subsampled || emaGateA4?.subsampled ? (
             <p className="hourly-spikes-hint">
               EMA-gated metrics use the per-trade payload sent by API. This run is subsampled, so gated results are
               approximate.

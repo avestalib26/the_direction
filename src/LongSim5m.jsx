@@ -259,6 +259,20 @@ function appendFilteredOpenMarkStep(out, finalSum, markTimeMs, events, ongoingRo
   out.push({ time: tt, value: finalSum })
 }
 
+/** Apply current allowed ongoing MTM as a constant overlay on every filtered step (what-if view). */
+function applyOngoingMtmToAllFilteredSteps(data, ongoingMtmPct) {
+  const mtm = Number(ongoingMtmPct)
+  if (!Array.isArray(data)) return []
+  if (!Number.isFinite(mtm) || mtm === 0) return data.map((p) => ({ ...p }))
+  return data.map((p, idx) => {
+    const v = Number(p?.value)
+    if (!Number.isFinite(v)) return { ...p }
+    // Keep the synthetic origin anchor unchanged for readability.
+    if (idx === 0) return { ...p }
+    return { ...p, value: v + mtm }
+  })
+}
+
 /**
  * Realized PnL after EMA **cross** rule (exit-ordered curve): cumulative Σ% vs EMA on closed-trade steps.
  * Bearish cross (above→below) blocks **new** entries after that close; bullish cross unblocks. Trades opened
@@ -285,7 +299,7 @@ function computeEmaFilteredClosedCurveCrossRegime(
   })
   const n = sortedExit.length
   const src0 = curveToLineDataUtc(sortedExit.length ? sortedExit : closedCurve ?? [], firstOpenTimeMs)
-  const out = [{ time: src0[0].time, value: 0 }]
+  const outClosedOnly = [{ time: src0[0].time, value: 0 }]
   if (n === 0) {
     const events = []
     let ongoingMtmPct = 0
@@ -299,15 +313,29 @@ function computeEmaFilteredClosedCurveCrossRegime(
         ongoingMtmPct += u
       }
     }
+    const out = [...outClosedOnly]
     if (ongoingKeptCount > 0) {
       appendFilteredOpenMarkStep(out, ongoingMtmPct, markTimeMs, events, ongoingRows ?? [])
     }
     if (out.length < 2) out.push({ time: out[0].time + 300, value: 0 })
+    const dataOngoingEveryStep = applyOngoingMtmToAllFilteredSteps(outClosedOnly, ongoingMtmPct)
+    if (dataOngoingEveryStep.length < 2) {
+      dataOngoingEveryStep.push({
+        time: dataOngoingEveryStep[0].time + 300,
+        value: Number.isFinite(ongoingMtmPct) ? ongoingMtmPct : 0,
+      })
+    }
+    const sumPnlPctEveryStep =
+      dataOngoingEveryStep.length > 0
+        ? Number(dataOngoingEveryStep[dataOngoingEveryStep.length - 1]?.value) || 0
+        : 0
     return {
       data: out,
+      dataOngoingEveryStep,
       keptCount: 0,
       totalCount: 0,
       sumPnlPct: ongoingMtmPct,
+      sumPnlPctEveryStep,
       sumClosedFiltered: 0,
       ongoingKeptCount,
       ongoingMtmPct,
@@ -327,8 +355,8 @@ function computeEmaFilteredClosedCurveCrossRegime(
     const t = Math.floor(Number(row?.time ?? row?.exitOpenTime) / 1000)
     if (!Number.isFinite(t)) continue
     let tt = t
-    while (out.some((x) => x.time === tt)) tt += 1
-    out.push({ time: tt, value: sum })
+    while (outClosedOnly.some((x) => x.time === tt)) tt += 1
+    outClosedOnly.push({ time: tt, value: sum })
   }
 
   let ongoingMtmPct = 0
@@ -343,17 +371,32 @@ function computeEmaFilteredClosedCurveCrossRegime(
     }
   }
 
+  const dataOngoingEveryStep = applyOngoingMtmToAllFilteredSteps(outClosedOnly, ongoingMtmPct)
+  if (dataOngoingEveryStep.length < 2 && dataOngoingEveryStep.length > 0) {
+    dataOngoingEveryStep.push({
+      time: dataOngoingEveryStep[0].time + 300,
+      value: Number(dataOngoingEveryStep[0].value) || 0,
+    })
+  }
+
+  const out = [...outClosedOnly]
   if (ongoingKeptCount > 0) {
     appendFilteredOpenMarkStep(out, sum + ongoingMtmPct, markTimeMs, events, ongoingRows ?? [])
   }
 
   if (out.length < 2) out.push({ time: out[0].time + 300, value: 0 })
   const sumTotal = sum + ongoingMtmPct
+  const sumPnlPctEveryStep =
+    dataOngoingEveryStep.length > 0
+      ? Number(dataOngoingEveryStep[dataOngoingEveryStep.length - 1]?.value) || 0
+      : 0
   return {
     data: out,
+    dataOngoingEveryStep,
     keptCount: kept,
     totalCount: n,
     sumPnlPct: sumTotal,
+    sumPnlPctEveryStep,
     sumClosedFiltered: sum,
     ongoingKeptCount,
     ongoingMtmPct,
@@ -851,13 +894,8 @@ export function LongSim5m() {
     return null
   }, [tradesA3, curveAgent3])
 
-  const lineSource = Array.isArray(liveCurve) && liveCurve.length > 0 ? liveCurve : curve
-  const lineSourceA3 =
-    Array.isArray(liveCurveAgent3) && liveCurveAgent3.length > 0
-      ? liveCurveAgent3
-      : Array.isArray(curveAgent3)
-        ? curveAgent3
-        : []
+  const lineSource = Array.isArray(curve) ? curve : []
+  const lineSourceA3 = Array.isArray(curveAgent3) ? curveAgent3 : []
   const lineData = useMemo(() => curveToLineDataUtc(lineSource, lineStartMs), [lineSource, lineStartMs])
   const lineDataA3 = useMemo(
     () => curveToLineDataUtc(lineSourceA3, lineStartMsA3),
@@ -872,10 +910,10 @@ export function LongSim5m() {
         curve,
         lineStartMs,
         emaPeriod,
-        ongoingTrades ?? [],
+        [],
         lastBarOpenTime,
       ),
-    [curve, lineStartMs, emaPeriod, ongoingTrades, lastBarOpenTime],
+    [curve, lineStartMs, emaPeriod, lastBarOpenTime],
   )
   const emaFilteredA3 = useMemo(
     () =>
@@ -883,10 +921,10 @@ export function LongSim5m() {
         curveAgent3 ?? [],
         lineStartMsA3,
         emaPeriod,
-        ongoingTradesA3 ?? [],
+        [],
         lastBarOpenTime,
       ),
-    [curveAgent3, lineStartMsA3, emaPeriod, ongoingTradesA3, lastBarOpenTime],
+    [curveAgent3, lineStartMsA3, emaPeriod, lastBarOpenTime],
   )
 
   const emaOnFilteredA1 = useMemo(
@@ -897,7 +935,6 @@ export function LongSim5m() {
     () => lineEmaData(emaFilteredA3.data, emaPeriod),
     [emaFilteredA3.data, emaPeriod],
   )
-
   const latestCum = lineData.length ? Number(lineData[lineData.length - 1]?.value) : null
   const latestEma = emaData?.length ? Number(emaData[emaData.length - 1]?.value) : null
   const isAboveEma =
@@ -1268,7 +1305,7 @@ export function LongSim5m() {
 
       <div ref={chartsSectionRef} className="agent1-anchor-target">
       <section className="longsim5m-chart-block" aria-label="Cumulative PnL Agent 1">
-        <h3 className="longsim5m-chart-label">Agent 1 — cumulative PnL % (candle per step, closed + open mark)</h3>
+        <h3 className="longsim5m-chart-label">Agent 1 — cumulative PnL % (candle per step, closed trades only)</h3>
         <p className="hourly-spikes-hint longsim5m-chart-hint">
           Green / red = cumulative % up or down vs the prior step (needs two or more points; otherwise a line is
           shown). Amber line = EMA({emaPeriod}) on the same series. Gate = cumulative &gt; EMA. Current:{' '}
@@ -1280,7 +1317,7 @@ export function LongSim5m() {
         <SimPnlCandleChart lineData={lineData} emaData={emaData} />
       </section>
       <section className="longsim5m-chart-block" aria-label="Cumulative PnL Agent 3">
-        <h3 className="longsim5m-chart-label">Agent 3 — cumulative PnL % (candle per step, closed + open mark)</h3>
+        <h3 className="longsim5m-chart-label">Agent 3 — cumulative PnL % (candle per step, closed trades only)</h3>
         <p className="hourly-spikes-hint longsim5m-chart-hint">
           Same green / red convention; amber = EMA({emaPeriod}). Current:{' '}
           <strong className={isAboveEmaA3 == null ? '' : isAboveEmaA3 ? 'pnl-pos' : 'pnl-neg'}>
@@ -1296,31 +1333,15 @@ export function LongSim5m() {
         <p className="hourly-spikes-hint longsim5m-chart-hint">
           On the exit-ordered Σ% curve vs EMA({emaPeriod}), a <strong>bearish cross</strong> blocks <strong>new</strong>{' '}
           entries after that close; a <strong>bullish cross</strong> unblocks. <strong>Closed</strong> trades opened while
-          blocked are omitted; allowed closes add realized TP/SL %. <strong>Ongoing</strong> legs use the same rule at
-          entry: allowed opens contribute one combined <strong>mark</strong> step (last bar / live poll), like the main
-          chart. Amber = EMA on this staircase.
+          blocked are omitted; allowed closes add realized TP/SL %. Ongoing/open legs are ignored here. Amber = EMA on
+          this staircase.
         </p>
         <div className="risk-summary longsim5m-filter-summary">
           <div className="risk-chip">
             Closes kept: <strong>{emaFiltered.keptCount}</strong> / {emaFiltered.totalCount}
           </div>
-          {emaFiltered.ongoingKeptCount > 0 ? (
-            <div className="risk-chip">
-              Open MTM (allowed):{' '}
-              <strong
-                className={
-                  Number(emaFiltered.ongoingMtmPct) >= 0 ? 'pnl-pos' : 'pnl-neg'
-                }
-              >
-                {Number(emaFiltered.ongoingMtmPct) >= 0 ? '+' : ''}
-                {Number(emaFiltered.ongoingMtmPct).toFixed(3)}% ·{' '}
-                <strong>{emaFiltered.ongoingKeptCount}</strong> leg
-                {emaFiltered.ongoingKeptCount === 1 ? '' : 's'}
-              </strong>
-            </div>
-          ) : null}
           <div className="risk-chip">
-            Σ% (chart end, closed + allowed MTM):{' '}
+            Σ% (chart end, closed-only):{' '}
             <strong className={emaFiltered.sumPnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}>
               {emaFiltered.sumPnlPct >= 0 ? '+' : ''}
               {emaFiltered.sumPnlPct.toFixed(3)}%
@@ -1333,30 +1354,15 @@ export function LongSim5m() {
       <section className="longsim5m-chart-block" aria-label="EMA rule realized curve Agent 3">
         <h3 className="longsim5m-chart-label">Agent 3 — realized PnL after EMA rule (candles)</h3>
         <p className="hourly-spikes-hint longsim5m-chart-hint">
-          Same cross regime as Agent 1 for shorts: blocked entries after a bearish cross; allowed closes and{' '}
-          <strong>allowed ongoing</strong> MTM at the last mark. Amber = EMA on filtered equity.
+          Same cross regime as Agent 1 for shorts: blocked entries after a bearish cross; allowed closes only.
+          Ongoing/open legs are ignored. Amber = EMA on filtered equity.
         </p>
         <div className="risk-summary longsim5m-filter-summary">
           <div className="risk-chip">
             Closes kept: <strong>{emaFilteredA3.keptCount}</strong> / {emaFilteredA3.totalCount}
           </div>
-          {emaFilteredA3.ongoingKeptCount > 0 ? (
-            <div className="risk-chip">
-              Open MTM (allowed):{' '}
-              <strong
-                className={
-                  Number(emaFilteredA3.ongoingMtmPct) >= 0 ? 'pnl-pos' : 'pnl-neg'
-                }
-              >
-                {Number(emaFilteredA3.ongoingMtmPct) >= 0 ? '+' : ''}
-                {Number(emaFilteredA3.ongoingMtmPct).toFixed(3)}% ·{' '}
-                <strong>{emaFilteredA3.ongoingKeptCount}</strong> leg
-                {emaFilteredA3.ongoingKeptCount === 1 ? '' : 's'}
-              </strong>
-            </div>
-          ) : null}
           <div className="risk-chip">
-            Σ% (chart end, closed + allowed MTM):{' '}
+            Σ% (chart end, closed-only):{' '}
             <strong className={emaFilteredA3.sumPnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}>
               {emaFilteredA3.sumPnlPct >= 0 ? '+' : ''}
               {emaFilteredA3.sumPnlPct.toFixed(3)}%
