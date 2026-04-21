@@ -1055,6 +1055,40 @@ export function LongSim5m() {
               {fmtIst(sched.nextFireAt)}
             </strong>
           </div>
+          <div className="risk-chip" title="Agent 1 ongoing unrealized PnL (sum of open legs)">
+            A1 unrealized:{' '}
+            <strong
+              className={
+                Number.isFinite(Number(totalUnrealizedPct))
+                  ? Number(totalUnrealizedPct) >= 0
+                    ? 'pnl-pos'
+                    : 'pnl-neg'
+                  : ''
+              }
+              style={{ fontSize: '1.02em' }}
+            >
+              {Number.isFinite(Number(totalUnrealizedPct))
+                ? `${Number(totalUnrealizedPct) >= 0 ? '+' : ''}${Number(totalUnrealizedPct).toFixed(3)}%`
+                : '—'}
+            </strong>
+          </div>
+          <div className="risk-chip" title="Agent 3 ongoing unrealized PnL (sum of open legs)">
+            A3 unrealized:{' '}
+            <strong
+              className={
+                Number.isFinite(Number(totalUnrealizedPctA3))
+                  ? Number(totalUnrealizedPctA3) >= 0
+                    ? 'pnl-pos'
+                    : 'pnl-neg'
+                  : ''
+              }
+              style={{ fontSize: '1.02em' }}
+            >
+              {Number.isFinite(Number(totalUnrealizedPctA3))
+                ? `${Number(totalUnrealizedPctA3) >= 0 ? '+' : ''}${Number(totalUnrealizedPctA3).toFixed(3)}%`
+                : '—'}
+            </strong>
+          </div>
           {simulationPaused && shadowSchedulerActive ? (
             <div className="risk-chip" style={{ color: '#fbbf24' }} title="Full replay and mark polls are paused; last curve is frozen.">
               Simulation paused
