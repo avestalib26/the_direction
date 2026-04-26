@@ -7,16 +7,20 @@ import {
   computeMarketBreadth,
 } from './breadth.js'
 import { computeMarketRegimeBreadth } from './marketRegimeBreadth.js'
+import { computeDailyMarketOverview } from './dailyMarketOverview.js'
 import { computeClosedPositionPnl } from './closedPositions.js'
 import { computeFutures24hVolumes } from './volumeScreener.js'
 import { computeFiveMinScreener } from './fiveMinScreener.js'
 import { mountHftRaveSse } from './hftRaveSse.js'
 import { runGptBacktest } from './gptBacktest.js'
 import { computeSpikeFilter, computeSpikeFilterUniverse } from './spikeFilterBacktest.js'
+import { DCA_BACKTEST_INTERVALS, runDailyDcaBacktest } from './dailyDcaBacktest.js'
 import {
   computeSpikeTpSlBacktest,
   parseSpikeTpSlUtcRange,
 } from './spikeTpSlBacktest.js'
+import { runLocalCandlesFullSync, scanLocalCandlesStatus } from './localCandleStore.js'
+import { binanceFuturesPublicHeaders } from './binancePublicHeaders.js'
 import {
   computeSpikeTpSlBacktestV3,
   parseSpikeTpSlV3UtcRange,
@@ -5298,6 +5302,37 @@ app.get('/api/binance/market-breadth', async (req, res) => {
   }
 })
 
+app.get('/api/binance/daily-market-overview', async (req, res) => {
+  const days = Number.parseInt(String(req.query.days ?? '60'), 10)
+  const minQuoteVolume = Number.parseFloat(String(req.query.minQuoteVolume ?? '2000000'))
+  const maxSymbols = Number.parseInt(String(req.query.maxSymbols ?? '250'), 10)
+  if (!Number.isFinite(days) || days < 10 || days > 120) {
+    return res.status(400).json({ error: 'days must be between 10 and 120' })
+  }
+  if (!Number.isFinite(minQuoteVolume) || minQuoteVolume < 0) {
+    return res.status(400).json({ error: 'minQuoteVolume must be >= 0' })
+  }
+  if (!Number.isFinite(maxSymbols) || maxSymbols < 20 || maxSymbols > 500) {
+    return res.status(400).json({ error: 'maxSymbols must be between 20 and 500' })
+  }
+  try {
+    const result = await computeDailyMarketOverview(FUTURES_BASE, {
+      days,
+      minQuoteVolume,
+      maxSymbols,
+    })
+    if (result.error) {
+      return res.status(400).json({ error: result.error })
+    }
+    res.json(result)
+  } catch (e) {
+    console.error(e)
+    res.status(502).json({
+      error: e instanceof Error ? e.message : 'Daily market overview failed',
+    })
+  }
+})
+
 /** Public: USDT-M perpetual 24h quote volume (USDT) and last price for all symbols. */
 app.get('/api/binance/futures-24h-volumes', async (req, res) => {
   try {
@@ -5423,6 +5458,64 @@ app.get('/api/binance/spike-filter', async (req, res) => {
     console.error(e)
     res.status(502).json({
       error: e instanceof Error ? e.message : 'Spike filter failed',
+    })
+  }
+})
+
+app.get('/api/binance/daily-dca-backtest', async (req, res) => {
+  const interval = String(req.query.interval ?? '1d').trim()
+  const candleCount = Number.parseInt(String(req.query.candleCount ?? '120'), 10)
+  const maxSymbols = Number.parseInt(String(req.query.maxSymbols ?? '0'), 10)
+  const startingBalanceUsd = Number.parseFloat(String(req.query.startingBalanceUsd ?? '1000'))
+  const leverage = Number.parseFloat(String(req.query.leverage ?? '20'))
+  const perEntryMarginUsd = Number.parseFloat(String(req.query.perEntryMarginUsd ?? '1'))
+  const tpPct = Number.parseFloat(String(req.query.tpPct ?? '20'))
+  const addPct = Number.parseFloat(String(req.query.addPct ?? '-50'))
+
+  if (!DCA_BACKTEST_INTERVALS.has(interval)) {
+    return res.status(400).json({
+      error: `interval must be one of: ${[...DCA_BACKTEST_INTERVALS].join(', ')}`,
+    })
+  }
+  if (!Number.isFinite(candleCount) || candleCount < 30 || candleCount > 500) {
+    return res.status(400).json({ error: 'candleCount must be between 30 and 500' })
+  }
+  if (!Number.isFinite(maxSymbols) || maxSymbols < 0 || maxSymbols > 1200) {
+    return res.status(400).json({ error: 'maxSymbols must be between 0 and 1200' })
+  }
+  if (!Number.isFinite(startingBalanceUsd) || startingBalanceUsd <= 0) {
+    return res.status(400).json({ error: 'startingBalanceUsd must be > 0' })
+  }
+  if (!Number.isFinite(leverage) || leverage <= 0 || leverage > 125) {
+    return res.status(400).json({ error: 'leverage must be in (0, 125]' })
+  }
+  if (!Number.isFinite(perEntryMarginUsd) || perEntryMarginUsd <= 0) {
+    return res.status(400).json({ error: 'perEntryMarginUsd must be > 0' })
+  }
+  if (!Number.isFinite(tpPct) || tpPct <= 0) {
+    return res.status(400).json({ error: 'tpPct must be > 0' })
+  }
+  if (!Number.isFinite(addPct) || addPct >= 0) {
+    return res.status(400).json({ error: 'addPct must be < 0' })
+  }
+
+  try {
+    const result = await runDailyDcaBacktest(FUTURES_BASE, {
+      interval,
+      candleCount,
+      maxSymbols,
+      startingBalanceUsd,
+      leverage,
+      perEntryMarginUsd,
+      tpPct,
+      addPct,
+    })
+    if (result.error) return res.status(400).json({ error: result.error })
+    res.json(result)
+  } catch (e) {
+    console.error(e)
+    res.status(502).json({
+      error: e instanceof Error ? e.message : 'Daily DCA backtest failed',
     })
   }
 })
@@ -5561,6 +5654,18 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
     }
     tpROpt = tr
   }
+  const entryVolQ = req.query.entryMinQuoteVolume24hAtEntry
+  let entryMinQuoteVolume24hAtEntryOpt
+  if (entryVolQ != null && String(entryVolQ).trim() !== '') {
+    const v = Number.parseFloat(String(entryVolQ))
+    if (!Number.isFinite(v) || v <= 0) {
+      return res.status(400).json({
+        error:
+          'entryMinQuoteVolume24hAtEntry must be a positive number (strict rolling 24h entry-volume gate), or omit it',
+      })
+    }
+    entryMinQuoteVolume24hAtEntryOpt = v
+  }
 
   const longRetestTpAtSpikeHigh =
     strategy === 'longGreenRetestLow' &&
@@ -5586,6 +5691,9 @@ app.get('/api/binance/spike-tpsl-backtest', async (req, res) => {
       emaLongSlopePositive96_5m,
       emaShortFilter96_5m,
       equityEmaSlow: equityEmaSlowOpt,
+      ...(entryMinQuoteVolume24hAtEntryOpt != null
+        ? { entryMinQuoteVolume24hAtEntry: entryMinQuoteVolume24hAtEntryOpt }
+        : {}),
       ...(tpROpt != null ? { tpR: tpROpt } : {}),
       ...(longRetestTpAtSpikeHigh ? { longRetestTpAtSpikeHigh: true } : {}),
     })
@@ -5678,8 +5786,38 @@ app.get('/api/binance/spike-tpsl-quick-backtest/stream', async (req, res) => {
     return
   }
 
-  const maxSymQ = Number.parseInt(String(req.query.maxSymbols ?? '120'), 10)
-  const maxSymbols = Number.isFinite(maxSymQ) ? Math.min(300, Math.max(10, maxSymQ)) : 120
+  const firstQ = (v) => {
+    if (v == null) return ''
+    const x = Array.isArray(v) ? v[0] : v
+    return String(x ?? '').trim()
+  }
+  const truthyQ = (v) => {
+    const s = firstQ(v).toLowerCase()
+    return s === '1' || s === 'true' || s === 'yes'
+  }
+
+  const useLocalCandlesOpt = truthyQ(req.query.useLocalCandles)
+  const localCandlesOnlyOpt = truthyQ(req.query.localCandlesOnly)
+  const localDiskMode = useLocalCandlesOpt && localCandlesOnlyOpt
+
+  const maxSymTrim = firstQ(req.query.maxSymbols)
+  let maxSymbolsOpt = null
+  let allQualifiedSymbolsOpt = false
+  if (localDiskMode && maxSymTrim === '') {
+    allQualifiedSymbolsOpt = true
+  } else if (localDiskMode && maxSymTrim !== '') {
+    const maxSymQ = Number.parseInt(maxSymTrim, 10)
+    maxSymbolsOpt = Number.isFinite(maxSymQ) ? Math.min(500, Math.max(10, maxSymQ)) : 120
+  } else if (
+    maxSymTrim === '' &&
+    truthyQ(req.query.allQualifiedSymbols) &&
+    useLocalCandlesOpt
+  ) {
+    allQualifiedSymbolsOpt = true
+  } else {
+    const maxSymQ = Number.parseInt(maxSymTrim || '120', 10)
+    maxSymbolsOpt = Number.isFinite(maxSymQ) ? Math.min(500, Math.max(10, maxSymQ)) : 120
+  }
 
   const equityEmaSlowQ = Number.parseInt(String(req.query.equityEmaSlow ?? '50'), 10)
   const equityEmaSlowOpt = Number.isFinite(equityEmaSlowQ) ? equityEmaSlowQ : 50
@@ -5695,6 +5833,32 @@ app.get('/api/binance/spike-tpsl-quick-backtest/stream', async (req, res) => {
     }
     tpROpt = tr
   }
+  let maxSlPctOpt = null
+  const maxSlQ = req.query.maxSlPct
+  if (maxSlQ != null && String(maxSlQ).trim() !== '') {
+    const v = Number.parseFloat(String(maxSlQ))
+    if (!Number.isFinite(v) || v <= 0 || v > 100) {
+      send({ event: 'error', message: 'maxSlPct must be a number in (0, 100], or omit it' })
+      res.end()
+      return
+    }
+    maxSlPctOpt = v
+  }
+  const entryVolQ = req.query.entryMinQuoteVolume24hAtEntry
+  let entryMinQuoteVolume24hAtEntryOpt = null
+  if (entryVolQ != null && String(entryVolQ).trim() !== '') {
+    const v = Number.parseFloat(String(entryVolQ))
+    if (!Number.isFinite(v) || v <= 0) {
+      send({
+        event: 'error',
+        message:
+          'entryMinQuoteVolume24hAtEntry must be a positive number (strict rolling 24h entry-volume gate), or omit it',
+      })
+      res.end()
+      return
+    }
+    entryMinQuoteVolume24hAtEntryOpt = v
+  }
 
   try {
     const result = await computeSpikeTpSlBacktest(FUTURES_BASE, {
@@ -5705,9 +5869,15 @@ app.get('/api/binance/spike-tpsl-quick-backtest/stream', async (req, res) => {
       strategy,
       includeChartCandles: false,
       extendedCandles: true,
-      maxSymbols,
+      ...(allQualifiedSymbolsOpt ? { allQualifiedSymbols: true } : { maxSymbols: maxSymbolsOpt }),
+      ...(maxSlPctOpt != null ? { maxSlPct: maxSlPctOpt } : {}),
       equityEmaSlow: equityEmaSlowOpt,
+      ...(entryMinQuoteVolume24hAtEntryOpt != null
+        ? { entryMinQuoteVolume24hAtEntry: entryMinQuoteVolume24hAtEntryOpt }
+        : {}),
       ...(tpROpt != null ? { tpR: tpROpt } : {}),
+      ...(useLocalCandlesOpt ? { useLocalCandles: true } : {}),
+      ...(localCandlesOnlyOpt ? { localCandlesOnly: true } : {}),
       onProgress: (p) => send({ event: 'progress', ...p }),
     })
     send({ event: 'done', result })
@@ -5716,6 +5886,79 @@ app.get('/api/binance/spike-tpsl-quick-backtest/stream', async (req, res) => {
     send({
       event: 'error',
       message: e instanceof Error ? e.message : 'Quick backtest failed',
+    })
+  }
+  res.end()
+})
+
+/** Local on-disk kline cache (see data/local-candles). */
+app.get('/api/local-candles/status', async (_req, res) => {
+  try {
+    const status = await scanLocalCandlesStatus()
+    res.json({
+      ...status,
+      useLocalInBacktest:
+        String(process.env.SPIKE_TPSL_USE_LOCAL_CANDLES ?? '').trim() === '1' ||
+        String(process.env.SPIKE_TPSL_USE_LOCAL_CANDLES ?? '').toLowerCase().trim() === 'true',
+    })
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({
+      error: e instanceof Error ? e.message : 'local-candles status failed',
+    })
+  }
+})
+
+/**
+ * SSE: download up to `targetBars` (default 10_000) closed klines per symbol.
+ * Query `interval`: `5m` or `15m` (one phase); omit for both 5m and 15m in one run.
+ */
+app.get('/api/local-candles/sync/stream', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no')
+  if (typeof res.flushHeaders === 'function') res.flushHeaders()
+
+  const send = (obj) => {
+    res.write(`data: ${JSON.stringify(obj)}\n\n`)
+  }
+
+  const concQ = Number.parseInt(String(req.query.concurrency ?? '2'), 10)
+  const concurrency = Number.isFinite(concQ) ? Math.min(8, Math.max(1, concQ)) : 2
+
+  const tbQ = Number.parseInt(String(req.query.targetBars ?? '10000'), 10)
+  const targetBars = Number.isFinite(tbQ) ? Math.min(20_000, Math.max(100, tbQ)) : 10_000
+
+  const intervalRaw = String(req.query.interval ?? '').trim().toLowerCase()
+  let intervals
+  if (!intervalRaw) {
+    intervals = ['5m', '15m']
+  } else if (intervalRaw === '5m' || intervalRaw === '15m') {
+    intervals = [intervalRaw]
+  } else {
+    send({
+      event: 'error',
+      message: 'interval must be 5m or 15m (or omit to fetch both in one run)',
+    })
+    res.end()
+    return
+  }
+
+  try {
+    await runLocalCandlesFullSync({
+      futuresBase: FUTURES_BASE,
+      headers: binanceFuturesPublicHeaders(),
+      targetBars,
+      intervals,
+      concurrency,
+      onEvent: (evt) => send(evt),
+    })
+  } catch (e) {
+    console.error(e)
+    send({
+      event: 'error',
+      message: e instanceof Error ? e.message : 'local-candles sync failed',
     })
   }
   res.end()

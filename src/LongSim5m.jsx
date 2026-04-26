@@ -480,13 +480,13 @@ function SimPnlCandleChart({
       })
       candleSeries.setData(candleData)
     } else {
-      const series = chart.addSeries(LineSeries, {
-        color: lineColor,
-        lineWidth: 2,
-        crosshairMarkerVisible: true,
-        lastValueVisible: true,
-        priceLineVisible: true,
-      })
+    const series = chart.addSeries(LineSeries, {
+      color: lineColor,
+      lineWidth: 2,
+      crosshairMarkerVisible: true,
+      lastValueVisible: true,
+      priceLineVisible: true,
+    })
       series.setData(line)
     }
 
@@ -717,7 +717,7 @@ export function LongSim5m() {
   }, [payload, shadowSimConfig, ovrFormSyncKey])
 
   const applyReplayParams = useCallback(async () => {
-    if (payload?.shadowSchedulerActive === false) return
+      if (payload?.shadowSchedulerActive === false) return
     setSimParamsBusy(true)
     setError('')
     try {
@@ -788,15 +788,15 @@ export function LongSim5m() {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
+        })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`)
       replayFormDirtyRef.current = false
-      await load()
+        await load()
       await loadShadowSimConfig()
-    } catch (e) {
+      } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to update replay parameters')
-    } finally {
+      } finally {
       setSimParamsBusy(false)
     }
   }, [
@@ -1245,14 +1245,14 @@ export function LongSim5m() {
             </label>
           </div>
           <div className="longsim5m-replay-actions">
-            <button
-              type="button"
+              <button
+                type="button"
               className="btn-refresh"
               disabled={!shadowSchedulerActive || simParamsBusy}
               onClick={() => void applyReplayParams()}
             >
               {simParamsBusy ? '…' : 'Apply replay params'}
-            </button>
+              </button>
           </div>
         </div>
       </details>
@@ -1340,7 +1340,7 @@ export function LongSim5m() {
       <div ref={chartsSectionRef} className="agent1-anchor-target">
       <section className="longsim5m-chart-block" aria-label="Cumulative PnL Agent 1">
         <h3 className="longsim5m-chart-label">Agent 1 — cumulative PnL % (candle per step, closed trades only)</h3>
-        <p className="hourly-spikes-hint longsim5m-chart-hint">
+          <p className="hourly-spikes-hint longsim5m-chart-hint">
           Green / red = cumulative % up or down vs the prior step (needs two or more points; otherwise a line is
           shown). Amber line = EMA({emaPeriod}) on the same series. Gate = cumulative &gt; EMA. Current:{' '}
           <strong className={isAboveEma == null ? '' : isAboveEma ? 'pnl-pos' : 'pnl-neg'}>
@@ -1349,18 +1349,18 @@ export function LongSim5m() {
           .
         </p>
         <SimPnlCandleChart lineData={lineData} emaData={emaData} />
-      </section>
+        </section>
       <section className="longsim5m-chart-block" aria-label="Cumulative PnL Agent 3">
         <h3 className="longsim5m-chart-label">Agent 3 — cumulative PnL % (candle per step, closed trades only)</h3>
-        <p className="hourly-spikes-hint longsim5m-chart-hint">
+          <p className="hourly-spikes-hint longsim5m-chart-hint">
           Same green / red convention; amber = EMA({emaPeriod}). Current:{' '}
           <strong className={isAboveEmaA3 == null ? '' : isAboveEmaA3 ? 'pnl-pos' : 'pnl-neg'}>
             {isAboveEmaA3 == null ? 'warming up' : isAboveEmaA3 ? 'above EMA' : 'below EMA'}
-          </strong>
-          .
-        </p>
+            </strong>
+            .
+          </p>
         <SimPnlCandleChart lineData={lineDataA3} emaData={emaDataA3} />
-      </section>
+        </section>
 
       <section className="longsim5m-chart-block" aria-label="EMA rule realized curve Agent 1">
         <h3 className="longsim5m-chart-label">Agent 1 — realized PnL after EMA rule (candles)</h3>
@@ -1494,7 +1494,7 @@ export function LongSim5m() {
               <strong className={Number(totalUnrealizedPctA3) >= 0 ? 'pnl-pos' : 'pnl-neg'}>
                 {Number.isFinite(Number(totalUnrealizedPctA3))
                   ? `${Number(totalUnrealizedPctA3) >= 0 ? '+' : ''}${Number(totalUnrealizedPctA3).toFixed(3)}%`
-                  : '—'}
+                        : '—'}
               </strong>
             </div>
             <div className="risk-chip">

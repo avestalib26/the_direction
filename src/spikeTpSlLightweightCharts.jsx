@@ -174,7 +174,7 @@ const COL_BB_BAND = 'rgba(96, 165, 250, 0.55)'
 const COL_BB_MID = 'rgba(147, 197, 253, 0.45)'
 
 /**
- * Cumulative Σ price % curves on one y-scale (Agent 1 vs 3, optional Agent 4 & 5).
+ * Cumulative Σ price % curves on one y-scale (long vs short, optional extraCompareSeries).
  * X-axis = normalized progress through each run (start → end), not wall-clock time.
  * @param {{ points: unknown, side: 'long'|'short', label: string, color?: string }[]} [extraCompareSeries]
  */

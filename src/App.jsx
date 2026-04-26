@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useId, useMemo, useState } from 'react'
 import { MarketBreadth } from './MarketBreadth'
+import { DailyMarketOverview } from './DailyMarketOverview.jsx'
 import { GptBacktest } from './GptBacktest'
 import { SpikeTpSlBacktest } from './SpikeTpSlBacktest'
 import { SpikeTpSlBacktestV3 } from './SpikeTpSlBacktestV3'
 import { AgentStrategiesQuickBacktest } from './AgentStrategiesQuickBacktest.jsx'
 import { AgentLongShortCompareBacktest } from './AgentLongShortCompareBacktest.jsx'
+import { LocalCandlesFetch } from './LocalCandlesFetch.jsx'
+import { DailyDcaBacktest } from './DailyDcaBacktest.jsx'
 import { The100k } from './The100k'
 import { TradeHistory } from './TradeHistory'
 import { Emotions } from './Emotions'
@@ -22,6 +25,7 @@ const APP_VIEWS = new Set([
   'home',
   'the100k',
   'breadth',
+  'dailyoverview',
   'history',
   'emotions',
   'mldataset',
@@ -29,6 +33,9 @@ const APP_VIEWS = new Set([
   'spiketpsl',
   'spiketpslquick',
   'longshortsim',
+  'localbacktest',
+  'localcandles',
+  'dailydcabacktest',
   'spiketpslv3',
   'agent1',
   'agent2',
@@ -186,6 +193,9 @@ function App() {
     'spiketpsl',
     'spiketpslquick',
     'longshortsim',
+    'localbacktest',
+    'localcandles',
+    'dailydcabacktest',
     'spiketpslv3',
   ]
   const isBacktestView = BACKTEST_VIEWS.includes(view)
@@ -994,6 +1004,18 @@ function App() {
           <li>
             <a
               href="#"
+              className={`menu-link ${view === 'dailyoverview' ? 'menu-link--active' : ''}`}
+              onClick={(e) => {
+                e.preventDefault()
+                go('dailyoverview')
+              }}
+            >
+              Daily market overview
+            </a>
+          </li>
+          <li>
+            <a
+              href="#"
               className={`menu-link ${view === 'history' ? 'menu-link--active' : ''}`}
               onClick={(e) => {
                 e.preventDefault()
@@ -1099,6 +1121,42 @@ function App() {
                     Long / short simulation
                   </a>
                 </li>
+                <li>
+                  <a
+                    href="#"
+                    className={`menu-link menu-sublink ${view === 'localbacktest' ? 'menu-link--active' : ''}`}
+                    onClick={(e) => {
+                      e.preventDefault()
+                      go('localbacktest')
+                    }}
+                  >
+                    Local backtest
+                  </a>
+                </li>
+                <li>
+                  <a
+                    href="#"
+                    className={`menu-link menu-sublink ${view === 'localcandles' ? 'menu-link--active' : ''}`}
+                    onClick={(e) => {
+                      e.preventDefault()
+                      go('localcandles')
+                    }}
+                  >
+                    Local candle cache
+                  </a>
+                </li>
+                <li>
+                  <a
+                    href="#"
+                    className={`menu-link menu-sublink ${view === 'dailydcabacktest' ? 'menu-link--active' : ''}`}
+                    onClick={(e) => {
+                      e.preventDefault()
+                      go('dailydcabacktest')
+                    }}
+                  >
+                    Daily DCA all coins
+                  </a>
+                </li>
               </ul>
             </details>
           </li>
@@ -1106,7 +1164,7 @@ function App() {
       </nav>
 
       <main
-        className={`app ${view === 'breadth' || view === 'history' || view === 'emotions' || view === 'mldataset' || view === 'the100k' || view === 'gptbacktest' || view === 'spiketpsl' || view === 'spiketpslquick' || view === 'longshortsim' || view === 'spiketpslv3' || view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' || view === 'testpage' ? 'app--breadth' : ''} ${view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' ? 'app--agent1' : ''}`}
+        className={`app ${view === 'breadth' || view === 'dailyoverview' || view === 'history' || view === 'emotions' || view === 'mldataset' || view === 'the100k' || view === 'gptbacktest' || view === 'spiketpsl' || view === 'spiketpslquick' || view === 'longshortsim' || view === 'localbacktest' || view === 'localcandles' || view === 'dailydcabacktest' || view === 'spiketpslv3' || view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' || view === 'testpage' ? 'app--breadth' : ''} ${view === 'agent1' || view === 'agent2' || view === 'agent3' || view === 'longsim5m' ? 'app--agent1' : ''}`}
         id="main"
       >
         {view === 'home' && (
@@ -1346,6 +1404,7 @@ function App() {
 
         {view === 'the100k' && <The100k />}
         {view === 'breadth' && <MarketBreadth />}
+        {view === 'dailyoverview' && <DailyMarketOverview />}
         {view === 'history' && <TradeHistory />}
         {view === 'emotions' && (
           <EmotionsErrorBoundary>
@@ -1357,6 +1416,9 @@ function App() {
         {view === 'spiketpsl' && <SpikeTpSlBacktest />}
         {view === 'spiketpslquick' && <AgentStrategiesQuickBacktest />}
         {view === 'longshortsim' && <AgentLongShortCompareBacktest />}
+        {view === 'localbacktest' && <AgentLongShortCompareBacktest useLocalDisk />}
+        {view === 'localcandles' && <LocalCandlesFetch />}
+        {view === 'dailydcabacktest' && <DailyDcaBacktest />}
         {view === 'spiketpslv3' && <SpikeTpSlBacktestV3 />}
         {view === 'agent1' && <Agent1 />}
         {view === 'agent2' && <Agent2 />}

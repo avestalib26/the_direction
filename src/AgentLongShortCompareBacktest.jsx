@@ -19,6 +19,12 @@ const INTERVAL_OPTIONS = [
   { value: '4h', label: '4h' },
 ]
 
+/** Cached on disk (see Local candle cache); local backtest does not fetch klines from Binance. */
+const LOCAL_DISK_INTERVAL_OPTIONS = [
+  { value: '5m', label: '5m' },
+  { value: '15m', label: '15m' },
+]
+
 const PROGRESS_CAP = 56
 const QUICK_EMA_PERIOD = 50
 
@@ -55,6 +61,12 @@ function fmtReturnPerMaxDd(summary) {
 function fmtUsd2(n) {
   if (n == null || !Number.isFinite(Number(n))) return '—'
   return `${Number(n).toFixed(2)} USDT`
+}
+
+function fmtLocalTimeMs(ms) {
+  const t = Number(ms)
+  if (!Number.isFinite(t) || t <= 0) return '—'
+  return new Date(t).toLocaleString()
 }
 
 /** Visual-only rebase so plotted cumulative curves start at 0 at first shown point. */
@@ -366,6 +378,7 @@ function pushProgress(setLog, line) {
 
 function buildQuery({
   minQuoteVolume24h,
+  entryMinQuoteVolume24hAtEntry,
   interval,
   candleCount,
   thresholdPct,
@@ -373,6 +386,7 @@ function buildQuery({
   tpR,
   maxSlPct,
   maxSymbols,
+  useLocalDisk = false,
 }) {
   const q = new URLSearchParams({
     minQuoteVolume24h: String(minQuoteVolume24h),
@@ -384,7 +398,17 @@ function buildQuery({
   })
   if (Number.isFinite(tpR) && tpR > 0) q.set('tpR', String(tpR))
   if (Number.isFinite(maxSlPct) && maxSlPct > 0) q.set('maxSlPct', String(maxSlPct))
-  if (Number.isFinite(maxSymbols) && maxSymbols >= 10) q.set('maxSymbols', String(Math.min(300, maxSymbols)))
+  if (Number.isFinite(entryMinQuoteVolume24hAtEntry) && entryMinQuoteVolume24hAtEntry > 0) {
+    q.set('entryMinQuoteVolume24hAtEntry', String(entryMinQuoteVolume24hAtEntry))
+  }
+  if (!useLocalDisk && Number.isFinite(maxSymbols) && maxSymbols >= 10) {
+    q.set('maxSymbols', String(Math.min(500, maxSymbols)))
+  }
+  if (useLocalDisk) {
+    q.set('useLocalCandles', '1')
+    q.set('localCandlesOnly', '1')
+    q.set('allQualifiedSymbols', '1')
+  }
   return q
 }
 
@@ -480,6 +504,28 @@ function LongShortSideMetrics({ title, summary, symbolsSkipped, isFirst }) {
             {Number.isFinite(symbolsSkipped) ? symbolsSkipped.toLocaleString() : '—'}
           </span>
         </div>
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">Entry vol gate (checked / passed / skipped)</span>
+          <span className="backtest1-stat-value">
+            {(s.entryVolumeChecked ?? 0).toLocaleString()} / {(s.entryVolumePassed ?? 0).toLocaleString()} /{' '}
+            {(s.entryVolumeSkips ?? 0).toLocaleString()}
+          </span>
+        </div>
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">Entry vol skip reason (history / below)</span>
+          <span className="backtest1-stat-value">
+            {(s.entryVolumeSkipInsufficientHistory ?? 0).toLocaleString()} /{' '}
+            {(s.entryVolumeSkipBelowThreshold ?? 0).toLocaleString()}
+          </span>
+        </div>
+        <div className="backtest1-stat">
+          <span className="backtest1-stat-label">First entry vol skip</span>
+          <span className="backtest1-stat-value">
+            {s?.entryVolumeFirstSkip?.reason
+              ? `${s.entryVolumeFirstSkip.reason} @ ${fmtLocalTimeMs(s.entryVolumeFirstSkip.entryOpenTime)}`
+              : '—'}
+          </span>
+        </div>
       </div>
     </>
   )
@@ -540,13 +586,16 @@ function EmaGatedSideMetrics({ title, gatedPack, isFirst }) {
   )
 }
 
-export function AgentLongShortCompareBacktest() {
-  const [minQuoteVolume24h, setMinQuoteVolume24h] = useState('10000000')
-  const [interval, setInterval] = useState('15m')
+export function AgentLongShortCompareBacktest({ useLocalDisk = false } = {}) {
+  const [minQuoteVolume24h, setMinQuoteVolume24h] = useState(() => (useLocalDisk ? '0' : '10000000'))
+  const [interval, setInterval] = useState(() => (useLocalDisk ? '5m' : '15m'))
   const [thresholdPct, setThresholdPct] = useState('5')
-  const [candleCount, setCandleCount] = useState('500')
+  const [candleCount, setCandleCount] = useState(() =>
+    useLocalDisk ? String(MAX_QUICK_BACKTEST_CANDLES) : '500',
+  )
   const [tpR, setTpR] = useState('2')
   const [maxSlPct, setMaxSlPct] = useState('30')
+  const [entryMinQuoteVolume24hAtEntry, setEntryMinQuoteVolume24hAtEntry] = useState('1000000')
   const [maxSymbols, setMaxSymbols] = useState('300')
   const [startingBalance, setStartingBalance] = useState('100')
   const [tradeSizePct, setTradeSizePct] = useState('10')
@@ -556,7 +605,6 @@ export function AgentLongShortCompareBacktest() {
   const [error, setError] = useState(null)
   const [resultLong, setResultLong] = useState(null)
   const [resultShort, setResultShort] = useState(null)
-  const [resultAgent4, setResultAgent4] = useState(null)
   const [progressLog, setProgressLog] = useState([])
 
   const run = useCallback(async () => {
@@ -564,7 +612,6 @@ export function AgentLongShortCompareBacktest() {
     setError(null)
     setResultLong(null)
     setResultShort(null)
-    setResultAgent4(null)
     setProgressLog([])
     try {
       const vol = Number.parseFloat(String(minQuoteVolume24h).replace(/,/g, ''))
@@ -572,6 +619,7 @@ export function AgentLongShortCompareBacktest() {
       const n = Number.parseInt(String(candleCount).replace(/,/g, ''), 10)
       const tp = Number.parseFloat(String(tpR).replace(/,/g, ''))
       const maxSl = Number.parseFloat(String(maxSlPct).replace(/,/g, ''))
+      const entryVolAtEntry = Number.parseFloat(String(entryMinQuoteVolume24hAtEntry).replace(/,/g, ''))
       const maxSym = Number.parseInt(String(maxSymbols).trim(), 10)
 
       if (!Number.isFinite(vol) || vol < 0) throw new Error('Volume must be >= 0')
@@ -587,7 +635,12 @@ export function AgentLongShortCompareBacktest() {
         thresholdPct: th,
         tpR: Number.isFinite(tp) && tp > 0 ? tp : undefined,
         maxSlPct: Number.isFinite(maxSl) && maxSl > 0 ? Math.min(maxSl, 100) : undefined,
-        maxSymbols: Number.isFinite(maxSym) && maxSym >= 10 ? Math.min(300, maxSym) : undefined,
+        entryMinQuoteVolume24hAtEntry:
+          Number.isFinite(entryVolAtEntry) && entryVolAtEntry > 0 ? entryVolAtEntry : undefined,
+        useLocalDisk,
+        ...(!useLocalDisk
+          ? { maxSymbols: Number.isFinite(maxSym) && maxSym >= 10 ? Math.min(500, maxSym) : undefined }
+          : {}),
       }
 
       pushProgress(setProgressLog, 'Starting Agent 1 (long / green spike)…')
@@ -630,82 +683,63 @@ export function AgentLongShortCompareBacktest() {
         }
       })
 
-      pushProgress(setProgressLog, 'Starting Agent 4 (long / red spike, 2R fixed)…')
-      await consumeQuickBacktestStream(buildQuery({ ...base, strategy: 'agent4' }), (evt) => {
-        if (evt.event === 'progress') {
-          if (evt.phase === 'symbol') {
-            const extra = evt.error ? ` — ${evt.error}` : ''
-            pushProgress(
-              setProgressLog,
-              `[A4 long ${evt.index}/${evt.total}] ${evt.symbol}: ${evt.candlesFetched}/${evt.candlesRequested} bars${extra}`,
-            )
-          } else if (evt.phase === 'aggregate') {
-            pushProgress(setProgressLog, 'Agent 4: aggregating trades & equity…')
-          }
-        } else if (evt.event === 'done') {
-          setResultAgent4(evt.result)
-          pushProgress(setProgressLog, 'Agent 4 done. Compare charts ready.')
-        } else if (evt.event === 'error') {
-          throw new Error(evt.message || 'Agent 4 backtest error')
-        }
-      })
+      pushProgress(setProgressLog, 'Compare charts ready.')
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed')
     } finally {
       setRunning(false)
     }
-  }, [minQuoteVolume24h, interval, thresholdPct, candleCount, tpR, maxSlPct, maxSymbols])
+  }, [
+    minQuoteVolume24h,
+    entryMinQuoteVolume24hAtEntry,
+    interval,
+    thresholdPct,
+    candleCount,
+    tpR,
+    maxSlPct,
+    maxSymbols,
+    useLocalDisk,
+  ])
+
+  const intervalChoices = useLocalDisk ? LOCAL_DISK_INTERVAL_OPTIONS : INTERVAL_OPTIONS
 
   const sLong = resultLong?.summary
   const sShort = resultShort?.summary
-  const sA4 = resultAgent4?.summary
-  const showSummary = Boolean(sLong || sShort || sA4)
-
-  const compareExtraSeries = useMemo(() => {
-    if (resultAgent4?.equityCurve?.length > 1) {
-      return [
-        {
-          points: resultAgent4.equityCurve,
-          side: 'long',
-          label: 'Agent 4 (long / red spike, 2R)',
-        },
-      ]
-    }
-    return null
-  }, [resultAgent4])
+  const showSummary = Boolean(sLong || sShort)
 
   const emaGateLong = useMemo(() => buildEmaGatedPackForResult(resultLong, QUICK_EMA_PERIOD), [resultLong])
   const emaGateShort = useMemo(() => buildEmaGatedPackForResult(resultShort, QUICK_EMA_PERIOD), [resultShort])
-  const emaGateA4 = useMemo(() => buildEmaGatedPackForResult(resultAgent4, QUICK_EMA_PERIOD), [resultAgent4])
   const emaGateActivityBars = useMemo(
     () => buildCombinedActivityBars(emaGateLong, emaGateShort),
     [emaGateLong, emaGateShort],
   )
-  const emaGateExtraSeries = useMemo(() => {
-    if (emaGateA4?.equityCurve?.length > 1) {
-      return [
-        {
-          points: emaGateA4.equityCurve,
-          side: 'long',
-          label: 'Agent 4 (long / red spike, EMA gated)',
-        },
-      ]
-    }
-    return null
-  }, [emaGateA4])
-  const emaGateCombinedAccount = useMemo(
-    () => buildCombinedEmaGatedAccountSim(emaGateLong, emaGateShort, startingBalance, tradeSizePct, leverage),
-    [emaGateLong, emaGateShort, startingBalance, tradeSizePct, leverage],
-  )
+  const emaGateCombinedAccount = useMemo(() => {
+    if (useLocalDisk) return null
+    return buildCombinedEmaGatedAccountSim(emaGateLong, emaGateShort, startingBalance, tradeSizePct, leverage)
+  }, [useLocalDisk, emaGateLong, emaGateShort, startingBalance, tradeSizePct, leverage])
 
   return (
     <div className="vol-screener spike-tpsl-bt">
-      <h1 className="vol-screener-title">Long / short simulation</h1>
+      <h1 className="vol-screener-title">
+        {useLocalDisk ? 'Local long / short backtest' : 'Long / short simulation'}
+      </h1>
       <p className="vol-screener-lead">
-        One click runs three quick backtests: <strong>Agent 1</strong> (long on green spikes), <strong>Agent 3</strong>{' '}
-        (short on red spikes), and <strong>Agent 4</strong> (long on red spikes, fixed 2R TP / 1R SL). The compare chart
-        overlays cumulative Σ price % curves. <strong>tpR</strong> applies to Agents 1 and 3 only; Agent 4 uses fixed
-        2R take-profit in the engine.
+        {useLocalDisk ? (
+          <>
+            Same comparison as Long / short simulation, but <strong>per-symbol candles load only from disk</strong>{' '}
+            (<code>data/local-candles/binance_usdm/&lt;interval&gt;/</code> or legacy per-symbol folders). Missing cache
+            skips the symbol (no Binance klines). Defaults: <strong>min 24h vol = 0</strong> (all listed perps),{' '}
+            <strong>candles = max</strong> ({MAX_QUICK_BACKTEST_CANDLES.toLocaleString()}), <strong>all symbols</strong>{' '}
+            (no cap). <strong>24h ticker</strong> still uses one live Binance call. Use <strong>5m</strong> or{' '}
+            <strong>15m</strong> matching your cache.
+          </>
+        ) : (
+          <>
+            One click runs two quick backtests: <strong>Agent 1</strong> (long on green spikes) and{' '}
+            <strong>Agent 3</strong> (short on red spikes). The compare chart overlays cumulative Σ price % curves.{' '}
+            <strong>tpR</strong> applies to both agents.
+          </>
+        )}
       </p>
 
       <div className="backtest1-form" style={{ maxWidth: 560, marginBottom: '1.25rem' }}>
@@ -726,7 +760,7 @@ export function AgentLongShortCompareBacktest() {
             onChange={(e) => setInterval(e.target.value)}
             disabled={running}
           >
-            {INTERVAL_OPTIONS.map((o) => (
+            {intervalChoices.map((o) => (
               <option key={o.value} value={o.value}>
                 {o.label}
               </option>
@@ -772,46 +806,67 @@ export function AgentLongShortCompareBacktest() {
           />
         </label>
         <label className="backtest1-field">
-          <span className="backtest1-label">Max symbols (10–300)</span>
+          <span className="backtest1-label">Entry rolling 24h vol min (strict)</span>
           <input
             className="backtest1-input"
-            value={maxSymbols}
-            onChange={(e) => setMaxSymbols(e.target.value)}
+            value={entryMinQuoteVolume24hAtEntry}
+            onChange={(e) => setEntryMinQuoteVolume24hAtEntry(e.target.value)}
             disabled={running}
-          />
-        </label>
-        <p className="backtest1-meta" style={{ gridColumn: '1 / -1', margin: '0.25rem 0 0' }}>
-          Balance / size / leverage: used for the EMA-gated combined wallet (Agent 1 + Agent 3) only
-        </p>
-        <label className="backtest1-field">
-          <span className="backtest1-label">Starting balance (USDT)</span>
-          <input
-            className="backtest1-input"
-            value={startingBalance}
-            onChange={(e) => setStartingBalance(e.target.value)}
             inputMode="decimal"
+            placeholder="e.g. 1000000"
           />
         </label>
-        <label className="backtest1-field">
-          <span className="backtest1-label">Trade size (% of balance at entry)</span>
-          <input
-            className="backtest1-input"
-            value={tradeSizePct}
-            onChange={(e) => setTradeSizePct(e.target.value)}
-            inputMode="decimal"
-          />
-        </label>
-        <label className="backtest1-field">
-          <span className="backtest1-label">Leverage (×)</span>
-          <input
-            className="backtest1-input"
-            value={leverage}
-            onChange={(e) => setLeverage(e.target.value)}
-            inputMode="decimal"
-          />
-        </label>
+        {!useLocalDisk ? (
+          <label className="backtest1-field">
+            <span className="backtest1-label">Max symbols (10–500)</span>
+            <input
+              className="backtest1-input"
+              value={maxSymbols}
+              onChange={(e) => setMaxSymbols(e.target.value)}
+              disabled={running}
+            />
+          </label>
+        ) : null}
+        {useLocalDisk ? null : (
+          <>
+            <p className="backtest1-meta" style={{ gridColumn: '1 / -1', margin: '0.25rem 0 0' }}>
+              Balance / size / leverage: used for the EMA-gated combined wallet (Agent 1 + Agent 3) only
+            </p>
+            <label className="backtest1-field">
+              <span className="backtest1-label">Starting balance (USDT)</span>
+              <input
+                className="backtest1-input"
+                value={startingBalance}
+                onChange={(e) => setStartingBalance(e.target.value)}
+                inputMode="decimal"
+              />
+            </label>
+            <label className="backtest1-field">
+              <span className="backtest1-label">Trade size (% of balance at entry)</span>
+              <input
+                className="backtest1-input"
+                value={tradeSizePct}
+                onChange={(e) => setTradeSizePct(e.target.value)}
+                inputMode="decimal"
+              />
+            </label>
+            <label className="backtest1-field">
+              <span className="backtest1-label">Leverage (×)</span>
+              <input
+                className="backtest1-input"
+                value={leverage}
+                onChange={(e) => setLeverage(e.target.value)}
+                inputMode="decimal"
+              />
+            </label>
+          </>
+        )}
         <button type="button" className="backtest1-btn" onClick={run} disabled={running}>
-          {running ? 'Running Agents 1, 3, 4…' : 'Run comparison (3 agents)'}
+          {running
+            ? 'Running Agents 1 & 3…'
+            : useLocalDisk
+              ? 'Run local comparison (2 agents)'
+              : 'Run comparison (2 agents)'}
         </button>
       </div>
 
@@ -843,7 +898,7 @@ export function AgentLongShortCompareBacktest() {
 
       {showSummary ? (
         <section className="hourly-spikes-section">
-          <h2 className="hourly-spikes-h2">Results — all agents</h2>
+          <h2 className="hourly-spikes-h2">Results — Agents 1 &amp; 3</h2>
           <p className="hourly-spikes-hint" style={{ marginBottom: '0.75rem' }}>
             <strong>Max drawdown</strong> is the largest peak-to-trough drop in cumulative Σ price % (same definition as
             the main Spike backtest). <strong>Win rate (TP vs SL)</strong> uses only TP+SL exits; EOD uses signed price %.
@@ -861,18 +916,10 @@ export function AgentLongShortCompareBacktest() {
             symbolsSkipped={resultShort?.skipped}
             isFirst={false}
           />
-          <LongShortSideMetrics
-            title="Agent 4 — long (red spike, 2R fixed)"
-            summary={sA4}
-            symbolsSkipped={resultAgent4?.skipped}
-            isFirst={false}
-          />
         </section>
       ) : null}
 
-      {emaGateLong?.equityCurve?.length > 1 ||
-      emaGateShort?.equityCurve?.length > 1 ||
-      emaGateA4?.equityCurve?.length > 1 ? (
+      {emaGateLong?.equityCurve?.length > 1 || emaGateShort?.equityCurve?.length > 1 ? (
         <section className="hourly-spikes-section">
           <h2 className="hourly-spikes-h2">EMA(50)-gated equity compare</h2>
           <p className="hourly-spikes-hint" style={{ marginBottom: '0.75rem' }}>
@@ -885,11 +932,10 @@ export function AgentLongShortCompareBacktest() {
           <SpikeTpSlCompareEquityChart
             longPoints={emaGateLong?.equityCurve}
             shortPoints={emaGateShort?.equityCurve}
-            extraCompareSeries={emaGateExtraSeries}
             activityBars={emaGateActivityBars}
             showFootnote={false}
           />
-          {emaGateCombinedAccount ? (
+          {!useLocalDisk && emaGateCombinedAccount ? (
             <>
               <h3 className="hourly-spikes-h3" style={{ marginTop: '1rem' }}>
                 Combined account (EMA-gated Agent 1 + Agent 3 on one wallet)
@@ -937,8 +983,7 @@ export function AgentLongShortCompareBacktest() {
           ) : null}
           <EmaGatedSideMetrics title="Agent 1 — long (EMA gated)" gatedPack={emaGateLong} isFirst />
           <EmaGatedSideMetrics title="Agent 3 — short (EMA gated)" gatedPack={emaGateShort} isFirst={false} />
-          <EmaGatedSideMetrics title="Agent 4 — long (EMA gated)" gatedPack={emaGateA4} isFirst={false} />
-          {emaGateLong?.subsampled || emaGateShort?.subsampled || emaGateA4?.subsampled ? (
+          {emaGateLong?.subsampled || emaGateShort?.subsampled ? (
             <p className="hourly-spikes-hint">
               EMA-gated metrics use the per-trade payload sent by API. This run is subsampled, so gated results are
               approximate.
@@ -947,20 +992,14 @@ export function AgentLongShortCompareBacktest() {
         </section>
       ) : null}
 
-      {resultLong?.equityCurve?.length > 1 ||
-      resultShort?.equityCurve?.length > 1 ||
-      resultAgent4?.equityCurve?.length > 1 ? (
+      {resultLong?.equityCurve?.length > 1 || resultShort?.equityCurve?.length > 1 ? (
         <section className="hourly-spikes-section">
-          <h2 className="hourly-spikes-h2">Cumulative Σ price % — all agents</h2>
+          <h2 className="hourly-spikes-h2">Cumulative Σ price % — Agents 1 &amp; 3</h2>
           <p className="hourly-spikes-hint">
             Candles use the same <strong>normalized progress</strong> time base as the compare line (per side). Each
             chart pans and zooms on its own.
           </p>
-          <SpikeTpSlCompareEquityChart
-            longPoints={resultLong?.equityCurve}
-            shortPoints={resultShort?.equityCurve}
-            extraCompareSeries={compareExtraSeries}
-          />
+          <SpikeTpSlCompareEquityChart longPoints={resultLong?.equityCurve} shortPoints={resultShort?.equityCurve} />
           {resultLong?.equityCurve?.length > 1 ? (
             <>
               <h3 className="hourly-spikes-h3" style={{ marginTop: '1.25rem' }}>
@@ -994,25 +1033,6 @@ export function AgentLongShortCompareBacktest() {
                 cumulativePnlScale="pnlFromZero"
                 chartTimeMode="compareProgress"
                 compareProgressEquityPointCount={resultShort.equityCurve.length}
-                showFooterHint={false}
-                bollingerToggle
-              />
-            </>
-          ) : null}
-          {resultAgent4?.equityCurve?.length > 1 ? (
-            <>
-              <h3 className="hourly-spikes-h3" style={{ marginTop: '1.25rem' }}>
-                Agent 4 — stacked cumulative % candles + EMA({QUICK_EMA_PERIOD})
-              </h3>
-              <SpikeTpSlPerTradeCandleLightChart
-                perTradePricePctChron={resultAgent4.perTradePricePctChron}
-                tradesFallback={resultAgent4.trades}
-                totalTradeRows={resultAgent4.totalTradeRows}
-                serverSubsampled={Boolean(resultAgent4.perTradePricePctSubsampled)}
-                emaPeriod={QUICK_EMA_PERIOD}
-                cumulativePnlScale="pnlFromZero"
-                chartTimeMode="compareProgress"
-                compareProgressEquityPointCount={resultAgent4.equityCurve.length}
                 showFooterHint={false}
                 bollingerToggle
               />

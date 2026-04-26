@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 
-const START_USD = 6
+const START_USD = 100
 const GOAL_USD = 100_000
 
 const RATE_PRESETS = [
+  { multiplier: 1.01, label: '1%' },
   { multiplier: 1.02, label: '2%' },
   { multiplier: 1.08, label: '8%' },
   { multiplier: 1.1, label: '10%' },
@@ -237,7 +238,7 @@ function ProgressTrack({ wallet }) {
 export function The100k() {
   const summaryId = useId()
   const highlightRef = useRef(null)
-  const [rateMultiplier, setRateMultiplier] = useState(1.02)
+  const [rateMultiplier, setRateMultiplier] = useState(1.01)
   const [wallet, setWallet] = useState(null)
   /** Sum of USDT-M unrealized P&L; null = not loaded or open-positions failed */
   const [unrealizedTotal, setUnrealizedTotal] = useState(null)
@@ -386,8 +387,8 @@ export function The100k() {
           </h1>
           <p className="the100k-intro">
             Compound ladder from {formatMoney(START_USD)} to {formatMoney(GOAL_USD)}. Each step
-            multiplies the <strong>previous balance</strong> by your rate — not 2% of the
-            original $6 every time.
+            multiplies the <strong>previous balance</strong> by your rate — not a fixed slice of
+            the original {formatMoney(START_USD)} every time.
           </p>
 
           <div className="the100k-rate-control">
@@ -539,7 +540,9 @@ export function The100k() {
                 <div className="the100k-metric the100k-metric--accent">
                   <span className="the100k-metric-label">Journey (linear)</span>
                   <span className="the100k-metric-value">{formatPct(progressPct)}</span>
-                  <span className="the100k-metric-hint">from $6 → $100k scale</span>
+                  <span className="the100k-metric-hint">
+                    from {formatMoney(START_USD)} → {formatMoney(GOAL_USD)} scale
+                  </span>
                 </div>
                 <div className="the100k-metric">
                   <span className="the100k-metric-label">USDT to $100k</span>

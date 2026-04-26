@@ -26,6 +26,7 @@ import {
   attachBtcCloseToEquityPoints,
   candlesToBtcCloseMap,
 } from './spikeTpSlEquityBtc.js'
+import { loadCandlesFromLocalStore } from './localCandleStore.js'
 
 /** Max UTC calendar-day span (inclusive) for fromDate → toDate. */
 export const SPIKE_TPSL_MAX_RANGE_DAYS = 3
@@ -64,6 +65,82 @@ const EMA_5M_WARMUP_EXTRA_BARS = 100
 function mainIntervalMs(interval) {
   const k = String(interval ?? '5m').trim()
   return INTERVAL_MS[k] ?? 300_000
+}
+
+/**
+ * Strict entry-time liquidity gate:
+ * - Uses rolling 24h quote volume over completed bars only (entry bar excluded).
+ * - Requires full 24h history; otherwise entry is rejected.
+ */
+function buildStrictEntryVolumeGate(candles, intervalMs, minQuoteVolume24hAtEntry) {
+  const minVol = Number(minQuoteVolume24hAtEntry)
+  if (!Number.isFinite(minVol) || minVol <= 0) return null
+  const ms = Number(intervalMs)
+  if (!Number.isFinite(ms) || ms <= 0) return null
+  const windowBars = Math.max(1, Math.ceil(86_400_000 / ms))
+  const n = Array.isArray(candles) ? candles.length : 0
+  if (n === 0) {
+    return () => ({
+      pass: false,
+      reason: 'insufficient_history',
+      rollingQuoteVolume24h: null,
+      hasFullWindow: false,
+      windowBars,
+      minQuoteVolume24hAtEntry: minVol,
+    })
+  }
+
+  const prefix = new Array(n + 1).fill(0)
+  for (let i = 0; i < n; i++) {
+    const qv = Number(candles[i]?.quoteVolume)
+    prefix[i + 1] = prefix[i] + (Number.isFinite(qv) && qv >= 0 ? qv : 0)
+  }
+
+  return (entryBarIndex) => {
+    const e = Number(entryBarIndex)
+    if (!Number.isFinite(e)) {
+      return {
+        pass: false,
+        reason: 'invalid_entry_index',
+        rollingQuoteVolume24h: null,
+        hasFullWindow: false,
+        windowBars,
+        minQuoteVolume24hAtEntry: minVol,
+      }
+    }
+    const lastClosed = Math.floor(e) - 1
+    if (lastClosed < 0) {
+      return {
+        pass: false,
+        reason: 'insufficient_history',
+        rollingQuoteVolume24h: null,
+        hasFullWindow: false,
+        windowBars,
+        minQuoteVolume24hAtEntry: minVol,
+      }
+    }
+    if (lastClosed + 1 < windowBars) {
+      return {
+        pass: false,
+        reason: 'insufficient_history',
+        rollingQuoteVolume24h: null,
+        hasFullWindow: false,
+        windowBars,
+        minQuoteVolume24hAtEntry: minVol,
+      }
+    }
+    const start = lastClosed - windowBars + 1
+    const sum = prefix[lastClosed + 1] - prefix[start]
+    const pass = Number.isFinite(sum) && sum >= minVol
+    return {
+      pass,
+      reason: pass ? null : 'below_threshold',
+      rollingQuoteVolume24h: Number.isFinite(sum) ? sum : null,
+      hasFullWindow: true,
+      windowBars,
+      minQuoteVolume24hAtEntry: minVol,
+    }
+  }
 }
 
 /**
@@ -304,6 +381,7 @@ function mapKlineRow(k) {
     high: parseFloat(k[2]),
     low: parseFloat(k[3]),
     close: parseFloat(k[4]),
+    quoteVolume: parseFloat(k[7]),
   }
 }
 
@@ -994,8 +1072,15 @@ function simulateShortGreenSpike2RTrade(candles, spikeIndex, tradeOpts = {}) {
  */
 function runShortGreenRetestLowTrades(candles, thresholdPct, tradeOpts = {}, emaCtx = null, replayOpts = null) {
   const maxSlPct = tradeOpts.maxSlPct
+  const entryVolumeGate = replayOpts?.entryVolumeGate ?? null
   const trades = []
   const emaSkipped = []
+  let volumeChecked = 0
+  let volumePassed = 0
+  let volumeSkipped = 0
+  let volumeSkipInsufficientHistory = 0
+  let volumeSkipBelowThreshold = 0
+  let firstVolumeSkip = null
   let pending = null
 
   for (let i = 0; i < candles.length; i++) {
@@ -1013,6 +1098,32 @@ function runShortGreenRetestLowTrades(candles, thresholdPct, tradeOpts = {}, ema
       const entry = pending.spikeLow
       const entryOpenTime = bar.openTime
       const entryOpen = bar.open
+      if (entryVolumeGate) {
+        volumeChecked += 1
+        const vg = entryVolumeGate(i)
+        if (vg?.pass === true) volumePassed += 1
+        if (vg?.pass !== true) {
+          volumeSkipped += 1
+          if (vg?.reason === 'insufficient_history') volumeSkipInsufficientHistory += 1
+          else volumeSkipBelowThreshold += 1
+          if (firstVolumeSkip == null) {
+            firstVolumeSkip = {
+              symbol: emaCtx?.symbol ?? null,
+              entryOpenTime,
+              reason: vg?.reason ?? 'blocked',
+              rollingQuoteVolume24h: Number.isFinite(Number(vg?.rollingQuoteVolume24h))
+                ? Number(vg.rollingQuoteVolume24h)
+                : null,
+              minQuoteVolume24hAtEntry: Number.isFinite(Number(vg?.minQuoteVolume24hAtEntry))
+                ? Number(vg.minQuoteVolume24hAtEntry)
+                : null,
+              windowBars: Number.isFinite(Number(vg?.windowBars)) ? Number(vg.windowBars) : null,
+            }
+          }
+          pending = null
+          continue
+        }
+      }
       if (emaCtx && replayOpts) {
         const skip = shortEmaSkipIfAny(emaCtx, replayOpts, {
           symbol: emaCtx.symbol,
@@ -1127,7 +1238,19 @@ function runShortGreenRetestLowTrades(candles, thresholdPct, tradeOpts = {}, ema
     }
   }
 
-  return { trades, emaSkipped }
+  return {
+    trades,
+    emaSkipped,
+    volumeSkipped,
+    volumeGateStats: {
+      checked: volumeChecked,
+      passed: volumePassed,
+      skipped: volumeSkipped,
+      skippedInsufficientHistory: volumeSkipInsufficientHistory,
+      skippedBelowThreshold: volumeSkipBelowThreshold,
+      firstSkip: firstVolumeSkip,
+    },
+  }
 }
 
 /**
@@ -1142,8 +1265,15 @@ function runLongGreenRetestLowTrades(candles, thresholdPct, tradeOpts = {}, emaC
   const maxSlPct = tradeOpts.maxSlPct
   const tpR = normalizeTpR(tradeOpts)
   const tpAtSpikeHigh = Boolean(tradeOpts.longRetestTpAtSpikeHigh)
+  const entryVolumeGate = replayOpts?.entryVolumeGate ?? null
   const trades = []
   const emaSkipped = []
+  let volumeChecked = 0
+  let volumePassed = 0
+  let volumeSkipped = 0
+  let volumeSkipInsufficientHistory = 0
+  let volumeSkipBelowThreshold = 0
+  let firstVolumeSkip = null
   let pending = null
 
   for (let i = 0; i < candles.length; i++) {
@@ -1161,6 +1291,32 @@ function runLongGreenRetestLowTrades(candles, thresholdPct, tradeOpts = {}, emaC
       const entry = pending.spikeLow
       const entryOpenTime = bar.openTime
       const entryOpen = bar.open
+      if (entryVolumeGate) {
+        volumeChecked += 1
+        const vg = entryVolumeGate(i)
+        if (vg?.pass === true) volumePassed += 1
+        if (vg?.pass !== true) {
+          volumeSkipped += 1
+          if (vg?.reason === 'insufficient_history') volumeSkipInsufficientHistory += 1
+          else volumeSkipBelowThreshold += 1
+          if (firstVolumeSkip == null) {
+            firstVolumeSkip = {
+              symbol: emaCtx?.symbol ?? null,
+              entryOpenTime,
+              reason: vg?.reason ?? 'blocked',
+              rollingQuoteVolume24h: Number.isFinite(Number(vg?.rollingQuoteVolume24h))
+                ? Number(vg.rollingQuoteVolume24h)
+                : null,
+              minQuoteVolume24hAtEntry: Number.isFinite(Number(vg?.minQuoteVolume24hAtEntry))
+                ? Number(vg.minQuoteVolume24hAtEntry)
+                : null,
+              windowBars: Number.isFinite(Number(vg?.windowBars)) ? Number(vg.windowBars) : null,
+            }
+          }
+          pending = null
+          continue
+        }
+      }
       if (emaCtx && replayOpts) {
         const skip = longEmaSkipIfAny(emaCtx, replayOpts, {
           symbol: emaCtx.symbol,
@@ -1285,7 +1441,19 @@ function runLongGreenRetestLowTrades(candles, thresholdPct, tradeOpts = {}, emaC
     }
   }
 
-  return { trades, emaSkipped }
+  return {
+    trades,
+    emaSkipped,
+    volumeSkipped,
+    volumeGateStats: {
+      checked: volumeChecked,
+      passed: volumePassed,
+      skipped: volumeSkipped,
+      skippedInsufficientHistory: volumeSkipInsufficientHistory,
+      skippedBelowThreshold: volumeSkipBelowThreshold,
+      firstSkip: firstVolumeSkip,
+    },
+  }
 }
 
 /**
@@ -1717,13 +1885,23 @@ function maxDrawdownSummedPnlPct(equityPoints) {
  * @param {boolean} [replayOpts.emaLongLevel] long: require entry open > EMA at spike 5m bar
  * @param {boolean} [replayOpts.emaLongSlopePositive] long: require EMA at spike 5m bar > prior 5m EMA
  * @param {boolean} [replayOpts.emaShortLevel] short: require entry open < EMA at spike 5m bar
+ * @param {number} [replayOpts.intervalMs] bar size in ms (for strict rolling 24h entry-volume gate)
+ * @param {number | null} [replayOpts.entryMinQuoteVolume24hAtEntry] strict rolling 24h entry-volume floor
  */
 function runSymbolTrades(candles, thresholdPct, strategy = 'long', tradeOpts = {}, emaCtx = null, replayOpts = {}) {
+  const entryVolumeGate = buildStrictEntryVolumeGate(
+    candles,
+    replayOpts?.intervalMs,
+    replayOpts?.entryMinQuoteVolume24hAtEntry,
+  )
+  const replayOptsWithVolumeGate = entryVolumeGate
+    ? { ...replayOpts, entryVolumeGate }
+    : replayOpts
   if (strategy === 'shortGreenRetestLow') {
-    return runShortGreenRetestLowTrades(candles, thresholdPct, tradeOpts, emaCtx, replayOpts)
+    return runShortGreenRetestLowTrades(candles, thresholdPct, tradeOpts, emaCtx, replayOptsWithVolumeGate)
   }
   if (strategy === 'longGreenRetestLow') {
-    return runLongGreenRetestLowTrades(candles, thresholdPct, tradeOpts, emaCtx, replayOpts)
+    return runLongGreenRetestLowTrades(candles, thresholdPct, tradeOpts, emaCtx, replayOptsWithVolumeGate)
   }
   let sim = simulateLongTrade
   if (strategy === 'shortSpikeLow') sim = simulateShortSpikeLowTrade
@@ -1740,10 +1918,42 @@ function runSymbolTrades(candles, thresholdPct, strategy = 'long', tradeOpts = {
   let lastExitBar = -1
   const trades = []
   const emaSkipped = []
+  let volumeChecked = 0
+  let volumePassed = 0
+  let volumeSkipped = 0
+  let volumeSkipInsufficientHistory = 0
+  let volumeSkipBelowThreshold = 0
+  let firstVolumeSkip = null
 
   for (const si of spikes) {
     // Entry is at open of bar si+1; allow spike si when that entry bar is after the prior exit bar.
     if (!allowOverlap && si + 1 <= lastExitBar) continue
+
+    if (entryVolumeGate) {
+      volumeChecked += 1
+      const vg = entryVolumeGate(si + 1)
+      if (vg?.pass === true) volumePassed += 1
+      if (vg?.pass !== true) {
+        volumeSkipped += 1
+        if (vg?.reason === 'insufficient_history') volumeSkipInsufficientHistory += 1
+        else volumeSkipBelowThreshold += 1
+        if (firstVolumeSkip == null) {
+          firstVolumeSkip = {
+            symbol: emaCtx?.symbol ?? null,
+            entryOpenTime: candles?.[si + 1]?.openTime ?? null,
+            reason: vg?.reason ?? 'blocked',
+            rollingQuoteVolume24h: Number.isFinite(Number(vg?.rollingQuoteVolume24h))
+              ? Number(vg.rollingQuoteVolume24h)
+              : null,
+            minQuoteVolume24hAtEntry: Number.isFinite(Number(vg?.minQuoteVolume24hAtEntry))
+              ? Number(vg.minQuoteVolume24hAtEntry)
+              : null,
+            windowBars: Number.isFinite(Number(vg?.windowBars)) ? Number(vg.windowBars) : null,
+          }
+        }
+        continue
+      }
+    }
 
     if (emaCtx) {
       const entryOpen = candles[si + 1].open
@@ -1781,7 +1991,19 @@ function runSymbolTrades(candles, thresholdPct, strategy = 'long', tradeOpts = {
     trades.push(tr)
     if (!allowOverlap) lastExitBar = tr.exitBarIndex
   }
-  return { trades, emaSkipped }
+  return {
+    trades,
+    emaSkipped,
+    volumeSkipped,
+    volumeGateStats: {
+      checked: volumeChecked,
+      passed: volumePassed,
+      skipped: volumeSkipped,
+      skippedInsufficientHistory: volumeSkipInsufficientHistory,
+      skippedBelowThreshold: volumeSkipBelowThreshold,
+      firstSkip: firstVolumeSkip,
+    },
+  }
 }
 
 /**
@@ -1882,7 +2104,8 @@ async function mapPool(items, concurrency, mapper) {
  * @param {string} [opts.fromDate] YYYY-MM-DD UTC (with toDate)
  * @param {string} [opts.toDate] YYYY-MM-DD UTC (with fromDate)
  * @param {boolean} [opts.extendedCandles] raise per-symbol tail cap to 20k and paginate klines past 1500
- * @param {number} [opts.maxSymbols] cap universe size (default from env, max 300)
+ * @param {number} [opts.maxSymbols] cap universe size (default from env, max 500)
+ * @param {number} [opts.entryMinQuoteVolume24hAtEntry] strict rolling 24h quote-volume floor at entry time (requires full 24h history)
  * @param {(e: object) => void} [opts.onProgress] progress hook (volumes / per-symbol klines / aggregate)
  */
 export async function computeSpikeTpSlBacktest(futuresBase, opts) {
@@ -1903,6 +2126,7 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     allowOverlap: allowOverlapRaw,
     longRetestTpAtSpikeHigh: longRetestTpAtSpikeHighRaw,
     equityEmaSlow: equityEmaSlowRaw,
+    entryMinQuoteVolume24hAtEntry: entryMinQuoteVolume24hAtEntryRaw,
   } = opts
 
   let maxSlPct = null
@@ -1918,9 +2142,21 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const allowOverlap = Boolean(allowOverlapRaw)
   const tpR = normalizeTpR({ tpR: opts?.tpR })
   const longRetestTpAtSpikeHigh = Boolean(longRetestTpAtSpikeHighRaw)
+  let entryMinQuoteVolume24hAtEntry = null
+  if (entryMinQuoteVolume24hAtEntryRaw != null && entryMinQuoteVolume24hAtEntryRaw !== '') {
+    const v = Number(entryMinQuoteVolume24hAtEntryRaw)
+    if (Number.isFinite(v) && v > 0) entryMinQuoteVolume24hAtEntry = v
+  }
   const tradeOpts = { maxSlPct, slAtSpikeOpen, tpR, longRetestTpAtSpikeHigh }
   const extendedCandles = Boolean(opts.extendedCandles)
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null
+  const useLocalCandlesRaw = opts.useLocalCandles
+  const useLocalCandles =
+    useLocalCandlesRaw === true ||
+    String(process.env.SPIKE_TPSL_USE_LOCAL_CANDLES ?? '').trim() === '1' ||
+    String(process.env.SPIKE_TPSL_USE_LOCAL_CANDLES ?? '').toLowerCase().trim() === 'true'
+  /** When true with `useLocalCandles`, never fetch klines from Binance (skip symbol if cache missing / too short). */
+  const localCandlesOnly = Boolean(opts.localCandlesOnly)
 
   const maxChartCandles = Math.min(
     1500,
@@ -2022,12 +2258,16 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const utcRange = parseSpikeTpSlUtcRange(fromDateOpt, toDateOpt)
   const candleCap = extendedCandles ? EXTENDED_TAIL_MAX_CANDLES : 1500
   const n = Math.max(50, Math.min(candleCap, Math.floor(candleCount)))
-  const maxSymRaw = Number.parseInt(process.env.SPIKE_TPSL_MAX_SYMBOLS ?? '300', 10)
+  const intervalMs = mainIntervalMs(interval)
+  const maxSymRaw = Number.parseInt(process.env.SPIKE_TPSL_MAX_SYMBOLS ?? '500', 10)
   const envMaxSym = Number.isFinite(maxSymRaw) && maxSymRaw > 0 ? maxSymRaw : 300
+  const allQualifiedSymbols = Boolean(opts.allQualifiedSymbols)
   const maxSymbols =
-    Number.isFinite(opts.maxSymbols) && opts.maxSymbols > 0
-      ? Math.min(300, Math.floor(opts.maxSymbols))
-      : envMaxSym
+    allQualifiedSymbols
+      ? Number.POSITIVE_INFINITY
+      : Number.isFinite(opts.maxSymbols) && opts.maxSymbols > 0
+        ? Math.min(500, Math.floor(opts.maxSymbols))
+        : envMaxSym
   const concRaw = Number.parseInt(process.env.SPIKE_TPSL_CONCURRENCY ?? '4', 10)
   const CONCURRENCY =
     Number.isFinite(concRaw) && concRaw > 0 ? Math.min(16, concRaw) : 4
@@ -2038,7 +2278,10 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   const volumeRows = await computeFutures24hVolumes(futuresBase, { headers: publicHeaders })
   const volFiltered = volumeRows.filter((r) => r.quoteVolume24h >= minQuoteVolume24h)
   const requestedSymbols = volFiltered.length
-  const selected = volFiltered.slice(0, maxSymbols)
+  const selected =
+    allQualifiedSymbols || !Number.isFinite(maxSymbols)
+      ? volFiltered
+      : volFiltered.slice(0, maxSymbols)
 
   async function loadCandlesForSymbol(symbol) {
     if (utcRange) {
@@ -2050,6 +2293,11 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
         utcRange.endTime,
         publicHeaders,
       )
+    }
+    if (useLocalCandles) {
+      const local = await loadCandlesFromLocalStore(symbol, interval, n)
+      if (local && local.length >= 3) return local
+      if (localCandlesOnly) return []
     }
     if (n <= KLINES_PAGE_LIMIT) {
       return fetchKlinesOHLC(futuresBase, symbol, interval, n, publicHeaders)
@@ -2124,15 +2372,17 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
         emaLongLevel: emaLongFilterActive,
         emaLongSlopePositive: emaLongSlopeActive,
         emaShortLevel: emaShortFilterActive,
+        intervalMs,
+        entryMinQuoteVolume24hAtEntry,
       }
-      const { trades, emaSkipped } = useLegacyPerSymbolSim
+      const { trades, emaSkipped, volumeSkipped, volumeGateStats } = useLegacyPerSymbolSim
         ? runSymbolTrades(candles, thresholdPct, strat, tradeOpts, emaCtx, {
             allowOverlap:
               allowOverlap &&
               (strat === 'long' || strat === 'longRedSpikeTpHigh' || strat === 'longOnRedSpike2R'),
             ...emaReplayOpts,
           })
-        : { trades: [], emaSkipped: [] }
+        : { trades: [], emaSkipped: [], volumeSkipped: 0, volumeGateStats: null }
 
       const rowOut = {
         symbol: row.symbol,
@@ -2141,6 +2391,8 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
         error: null,
         trades,
         emaSkipped,
+        volumeSkipped,
+        volumeGateStats,
         ...(strat === 'regimeFlipEma50' ? { candles } : {}),
       }
 
@@ -2189,6 +2441,12 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
   let skipped = 0
   const allTrades = []
   const allEmaSkipped = []
+  let allVolumeSkipped = 0
+  let allVolumeChecked = 0
+  let allVolumePassed = 0
+  let allVolumeSkippedInsufficientHistory = 0
+  let allVolumeSkippedBelowThreshold = 0
+  let firstVolumeSkipGlobal = null
   const perSymbol = []
   const effectiveTradeCountBySymbol = new Map()
   for (const r of raw) {
@@ -2200,6 +2458,25 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     if (Array.isArray(r.emaSkipped)) {
       for (const ev of r.emaSkipped) allEmaSkipped.push(ev)
     }
+    allVolumeSkipped += Number.isFinite(Number(r.volumeSkipped)) ? Number(r.volumeSkipped) : 0
+    const vgs = r?.volumeGateStats
+    allVolumeChecked += Number.isFinite(Number(vgs?.checked)) ? Number(vgs.checked) : 0
+    allVolumePassed += Number.isFinite(Number(vgs?.passed)) ? Number(vgs.passed) : 0
+    allVolumeSkippedInsufficientHistory += Number.isFinite(Number(vgs?.skippedInsufficientHistory))
+      ? Number(vgs.skippedInsufficientHistory)
+      : 0
+    allVolumeSkippedBelowThreshold += Number.isFinite(Number(vgs?.skippedBelowThreshold))
+      ? Number(vgs.skippedBelowThreshold)
+      : 0
+    if (firstVolumeSkipGlobal == null && vgs?.firstSkip) {
+      firstVolumeSkipGlobal = vgs.firstSkip
+    } else if (vgs?.firstSkip) {
+      const cur = Number(firstVolumeSkipGlobal?.entryOpenTime)
+      const next = Number(vgs.firstSkip?.entryOpenTime)
+      if (!Number.isFinite(cur) || (Number.isFinite(next) && next < cur)) {
+        firstVolumeSkipGlobal = vgs.firstSkip
+      }
+    }
     const sumR = rowTrades.reduce((s, t) => s + t.rMultiple, 0)
     const tpN = rowTrades.filter((t) => t.outcome === 'tp').length
     const slN = rowTrades.filter((t) => t.outcome === 'sl').length
@@ -2210,6 +2487,15 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
       candleCount: r.candleCount,
       tradeCount: rowTrades.length,
       emaSkipCount: r.emaSkipped?.length ?? 0,
+      entryVolumeSkipCount: Number.isFinite(Number(r.volumeSkipped)) ? Number(r.volumeSkipped) : 0,
+      entryVolumeCheckedCount: Number.isFinite(Number(vgs?.checked)) ? Number(vgs.checked) : 0,
+      entryVolumePassedCount: Number.isFinite(Number(vgs?.passed)) ? Number(vgs.passed) : 0,
+      entryVolumeSkipInsufficientHistoryCount: Number.isFinite(Number(vgs?.skippedInsufficientHistory))
+        ? Number(vgs.skippedInsufficientHistory)
+        : 0,
+      entryVolumeSkipBelowThresholdCount: Number.isFinite(Number(vgs?.skippedBelowThreshold))
+        ? Number(vgs.skippedBelowThreshold)
+        : 0,
       tpCount: tpN,
       slCount: slN,
       eodCount: eodN,
@@ -2448,6 +2734,14 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
       entryRule: `${meta.entryRule} Max adverse stop distance capped at ${maxSlPct}% of entry.`,
     }
   }
+  if (entryMinQuoteVolume24hAtEntry != null) {
+    meta = {
+      ...meta,
+      entryRule:
+        `${meta.entryRule} Strict entry liquidity gate: require rolling last-24h quote volume at entry time >= ` +
+        `${entryMinQuoteVolume24hAtEntry}. Entries without full 24h history are skipped.`,
+    }
+  }
   if (emaFilterActive) {
     const parts = []
     if (emaLongFilterActive) {
@@ -2544,6 +2838,7 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
     candleCountTail: utcRange ? null : n,
     thresholdPct,
     minQuoteVolume24h,
+    entryMinQuoteVolume24hAtEntry,
     binancePublicApiKeySent,
     ...meta,
     equityCurveMode: 'summedPricePct',
@@ -2559,6 +2854,12 @@ export async function computeSpikeTpSlBacktest(futuresBase, opts) {
       slHits,
       eodHits,
       emaFilterSkips: allEmaSkipped.length,
+      entryVolumeSkips: allVolumeSkipped,
+      entryVolumeChecked: allVolumeChecked,
+      entryVolumePassed: allVolumePassed,
+      entryVolumeSkipInsufficientHistory: allVolumeSkippedInsufficientHistory,
+      entryVolumeSkipBelowThreshold: allVolumeSkippedBelowThreshold,
+      entryVolumeFirstSkip: firstVolumeSkipGlobal,
       winningTrades,
       losingTrades,
       breakevenTrades,

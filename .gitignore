@@ -33,3 +33,6 @@ ml/data/ml_prepared/*
 !ml/data/ml_prepared/.gitkeep
 ml/data/raw_ohlcv/*
 !ml/data/raw_ohlcv/.gitkeep
+
+# Local Binance USDT-M candle cache (see Local candle cache page)
+data/local-candles/
